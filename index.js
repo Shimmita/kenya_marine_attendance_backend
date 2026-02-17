@@ -99,12 +99,13 @@ app.use(
 // ─── Auth check ───────────────────────────────────────────────────────────────
 
 app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
-  try {
-    if (!req.session?.isOnline) throw new Error("Not authenticated");
+  if (req.session?.isOnline) {
+
     res.status(200).json({ valid: true });
-  } catch {
-    res.status(400).json({ valid: false });
+  } else {
+    res.status(200).json({ valid: false });
   }
+
 });
 
 // ─── Sign Up ──────────────────────────────────────────────────────────────────
