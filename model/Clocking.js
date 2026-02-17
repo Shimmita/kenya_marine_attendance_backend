@@ -6,18 +6,19 @@ const clockingSchema = new mongoose.Schema(
         email: {
             type: String,
             required: true,
-            unique: true,
             lowercase: true,
             trim: true,
         },
 
-        department: { type: String, default: "" },
-        supervisor: { type: String, default: "" },
-        station: { type: String, default: "" },
+        department: { type: String, required: true, default: "" },
+        supervisor: { type: String, default: "", required: true },
+        station: { type: String, default: "", required: true },
         phone: { type: String, required: true },
 
-        clock_in: { type: String, required: true },
-        clock_out: { type: String, required: true },
+        clock_in: { type: Date, required: true },
+        clock_out: { type: Date, default: null },
+        isPresent: { type: Boolean, default: false },
+        isLate: { type: Boolean, default: false },
 
     },
     { timestamps: true }

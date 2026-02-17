@@ -23,20 +23,39 @@ const userSchema = new mongoose.Schema(
     supervisor: { type: String, default: "" },
     phone: { type: String, required: true },
 
-    startDate: { type: String, required: true },
-    endDate: { type: String, required: true },
+    startDate: { type: String, required: false, default: null },
+    endDate: { type: String, required: false, default: null },
 
     gender: {
       type: String,
       enum: ["Male", "Female", "Other"],
       default: "Other",
+      required: true
     },
-
+    employeeId: {
+      type: String, default: ""
+    },
+    role: {
+      type: String,
+      enum: ["employee", "intern", "attachee"],
+      // Todo: make this required
+      default: "employee",
+    },
+    rank: {
+      type: String,
+      enum: ["admin", "user", "hr", "supervisor", "ceo"],
+      // default: "user",
+      default: "admin",
+    },
     avatarID: { type: String, default: "" },
     avatar: { type: String, default: "" },
 
     email_verified: { type: Boolean, default: true },
-
+    deviceLost: { type: Boolean, default: false },
+    hasDevices: { type: Boolean, default: false },
+    doneBiometric: { type: Boolean, default: false },
+    hasClockedIn: { type: Boolean, default: false },
+    isToClockOut: { type: Boolean, default: false },
     // 🔐 BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
     authenticator: authenticatorSchema,
   },

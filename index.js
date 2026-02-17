@@ -13,15 +13,27 @@ import express from "express";
 import session from "express-session";
 import mongoose from "mongoose";
 import validator from "validator";
+import Clocking from "./model/Clocking.js";
+import DeviceLost from "./model/deviceLost.js";
+import Devices from "./model/Devices.js";
 import User from "./model/User.js";
-
+const allowedOrigins = [
+  process.env.CROSS_ORIGIN_ALLOWED,
+  process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
+];
 const mongoDBSession = connectMongoStore(session);
 const app = express();
 app.use(bodyParser.json());
 app.use(express.json());
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true,
   })
 );
@@ -30,19 +42,13 @@ const PORT = process.env.PORT || 5000;
 const BASE_ROUTE = process.env.BASE_ROUTE;
 const environment = process.env.ENVIRONMENT_MODE;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Return the correct RP ID based on environment.
- */
 const getRpID = () =>
   environment === "SANDBOX"
-    ? process.env.DOMAIN_NAME_LOCAL
+    ? process.env.DOMAIN_NAME_LOCAL   // e.g. "localhost"
     : process.env.DOMAIN_NAME_PROD;
 
-/**
- * Return the correct expected origin based on environment.
- */
 const getExpectedOrigin = () =>
   environment === "SANDBOX"
     ? process.env.ORIGIN_LOCAL || "http://localhost:5173"
@@ -57,15 +63,11 @@ mongoose
       : process.env.MONGO_CONNECTION_URI_CLOUD
   )
   .then(() =>
-    console.log(
-      `Connected to MongoDB (${environment === "SANDBOX" ? "LOCAL" : "CLOUD"})`
-    )
+    console.log(`Connected to MongoDB (${environment === "SANDBOX" ? "LOCAL" : "CLOUD"})`)
   )
   .catch((err) => console.error("Database connection failed:", err));
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 
@@ -87,7 +89,7 @@ app.use(
     name: process.env.SESSION_NAME,
     store,
     cookie: {
-      maxAge: 60 * 60 * 2 * 1000, // 2 hours
+      maxAge: 60 * 60 * 24 * 1000,
       secure: environment !== "SANDBOX",
       sameSite: environment === "SANDBOX" ? "lax" : "none",
     },
@@ -105,46 +107,21 @@ app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
   }
 });
 
-// ─── Register ─────────────────────────────────────────────────────────────────
+// ─── Sign Up ──────────────────────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
   try {
-    const {
-      name,
-      email,
-      password,
-      department,
-      supervisor,
-      phone,
-      startDate,
-      endDate,
-      gender,
-    } = req.body.formData;
+    const data = req.body.formData
+    const { email, password } = data
 
-    if (!validator.isEmail(email)) {
-      throw new Error("Provided email is malformed!");
-    }
-
-    if (!password || password.length < 4) {
-      throw new Error("Password must be at least 4 characters!");
-    }
+    if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
+    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters!");
 
     const existingUser = await User.findOne({ email });
     if (existingUser) throw new Error("User already registered!");
 
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    await User.create({
-      name,
-      email,
-      password: hashedPassword,
-      department,
-      supervisor,
-      phone,
-      startDate,
-      endDate,
-      gender,
-    });
+    await User.create({ ...data, password: hashedPassword });
 
     return res.status(200).json({ message: "Account created successfully" });
   } catch (error) {
@@ -153,19 +130,13 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
   }
 });
 
-// ─── Login ────────────────────────────────────────────────────────────────────
+// ─── Sign In ──────────────────────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
   const { email, password } = req.body;
-
   try {
-    if (!validator.isEmail(email)) {
-      throw new Error("Provided email is malformed!");
-    }
-
-    if (!password || password.length < 4) {
-      throw new Error("Password must be at least 4 characters!");
-    }
+    if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
+    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters!");
 
     const user = await User.findOne({ email });
     if (!user) throw new Error("Create a new account to continue!");
@@ -173,9 +144,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) throw new Error("Invalid credentials!");
 
-    if (!user.email_verified) {
-      throw new Error("Email not verified. Contact admin.");
-    }
+    if (!user.email_verified) throw new Error("Email not verified. Contact admin.");
 
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
@@ -194,9 +163,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
  */
 app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
   try {
-    if (!req.session.isOnline) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
@@ -206,14 +173,10 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
       rpID: getRpID(),
       userID: Uint8Array.from(Buffer.from(user._id.toString())),
       userName: user.email,
-      authenticatorSelection: {
-        userVerification: "required",
-      },
+      authenticatorSelection: { userVerification: "required" },
     });
 
-    // Persist challenge in session for verification step
     req.session.registrationChallenge = options.challenge;
-
     res.json(options);
   } catch (err) {
     console.error("Register challenge error:", err);
@@ -222,10 +185,16 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
 });
 
 /**
- * 2. Verify Registration Response
+ * 2. Verify Registration & Save Credential
  *
- * FIX: credentialID and credentialPublicKey are stored as Base64URL strings
- * to avoid Mongoose Buffer serialization issues that caused auth to fail.
+ * KEY FIX — In @simplewebauthn/server v10+, credential.id is ALREADY a base64url
+ * string. Wrapping it in Buffer.from() corrupts it (treats the b64url chars as
+ * UTF-8 bytes, then re-encodes — producing a completely different string).
+ *
+ *   ❌ WRONG:   Buffer.from(credential.id).toString("base64url")
+ *   ✅ CORRECT: credential.id  (store directly — it's already base64url)
+ *
+ * credential.publicKey IS raw bytes (Uint8Array), so Buffer conversion is correct there.
  */
 app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
   try {
@@ -233,9 +202,7 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
     if (!user) throw new Error("User not found");
 
     const expectedChallenge = req.session.registrationChallenge;
-    if (!expectedChallenge) {
-      throw new Error("No registration challenge found. Please restart.");
-    }
+    if (!expectedChallenge) throw new Error("No registration challenge found. Please restart.");
 
     const verification = await verifyRegistrationResponse({
       response: req.body,
@@ -244,22 +211,20 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       expectedRPID: getRpID(),
     });
 
-    if (!verification.verified) {
-      return res.status(400).json({ registered: false });
-    }
+    if (!verification.verified) return res.status(400).json({ registered: false });
 
     const { credential } = verification.registrationInfo;
 
-    // ✅ Store as Base64URL strings — avoids Buffer round-trip corruption
     user.authenticator = {
-      credentialID: Buffer.from(credential.id).toString("base64url"),
-      credentialPublicKey: Buffer.from(credential.publicKey).toString("base64url"),
+      credentialID: credential.id,                                              // ✅ already base64url — store directly
+      credentialPublicKey: Buffer.from(credential.publicKey).toString("base64url"), // ✅ raw bytes → base64url
       counter: credential.counter,
     };
 
-    await user.save();
+    // update user to mark biometric registration complete
+    user.doneBiometric = true;
 
-    // Clean up challenge from session
+    await user.save();
     delete req.session.registrationChallenge;
 
     res.json({ registered: true });
@@ -272,29 +237,23 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
 /**
  * 3. Generate Authentication Challenge
  *
- * FIX: Pass allowCredentials so the browser targets the correct passkey.
- * credentialID is stored as Base64URL string, pass it directly.
+ * credentialID is stored as a base64url string — pass it directly to allowCredentials.
  */
 app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
   try {
-    if (!req.session.isOnline) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
     const user = await User.findById(req.session.userID);
     if (!user || !user.authenticator) {
-      return res
-        .status(400)
-        .json({ message: "Biometric not registered for this account" });
+      return res.status(400).json({ message: "Biometric not registered for this account" });
     }
 
     const options = await generateAuthenticationOptions({
       rpID: getRpID(),
       userVerification: "required",
-      // ✅ Target only this user's registered credential
       allowCredentials: [
         {
-          id: user.authenticator.credentialID, // Base64URL string
+          id: user.authenticator.credentialID, // base64url string — correct for v10+
           type: "public-key",
         },
       ],
@@ -306,17 +265,29 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
     res.json(options);
   } catch (error) {
     console.error("Auth challenge error:", error);
-    res
-      .status(500)
-      .json({ message: "Failed to generate authentication options" });
+    res.status(500).json({ message: "Failed to generate authentication options" });
   }
 });
 
 /**
  * 4. Verify Authentication Response
  *
- * FIX: Convert Base64URL strings back to Buffers for verifyAuthenticationResponse.
- * This is the reverse of what we do on save, and it must be exact.
+ * KEY FIX — @simplewebauthn/server v10+ replaced the `authenticator` param with
+ * a `credential` param using different field names:
+ *
+ *   ❌ Old shape (v9):
+ *      authenticator: {
+ *        credentialID:        Buffer,
+ *        credentialPublicKey: Buffer,
+ *        counter:             number,
+ *      }
+ *
+ *   ✅ New shape (v10+):
+ *      credential: {
+ *        id:        string     — base64url (pass stored string directly)
+ *        publicKey: Uint8Array — decoded from stored base64url
+ *        counter:   number
+ *      }
  */
 app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
   try {
@@ -326,10 +297,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
     const user = await User.findById(req.session.userID);
     if (!user || !user.authenticator) {
-      return res.status(400).json({
-        verified: false,
-        message: "Fingerprint not registered",
-      });
+      return res.status(400).json({ verified: false, message: "Fingerprint not registered" });
     }
 
     const expectedChallenge = req.session.authChallenge;
@@ -340,40 +308,107 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       });
     }
 
-    // ✅ Convert Base64URL strings back to Buffers for the library
-    const authenticator = {
-      credentialID: Buffer.from(user.authenticator.credentialID, "base64url"),
-      credentialPublicKey: Buffer.from(
-        user.authenticator.credentialPublicKey,
-        "base64url"
-      ),
-      counter: user.authenticator.counter,
-    };
+    // extract selected station and auth response from request body
+    const { selectedStation, ...authResponse } = req.body;
 
     const verification = await verifyAuthenticationResponse({
-      response: req.body,
+      response: authResponse,
       expectedChallenge,
       expectedOrigin: getExpectedOrigin(),
       expectedRPID: getRpID(),
-      authenticator,
+      // ✅ v10+ shape: `credential` not `authenticator`, `id` not `credentialID`,
+      //    `publicKey` (Uint8Array) not `credentialPublicKey` (Buffer)
+      credential: {
+        id: user.authenticator.credentialID,                                         // base64url string
+        publicKey: new Uint8Array(
+          Buffer.from(user.authenticator.credentialPublicKey, "base64url")           // base64url → Uint8Array
+        ),
+        counter: user.authenticator.counter,
+      },
       requireUserVerification: true,
     });
 
-    if (!verification.verified) {
-      return res.status(401).json({ verified: false });
-    }
+    if (!verification.verified) return res.status(401).json({ verified: false });
 
-    // ✅ Update counter to prevent replay attacks
+    // Update counter to prevent replay attacks
     user.authenticator.counter = verification.authenticationInfo.newCounter;
+
+    // save in the db
     await user.save();
 
-    // Mark session as biometrically verified with a timestamp
+    // save clocking in data in East African Time (EAT) timezone
+    if (!user?.hasClockedIn && !user?.isToClockOut) {
+
+      const now = new Date();
+
+      // Convert to Nairobi time
+      const eatTime = new Date(
+        now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
+      );
+
+      const hours = eatTime.getHours();
+
+      // Late if after 9:00 AM
+      const isLate = hours > 9 || (hours === 9 && eatTime.getMinutes() > 0);
+
+      const clockingData = {
+        name: user.name,
+        email: user.email,
+        department: user.department,
+        supervisor: user.supervisor,
+        station: selectedStation,
+        phone: user.phone,
+        // store UTC
+        clock_in: now,
+        // updated when is clocking out, store UTC
+        clock_out: null,
+        // value isLate is determined at clock-in time
+        isLate: isLate,
+        // will update later when clocking out
+        isPresent: false,
+      };
+
+      await Clocking.create(clockingData);
+
+      user.hasClockedIn = true;
+      user.isToClockOut = true;
+
+      await user.save();
+    }
+    else {
+
+      const latestClocking = await Clocking
+        .findOne({ email: user.email })
+        .sort({ clock_in: -1 });
+
+      if (!latestClocking) {
+        return res.status(404).json({ message: "No clock-in record found" });
+      }
+
+      const now = new Date();
+      latestClocking.clock_out = now;
+
+      // Calculate difference in milliseconds
+      const diffMs = now - latestClocking.clock_in;
+
+      // Convert to hours
+      const diffHours = diffMs / (1000 * 60 * 60);
+
+      // Present if worked 5 hours or more
+      latestClocking.isPresent = diffHours >= 5;
+
+      await latestClocking.save();
+
+      user.hasClockedIn = false;
+      user.isToClockOut = false;
+
+      await user.save();
+    }
+
+
     req.session.biometricVerified = true;
     req.session.biometricVerifiedAt = Date.now();
-
-    // Clean up challenge
     delete req.session.authChallenge;
-
     res.json({ verified: true });
   } catch (err) {
     console.error("Auth verify error:", err);
@@ -381,10 +416,10 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
   }
 });
 
-// ─── Attendance ───────────────────────────────────────────────────────────────
+
+// ─── Attendance ──────────────
 
 app.post(`${BASE_ROUTE}/attendance/clockin`, async (req, res) => {
-  // Biometric must be verified within the last 2 minutes
   const BIOMETRIC_WINDOW_MS = 2 * 60 * 1000;
   const verified =
     req.session.biometricVerified &&
@@ -404,12 +439,575 @@ app.post(`${BASE_ROUTE}/attendance/clockin`, async (req, res) => {
     //   type: "clock-in",
     // });
 
-    // Invalidate biometric window after use (one-shot)
-    req.session.biometricVerified = false;
-
+    req.session.biometricVerified = false; // one-shot — clear after use
     res.json({ message: "Clock-in successful", timestamp: new Date() });
   } catch (err) {
     console.error("Clock-in error:", err);
     res.status(500).json({ message: "Clock-in failed" });
+  }
+});
+
+
+// User related routes (e.g. profile update) would go here, ensuring to check req.session.isOnline and req.session.userID for authentication
+
+// get user profile
+app.get(`${BASE_ROUTE}/user/profile`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID).select("-password").select("-authenticator");
+    if (!user) throw new Error("User not found");
+
+    res.json(user);
+  } catch (err) {
+    console.error("Get profile error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// update user profile
+app.post(`${BASE_ROUTE}/user/profile`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const { name, department, supervisor, phone, startDate, endDate, gender } = req.body;
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    user.name = name || user.name;
+    user.department = department || user.department;
+    user.supervisor = supervisor || user.supervisor;
+    user.phone = phone || user.phone;
+    user.startDate = startDate || user.startDate;
+    user.endDate = endDate || user.endDate;
+    user.gender = gender || user.gender;
+
+    await user.save();
+    res.json({ message: "Profile updated successfully" });
+  } catch (err) {
+    console.error("Update profile error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+
+
+// fetch top 3 clocking data for the logged-in user, if no limit is specified, fetch all clocking data
+app.get(`${BASE_ROUTE}/user/attendance/history`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const limit = parseInt(req.query.limit) || 0;
+    if (limit == 0) {
+      const clockingData = await Clocking.find({ email: user.email }).sort({ clock_in: -1 });
+      res.json(clockingData);
+      return;
+    } else {
+      const clockingData = await Clocking.find({ email: user.email }).sort({ clock_in: -1 }).limit(limit);
+      res.json(clockingData);
+    }
+  } catch (err) {
+    console.error("Fetch clocking data error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+
+// attendance stats User
+app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const userEmail = user.email;
+    const now = new Date();
+
+    // Date Ranges
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+
+    const startOfWeek = new Date(now);
+    const dayOfWeek = now.getDay();
+    const diffToMonday = now.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
+    startOfWeek.setDate(diffToMonday);
+    startOfWeek.setHours(0, 0, 0, 0);
+
+    const records = await Clocking.find({
+      email: userEmail,
+      clock_in: { $gte: startOfMonth, $lte: endOfMonth }
+    });
+
+    // Helper: Calculate working days excluding weekends
+    const getWorkingDays = (start, end) => {
+      let count = 0;
+      let cur = new Date(start);
+      while (cur <= end && cur <= now) {
+        if (cur.getDay() !== 0 && cur.getDay() !== 6) count++;
+        cur.setDate(cur.getDate() + 1);
+      }
+      return count || 1;
+    };
+
+    const processStats = (filteredRecords, totalExpectedDays) => {
+      const dailyMap = {};
+
+      filteredRecords.forEach(rec => {
+        const dateKey = new Date(rec.clock_in).toISOString().split('T')[0];
+        if (!dailyMap[dateKey]) {
+          dailyMap[dateKey] = { hours: 0, isLateAny: false, isEarlyAny: false, clockings: 0 };
+        }
+
+        if (rec.clock_out) {
+          const duration = (new Date(rec.clock_out) - new Date(rec.clock_in)) / (1000 * 60 * 60);
+          dailyMap[dateKey].hours += duration;
+        }
+
+        // Punctuality: If any clock-in today was early, the day counts as early
+        if (rec.isLate) dailyMap[dateKey].isLateAny = true;
+        else dailyMap[dateKey].isEarlyAny = true;
+
+        dailyMap[dateKey].clockings++;
+      });
+
+      let totalHours = 0;
+      let totalOvertime = 0;
+      let presentDays = 0;
+      let halfDays = 0;
+      let lateDays = 0;
+      let earlyDays = 0;
+
+      Object.values(dailyMap).forEach(day => {
+        totalHours += day.hours;
+        if (day.hours > 9) totalOvertime += (day.hours - 9);
+
+        // Logical Classification
+        if (day.hours >= 5) presentDays++;
+        else if (day.hours > 0) halfDays++;
+
+        // Punctuality Strategy: Early trump's Late for the day
+        if (day.isEarlyAny) earlyDays++;
+        else if (day.isLateAny) lateDays++;
+      });
+
+      const attendanceRate = ((presentDays / totalExpectedDays) * 100).toFixed(1);
+      const punctualityRate = (presentDays + halfDays > 0)
+        ? ((earlyDays / (earlyDays + lateDays)) * 100).toFixed(1)
+        : 0;
+
+      return {
+        totalHours: totalHours.toFixed(2),
+        overtimeHours: totalOvertime.toFixed(2),
+        presentDays,
+        halfDays,
+        absentDays: Math.max(0, totalExpectedDays - presentDays - halfDays),
+        lateDays,
+        earlyDays,
+        attendanceRate: Number(attendanceRate),
+        punctualityRate: Number(punctualityRate),
+        avgHoursPerDay: (totalHours / (presentDays + halfDays || 1)).toFixed(2)
+      };
+    };
+
+    const weeklyStats = processStats(
+      records.filter(r => new Date(r.clock_in) >= startOfWeek),
+      getWorkingDays(startOfWeek, now)
+    );
+
+    const monthlyStats = processStats(
+      records,
+      getWorkingDays(startOfMonth, now)
+    );
+
+    res.status(200).json({
+      weekly: weeklyStats,
+      monthly: monthlyStats,
+      summary: `You have worked ${monthlyStats.totalHours} hours this month with ${monthlyStats.overtimeHours} hours of overtime.`
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+
+// ADMIN, SUPERVISOR,CEO,HR LEVEL overall org stats
+
+// Admin Overall Stats
+app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const [records, allUsers] = await Promise.all([
+      Clocking.find({ clock_in: { $gte: startOfMonth } }),
+      User.find({}, 'email name department station')
+    ]);
+
+    const stats = {
+      orgTotalHours: 0,
+      orgTotalOvertime: 0,
+      departmentData: {},
+      stationData: {}, // Track which branches are most active
+      employeeMetrics: {},
+      lateToday: 0
+    };
+
+    records.forEach(rec => {
+      const email = rec.email;
+      const dept = rec.department || "Unassigned";
+      const station = rec.station || "Main";
+
+      if (!stats.employeeMetrics[email]) {
+        stats.employeeMetrics[email] = { hours: 0, overtime: 0, lateCount: 0, earlyCount: 0, days: new Set() };
+      }
+
+      // 1. Calculate Hours
+      if (rec.clock_out) {
+        const diff = (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
+        stats.employeeMetrics[email].hours += diff;
+        if (diff > 9) stats.employeeMetrics[email].overtime += (diff - 9);
+      }
+
+      // 2. Punctuality
+      if (rec.isLate) stats.employeeMetrics[email].lateCount++;
+      else stats.employeeMetrics[email].earlyCount++;
+
+      // 3. Dept & Station Aggregation
+      if (!stats.departmentData[dept]) stats.departmentData[dept] = { hours: 0, staff: new Set() };
+      stats.departmentData[dept].hours += (rec.clock_out ? (rec.clock_out - rec.clock_in) / (1000 * 60 * 60) : 0);
+      stats.departmentData[dept].staff.add(email);
+
+      if (!stats.stationData[station]) stats.stationData[station] = { checkins: 0 };
+      stats.stationData[station].checkins++;
+    });
+
+    // Final Org-wide Calculations
+    const totalStaff = allUsers.length;
+    let burnoutAlerts = 0;
+    let topPerformers = [];
+
+    Object.entries(stats.employeeMetrics).forEach(([email, data]) => {
+      stats.orgTotalHours += data.hours;
+      stats.orgTotalOvertime += data.overtime;
+      if (data.overtime > 20) burnoutAlerts++; // More than 20h overtime/month is high risk
+
+      topPerformers.push({
+        email,
+        score: (data.hours * 0.6) + (data.earlyCount * 2) - (data.lateCount * 1)
+      });
+    });
+
+    res.status(200).json({
+      overview: {
+        totalStaff,
+        activeStaffThisMonth: Object.keys(stats.employeeMetrics).length,
+        totalOrgHours: stats.orgTotalHours.toFixed(1),
+        totalOrgOvertime: stats.orgTotalOvertime.toFixed(1),
+        averageStaffEfficiency: (stats.orgTotalHours / (totalStaff * 160) * 100).toFixed(1) + "%", // Based on 160h standard month
+      },
+      healthSignals: {
+        burnoutRiskCount: burnoutAlerts,
+        chronicLatenessDept: Object.keys(stats.departmentData).sort((a, b) => b.hours - a.hours)[0],
+        mostActiveStation: Object.keys(stats.stationData).sort((a, b) => b.checkins - a.checkins)[0]
+      },
+      departmentBreakdown: Object.keys(stats.departmentData).map(d => ({
+        name: d,
+        totalHours: stats.departmentData[d].hours.toFixed(1),
+        headcount: stats.departmentData[d].staff.size
+      })),
+      topPerformers: topPerformers.sort((a, b) => b.score - a.score).slice(0, 5)
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+
+// DEVICE LOST 
+app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const { description, startDate, endDate, device_fingerprint } = req.body;
+
+    if (!description || !startDate || !endDate)
+      throw new Error("All fields are required");
+
+    const userDevices = await Devices.find({ user_email: user.email })
+
+    const existingPending = await DeviceLost.findOne({
+      user_email: user.email,
+      status: "pending",
+      device_fingerprint
+    });
+
+    if (existingPending)
+      throw new Error("You already have a pending request");
+
+    const lostRequest = await DeviceLost.create({
+      description,
+      user_email: user.email,
+      startDate,
+      endDate,
+      device_fingerprint
+    });
+
+
+    // if user has no multiple devices, then flag them to do biometric false for forced 
+    // fingerprint registration
+    if (!user.hasDevices || !userDevices.length > 1) {
+      user.doneBiometric = false
+      user.authenticator = null
+
+      // flag the device in question as lost
+      const myLostDevice = await Devices.findOne({ device_fingerprint })
+      myLostDevice.device_lost = true
+      await myLostDevice.save()
+    } else {
+      // mark the other device(could be a browser check on that precisely) available as primary
+      const primaryDevice = userDevices.find(d => d.device_fingerprint !== device_fingerprint)
+
+      if (primaryDevice) {
+        primaryDevice.device_primary = true
+        await primaryDevice.save()
+      }
+    }
+
+    // mark user as device lost (temporary state)
+    user.deviceLost = true;
+    await user.save();
+
+
+    res.json({
+      message: "Lost device request submitted",
+      data: lostRequest
+    });
+
+  } catch (err) {
+    console.error("Lost device request error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+// view all lost devices
+app.get(`${BASE_ROUTE}/device/lost/all`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    if (!["admin", "hr", "supervisor", "ceo"].includes(user.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const requests = await DeviceLost.find()
+      .sort({ createdAt: -1 });
+
+    res.json(requests);
+
+  } catch (err) {
+    console.error("Fetch lost requests error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+
+//  respond to the lost device
+
+app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const responder = await User.findById(req.session.userID);
+    if (!responder) throw new Error("User not found");
+
+    if (!["admin", "hr", "supervisor"].includes(responder.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const { requestId, action } = req.body;
+
+    if (!["granted", "rejected"].includes(action))
+      throw new Error("Invalid action");
+
+    const request = await DeviceLost.findById(requestId);
+    if (!request) throw new Error("Request not found");
+
+    if (request.status !== "pending")
+      throw new Error("Request already processed");
+
+    request.status = action;
+    request.responded = responder.rank;
+    await request.save();
+
+    const affectedUser = await User.findOne({ email: request.user_email });
+    if (!affectedUser) throw new Error("User not found");
+
+    if (action === "granted") {
+      // mark all devices lost
+      await Devices.updateMany(
+        { user_email: affectedUser.email },
+        { device_lost: true, device_primary: false }
+      );
+
+      // clear biometric (force re-registration)
+      affectedUser.authenticator = undefined;
+      affectedUser.doneBiometric = false;
+      affectedUser.hasDevices = false;
+      // affectedUser.deviceLost = false;
+      affectedUser.deviceLost = true;
+
+      await affectedUser.save();
+    }
+
+    res.json({
+      message: `Request ${action} successfully`,
+      data: request
+    });
+
+  } catch (err) {
+    console.error("Respond lost device error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+
+// add device
+app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const { device_name, device_os, device_browser, device_fingerprint } = req.body;
+
+
+    if (!device_fingerprint || !device_os || !device_browser || !device_name) {
+      throw new Error('Something went wrong!')
+    }
+
+
+    const existingDevice = await Devices.findOne({
+      device_fingerprint
+    });
+
+
+
+    if (existingDevice)
+      throw new Error("device alreday registered in the system!");
+
+    const newDevice = await Devices.create({
+      device_name,
+      user_email: user.email,
+      device_os,
+      device_browser,
+      device_primary: true,
+      device_lost: false,
+      device_fingerprint
+    });
+
+    // list devices linked to the email, if two or more then user has multiple devices
+    const currentUserDevices = await Devices.find({
+      user_email: user.email
+    }).sort({ createdAt: -1 });
+
+    // user has mu
+    if (currentUserDevices.length > 1) {
+      user.hasDevices = true;
+      await user.save();
+    }
+
+    res.json({
+      message: "New device added successfully",
+      data: newDevice
+    });
+
+  } catch (err) {
+    console.error("Add device error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+// get user devices
+app.get(`${BASE_ROUTE}/device/my-devices`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const devices = await Devices.find({
+      user_email: user.email
+    }).sort({ createdAt: -1 });
+
+    res.json(devices);
+
+  } catch (err) {
+    console.error("Fetch devices error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+
+// get my lost device requests
+app.get(`${BASE_ROUTE}/device/lost/my-requests`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const requests = await DeviceLost.find({
+      user_email: user.email
+    }).sort({ createdAt: -1 });
+
+    res.json(requests);
+
+  } catch (err) {
+    console.error("Fetch my lost requests error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
+
+
+// signOut user
+app.post(`${BASE_ROUTE}/user/signout`, (req, res) => {
+  try {
+    // destroy the session
+    req.session.destroy();
+    // clear cookie if any
+    res.clearCookie(process.env.SESSION_NAME);
+    res.status(200).send("logged out successfully");
+  } catch (error) {
+    res.status(400).send(err.message);
   }
 });
