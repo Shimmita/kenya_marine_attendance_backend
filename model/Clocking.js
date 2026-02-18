@@ -11,7 +11,7 @@ const clockingSchema = new mongoose.Schema(
         },
 
         department: { type: String, required: true, default: "" },
-        supervisor: { type: String, default: "", required: true },
+        supervisor: { type: String, default: "", required: false },
         station: { type: String, default: "", required: true },
         phone: { type: String, required: true },
 
