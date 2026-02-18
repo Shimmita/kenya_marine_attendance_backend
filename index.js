@@ -16,6 +16,8 @@ import validator from "validator";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
+import MessageAdmin from "./model/MessageAdmin.js";
+import MessageUser from "./model/MessageUser.js";
 import User from "./model/User.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
@@ -739,6 +741,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
 // DEVICE LOST 
 app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
+
   try {
     if (!req.session.isOnline)
       return res.status(401).json({ message: "Unauthorized" });
@@ -750,6 +753,53 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
 
     if (!description || !startDate || !endDate)
       throw new Error("All fields are required");
+
+
+    // fetch recent clocking document of the user then pick the station from it
+    const latestStation = await Clocking.findOne({ email: user.email })
+      .sort({ clock_in: -1 })
+      .select("station")
+      .lean();
+
+    // for saving in the admin message notifications
+    const title = "Lost My Device"
+    const name = user.name
+    const phone = user.phone
+    const email = user.email
+    const department = user.department
+    const gender = user.gender
+    const role = user.role
+    // Check if station exists and extract the value
+    const stationName = latestStation?.station;
+    // 1. Determine Pronouns/Subject Reference based on Gender
+    const genderKey = gender?.toLowerCase();
+    const pronoun = genderKey === "male" ? "He" : genderKey === "female" ? "She" : "The user";
+
+    // 2. Format Role (Capitalize first letter)
+    const formattedRole = role.charAt(0).toUpperCase() + role.slice(1);
+
+    // 3. Define the Station Text (only if available)
+    const stationText = latestStation?.station
+      ? `\n- **Latest Clocking Station:** ${latestStation.station}`
+      : "";
+
+    // 4. Construct the letter-style message (Now including stationText)
+    const message = `**SUBJECT: Lost Device Report - ${name}**
+
+Hello Admin Team,
+
+**${formattedRole} ${name}** (Phone: ${phone}) from ${stationName} - **${department}** department has reported a lost device. ${pronoun} was last seen at a station.
+
+**Details:**
+- **Email:** ${email}${stationText}
+
+**Next Steps:**
+Please navigate to the **User Requests** section to review this case and resolve the issue. Most likely, this will involve deregistering the device from the system to ensure security.
+
+Best regards,
+System Automator`;
+
+
 
     const userDevices = await Devices.find({ user_email: user.email })
 
@@ -790,6 +840,18 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
         await primaryDevice.save()
       }
     }
+
+
+    // send message/notification to the admin+hr+supervisor
+    await MessageAdmin.create({
+      title,
+      message,
+      label: "urgent",
+      status: 'pending',
+      user_email: email,
+      device_fingerprint
+    })
+
 
     // mark user as device lost (temporary state)
     user.deviceLost = true;
@@ -848,7 +910,7 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
 
     const { requestId, action } = req.body;
 
-    if (!["granted", "rejected"].includes(action))
+    if (!["granted", "rejected", "success"].includes(action))
       throw new Error("Invalid action");
 
     const request = await DeviceLost.findById(requestId);
@@ -864,7 +926,7 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     const affectedUser = await User.findOne({ email: request.user_email });
     if (!affectedUser) throw new Error("User not found");
 
-    if (action === "granted") {
+    if (action === "granted" || action === "success") {
       // mark all devices lost
       await Devices.updateMany(
         { user_email: affectedUser.email },
@@ -880,6 +942,23 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
 
       await affectedUser.save();
     }
+
+    // update the admin message
+    const messageAdmin = await MessageAdmin.findOne({ device_fingerprint: request.device_fingerprint })
+    messageAdmin.status = action
+    messageAdmin.responded = responder.rank
+    messageAdmin.respondedName = responder.name
+
+    const message = generateAdminResponse(affectedUser, responder, action)
+
+    // send message notification to the user (specific email)
+    await MessageUser.create({
+      label: 'none',
+      message,
+      title: "Lost Device Request",
+      status: action,
+      user_email: affectedUser.email
+    })
 
     res.json({
       message: `Request ${action} successfully`,
@@ -998,10 +1077,82 @@ app.get(`${BASE_ROUTE}/device/lost/my-requests`, async (req, res) => {
 });
 
 
+// notifications
+
+// HIGH RANK NOTIF
+app.get(`${BASE_ROUTE}/admin/notification`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const acceptableRanks = ['admin', 'hr', 'supervisor']
+
+    if (!acceptableRanks.includes(user.rank)) {
+      throw new Error("unauthorized")
+    }
+
+    const messages = MessageAdmin.find({}).sort({ createdAt: -1 });
+    res.json(messages)
+
+  } catch (error) {
+    res.status(400).send(err.message);
+  }
+});
+
+
+// USER LEVEL NOTIF
+
+app.get(`${BASE_ROUTE}/user/notification`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+
+    const messages = MessageUser.find({ user_email: user.email }).sort({ createdAt: -1 });
+    res.json(messages)
+
+  } catch (error) {
+    res.status(400).send(err.message);
+  }
+});
+
+
+// delete user level notification
+app.delete(`${BASE_ROUTE}/user/notification/:id`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const user = await User.findById(req.session.userID);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const deleted = await MessageUser.findOneAndDelete({
+      _id: req.params.id,
+      user_email: user.email,
+    });
+
+    if (!deleted)
+      return res.status(404).json({ message: "Message not found" });
+
+    res.json({ message: "Deleted successfully" });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+
 
 
 // signOut user
-app.post(`${BASE_ROUTE}/user/signout`, (req, res) => {
+app.post(`${BASE_ROUTE}/user/signout`, async (req, res) => {
   try {
     // destroy the session
     req.session.destroy();
@@ -1012,3 +1163,43 @@ app.post(`${BASE_ROUTE}/user/signout`, (req, res) => {
     res.status(400).send(err.message);
   }
 });
+
+
+/**
+ * Generates an appropriate response message for the user based on the admin's decision.
+ */
+function generateAdminResponse(userTo, responder, action) {
+  const adminSignature = `${responder?.name} | ${responder?.rank}`;
+
+  if (action === "granted" || action === "success") {
+    return `Dear ${userTo?.name},
+
+Your request regarding the lost device has been successfully processed and the device has been deregistered from the system for security purposes.
+
+If you find the device, please contact the IT department immediately.
+
+Best regards, 
+${adminSignature} 
+Administration Department`;
+  }
+
+  if (action === "rejected") {
+    return `Dear ${userTo?.name},
+
+We have reviewed your request regarding the lost device. Unfortunately, we are unable to approve your request at this time. 
+
+Please visit the lost device section for details or contact support for further assistance.
+
+Best regards, 
+${adminSignature} 
+Administration Department`;
+  }
+
+  return `Dear ${userTo?.name},
+
+Your request regarding the lost device has been successfully processed.
+Best regards,
+${adminSignature} 
+Administration Department`;;
+}
+

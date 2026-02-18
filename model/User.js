@@ -49,7 +49,6 @@ const userSchema = new mongoose.Schema(
     },
     avatarID: { type: String, default: "" },
     avatar: { type: String, default: "" },
-
     email_verified: { type: Boolean, default: true },
     deviceLost: { type: Boolean, default: false },
     hasDevices: { type: Boolean, default: false },
