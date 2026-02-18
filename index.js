@@ -353,12 +353,13 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
       // Late if after 9:00 AM
       const isLate = hours > 9 || (hours === 9 && eatTime.getMinutes() > 0);
+      const isEmployee=user.role==="employee"
 
       const clockingData = {
         name: user.name,
         email: user.email,
         department: user.department,
-        supervisor: user.supervisor,
+        supervisor: isEmployee ? "":user.supervisor,
         station: selectedStation,
         phone: user.phone,
         // store UTC
