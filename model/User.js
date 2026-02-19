@@ -17,6 +17,7 @@ const userSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
     },
+  
     password: { type: String, required: true },
 
     department: { type: String, default: "" },
@@ -37,7 +38,7 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["employee", "intern", "attachee"],
+      enum: ["employee", "intern", "attachee", "employee-contract"],
       // Todo: make this required
       default: "employee",
     },

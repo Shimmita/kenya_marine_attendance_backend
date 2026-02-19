@@ -171,13 +171,29 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    const options = await generateRegistrationOptions({
+    // temp fix so that it can register outside google emails
+    // can make use of platform to force using device bound auth
+    /* const options = await generateRegistrationOptions({
       rpName: "KMFRI Attendance",
       rpID: getRpID(),
       userID: Uint8Array.from(Buffer.from(user._id.toString())),
       userName: user.email,
       authenticatorSelection: { userVerification: "required" },
+    }); */
+
+    const options = await generateRegistrationOptions({
+      rpName: "KMFRI Attendance",
+      rpID: getRpID(),
+      userID: Uint8Array.from(Buffer.from(user._id.toString())),
+      userName: user.email,
+      attestationType: "none",
+      supportedAlgorithmIDs: [-7, -257],
+      authenticatorSelection: {
+        residentKey: "preferred",
+        userVerification: "required",
+      },
     });
+
 
     req.session.registrationChallenge = options.challenge;
     res.json(options);
@@ -353,13 +369,13 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
       // Late if after 9:00 AM
       const isLate = hours > 9 || (hours === 9 && eatTime.getMinutes() > 0);
-      const isEmployee=user.role==="employee"
+      const isEmployee = user.role === "employee"
 
       const clockingData = {
         name: user.name,
         email: user.email,
         department: user.department,
-        supervisor: isEmployee ? "":user.supervisor,
+        supervisor: isEmployee ? "" : user.supervisor,
         station: selectedStation,
         phone: user.phone,
         // store UTC
