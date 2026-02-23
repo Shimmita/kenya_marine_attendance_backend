@@ -1220,3 +1220,266 @@ ${adminSignature}
 Administration Department`;;
 }
 
+
+
+//  USER MANAGEMENT ROUTE
+// deactivate user
+app.put(`${BASE_ROUTE}/admin/user/:id/toggle-active`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    // Only admin/hr/ceo can manage users
+    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    // Prevent admin from deactivating themselves
+    if (targetUser._id.toString() === currentUser._id.toString())
+      return res.status(400).json({ message: "You cannot deactivate yourself" });
+
+    targetUser.isAccountActive = !targetUser.isAccountActive;
+    await targetUser.save();
+
+    res.json({
+      message: `User account is now ${targetUser.isAccountActive ? "Active" : "Deactivated"
+        }`,
+      user: targetUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// change user rank 
+app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const { rank } = req.body;
+
+    const allowedRanks = ["admin", "user", "hr", "supervisor", "ceo"];
+    if (!allowedRanks.includes(rank))
+      return res.status(400).json({ message: "Invalid rank value" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "ceo"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Only admin or CEO can change ranks" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    targetUser.rank = rank;
+    await targetUser.save();
+
+    res.json({
+      message: `User rank updated to ${rank}`,
+      user: targetUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// change user role
+app.put(`${BASE_ROUTE}/admin/user/:id/update-role`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const { role } = req.body;
+
+    const allowedRoles = [
+      "employee",
+      "intern",
+      "attachee",
+      "employee-contract",
+    ];
+
+    if (!allowedRoles.includes(role))
+      return res.status(400).json({ message: "Invalid role value" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    targetUser.role = role;
+    await targetUser.save();
+
+    res.json({
+      message: `User role updated to ${role}`,
+      user: targetUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// get all users
+app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "ceo", "supervisor"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const users = await User.find().sort({ createdAt: -1 });
+
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// change or add department
+app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const { department } = req.body;
+
+    if (!department || department.trim() === "")
+      return res.status(400).json({ message: "Department is required" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    targetUser.department = department.trim();
+    await targetUser.save();
+
+    res.json({
+      message: `Department updated successfully`,
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+
+// change or update station
+app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
+  try {
+  
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const { station } = req.body;
+    console.log(station)
+
+    if (!station || station ===undefined || station===null)
+      return res.status(400).json({ message: "Station is required" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "ceo", "supervisor"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    targetUser.station = station;
+    await targetUser.save();
+
+    res.json({
+      message: `station updated successfully`,
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// add update supervisor
+
+app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const {supervisor } = req.body;
+
+    if (!supervisor)
+      return res.status(400).json({ message: "Supervisor ID is required" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    const supervisorUser = await User.findOne({name:supervisor?.trim()?.toLowerCase()});
+    if (!supervisorUser)
+      return res.status(404).json({ message: "Supervisor not found" });
+
+    // Ensure supervisor has proper rank
+    if (!["supervisor", "admin", "hr", "ceo"].includes(supervisorUser.rank))
+      return res.status(400).json({ message: "Selected user is not eligible to be a supervisor" });
+
+    // Prevent assigning user as their own supervisor
+    if (targetUser._id.toString() === supervisorUser._id.toString())
+      return res.status(400).json({ message: "User cannot supervise themselves" });
+
+    // Store supervisor as name or email (since schema uses string)
+    targetUser.supervisor = supervisorUser.name;
+    await targetUser.save();
+
+    res.json({
+      message: "Supervisor updated successfully",
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+

@@ -7,6 +7,7 @@ const authenticatorSchema = new mongoose.Schema({
   counter: { type: Number, required: true, default: 0 },
 });
 
+
 const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -17,13 +18,16 @@ const userSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
     },
-  
+
     password: { type: String, required: true },
 
     department: { type: String, default: "" },
-    supervisor: { type: String, default: "" },
+    supervisor: {
+      type: String, default: "", lowercase: true,
+      trim: true,
+    },
     phone: { type: String, required: true },
-
+    station: { type: String, default: "" },
     startDate: { type: String, required: false, default: null },
     endDate: { type: String, required: false, default: null },
 
@@ -56,6 +60,7 @@ const userSchema = new mongoose.Schema(
     doneBiometric: { type: Boolean, default: false },
     hasClockedIn: { type: Boolean, default: false },
     isToClockOut: { type: Boolean, default: false },
+    isAccountActive: { type: Boolean, default: true },
     // 🔐 BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
     authenticator: authenticatorSchema,
   },
