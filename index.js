@@ -18,6 +18,7 @@ import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
+import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
@@ -1282,6 +1283,27 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    // suppose user is being updated to supervisor, then populate them in supervisor db
+    const alreadySupervisor = await Supervisor.findOne({ email: targetUser.email })
+
+    if (rank?.trim()?.toLowerCase() === 'supervisor') {
+      if (!alreadySupervisor) {
+        await Supervisor.create({
+          name: targetUser.name,
+          email: targetUser.email,
+          station: targetUser.station,
+          department: targetUser.department
+        })
+      }
+    }
+
+    // remove them from supervisor db if they are just user and initially was supervisor
+    if (rank?.trim()?.toLowerCase() === 'user') {
+      if (alreadySupervisor) {
+        await Supervisor.findByIdAndDelete(alreadySupervisor._id)
+      }
+    }
+
     targetUser.rank = rank;
     await targetUser.save();
 
@@ -1399,14 +1421,14 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
 // change or update station
 app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
   try {
-  
+
     if (!req.session.isOnline)
       return res.status(401).json({ message: "Unauthorized" });
 
     const { station } = req.body;
     console.log(station)
 
-    if (!station || station ===undefined || station===null)
+    if (!station || station === undefined || station === null)
       return res.status(400).json({ message: "Station is required" });
 
     const currentUser = await User.findById(req.session.userID);
@@ -1434,17 +1456,31 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
 });
 
 
-// add update supervisor
+
+
+// get all supervisors
+app.get(`${BASE_ROUTE}/all/supervisors`, async (req, res) => {
+  try {
+    const supervisors = await Supervisor.find({})
+    res.status(200).json(supervisors)
+  } catch (error) {
+    res.status(400).send(error.message)
+  }
+})
+
+
+// assign supervisor to the user
 
 app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
   try {
     if (!req.session.isOnline)
       return res.status(401).json({ message: "Unauthorized" });
 
-    const {supervisor } = req.body;
+    const { supervisor } = req.body;
+
 
     if (!supervisor)
-      return res.status(400).json({ message: "Supervisor ID is required" });
+      return res.status(400).json({ message: "Supervisor is required" });
 
     const currentUser = await User.findById(req.session.userID);
     if (!currentUser)
@@ -1457,20 +1493,26 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
-    const supervisorUser = await User.findOne({name:supervisor?.trim()?.toLowerCase()});
-    if (!supervisorUser)
+    // fetch the gen user data for the potential supervisor be
+    const supervisorInUserDB = await User.findOne({ email: supervisor.email })
+    if (!supervisorInUserDB) {
+      return res.status(404).json({ message: "Supervisor not found" });
+    }
+    // fetch the potential supervisor data in supervisor data
+    const userInSupervisorDb = await Supervisor.findOne({ email: supervisor.email });
+    if (!userInSupervisorDb)
       return res.status(404).json({ message: "Supervisor not found" });
 
     // Ensure supervisor has proper rank
-    if (!["supervisor", "admin", "hr", "ceo"].includes(supervisorUser.rank))
+    if (!["supervisor", "admin", "hr", "ceo"].includes(supervisorInUserDB.rank))
       return res.status(400).json({ message: "Selected user is not eligible to be a supervisor" });
 
     // Prevent assigning user as their own supervisor
-    if (targetUser._id.toString() === supervisorUser._id.toString())
+    if (targetUser._id.toString() === userInSupervisorDb._id.toString())
       return res.status(400).json({ message: "User cannot supervise themselves" });
 
     // Store supervisor as name or email (since schema uses string)
-    targetUser.supervisor = supervisorUser.name;
+    targetUser.supervisor = userInSupervisorDb.name;
     await targetUser.save();
 
     res.json({
