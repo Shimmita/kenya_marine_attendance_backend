@@ -59,6 +59,7 @@ const userSchema = new mongoose.Schema(
     hasDevices: { type: Boolean, default: false },
     doneBiometric: { type: Boolean, default: false },
     hasClockedIn: { type: Boolean, default: false },
+    isOnLeave: { type: Boolean, default: false },
     isToClockOut: { type: Boolean, default: false },
     isAccountActive: { type: Boolean, default: true },
     // 🔐 BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings

@@ -20,6 +20,7 @@ import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
+import Leave from "./model/Leave.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -1276,8 +1277,11 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "ceo"].includes(currentUser.rank))
-      return res.status(403).json({ message: "Only admin or CEO can change ranks" });
+    if (!["admin", "ceo", "hr"].includes(currentUser.rank))
+      return res.status(403).json({ message: "unauthorised operation!" });
+
+    if (!["employee"].includes(currentUser.role))
+      return res.status(403).json({ message: "You are not yet permanent employee!" });
 
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
@@ -1522,6 +1526,57 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+
+
+
+// LEAVE MANAGEMENT
+
+// post
+app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
+  try {
+    const leave = await Leave.create(req.body);
+    res.status(201).json(leave);
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+// Get all leaves
+app.get(`${BASE_ROUTE}/all/leaves`, async (req, res) => {
+  try {
+    const leaves = await Leave.find({});
+    res.status(200).json(leaves);
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+// update the leave
+app.put(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
+  try {
+    const updatedLeave = await Leave.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true }
+    );
+
+    res.status(200).json(updatedLeave);
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+
+// delete leave
+app.delete(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
+  try {
+    await Leave.findByIdAndDelete(req.params.id);
+    res.status(200).json({ message: "Leave deleted successfully" });
+  } catch (error) {
+    res.status(400).send(error.message);
   }
 });
 
