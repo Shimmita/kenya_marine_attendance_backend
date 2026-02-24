@@ -16,11 +16,11 @@ import validator from "validator";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
+import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
-import Leave from "./model/Leave.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -1537,6 +1537,11 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
 // post
 app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
   try {
+    
+    if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
+      return res.status(400).json("end date should be higher than start date");
+    }
+
     const leave = await Leave.create(req.body);
     res.status(201).json(leave);
   } catch (error) {
@@ -1544,8 +1549,23 @@ app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
   }
 });
 
-// Get all leaves
-app.get(`${BASE_ROUTE}/all/leaves`, async (req, res) => {
+// Get all leaves user
+app.get(`${BASE_ROUTE}/user/all/leaves`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    const leaves = await Leave.find({ email: currentUser.email });
+    res.status(200).json(leaves);
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+app.get(`${BASE_ROUTE}/admin/all/leaves`, async (req, res) => {
   try {
     const leaves = await Leave.find({});
     res.status(200).json(leaves);
