@@ -168,7 +168,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
  */
 app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
   try {
-    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+    if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
 
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
@@ -262,7 +262,8 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
  */
 app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
   try {
-    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
 
     const user = await User.findById(req.session.userID);
     if (!user || !user.authenticator) {
@@ -1537,7 +1538,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
 // post
 app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
   try {
-    
+
     if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
       return res.status(400).json("end date should be higher than start date");
     }
@@ -1568,14 +1569,30 @@ app.get(`${BASE_ROUTE}/user/all/leaves`, async (req, res) => {
 app.get(`${BASE_ROUTE}/admin/all/leaves`, async (req, res) => {
   try {
     const leaves = await Leave.find({});
-    res.status(200).json(leaves);
+
+    // Fetch corresponding user info for each leave
+    const enrichedLeaves = await Promise.all(
+      leaves.map(async (leave) => {
+        const user = await User.findOne({ email: leave.email }).select(
+          "name department station email"
+        );
+        return {
+          ...leave.toObject(),
+          name: user?.name || "Unknown",
+          department: user?.department || "N/A",
+          station: user?.station || "N/A",
+        };
+      })
+    );
+
+    res.status(200).json(enrichedLeaves);
   } catch (error) {
     res.status(400).send(error.message);
   }
 });
 
 // update the leave
-app.put(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
+app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
   try {
     const updatedLeave = await Leave.findByIdAndUpdate(
       req.params.id,
