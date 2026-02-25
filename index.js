@@ -21,6 +21,7 @@ import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
+import Feedback from "./model/Feedback.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -1617,3 +1618,60 @@ app.delete(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
   }
 });
 
+
+
+// feedback
+
+app.post(`${BASE_ROUTE}/feedback`, async (req, res) => {
+  try {
+    const feedback = new Feedback(req.body);
+    await feedback.save();
+    res.status(201).json({ message: "Feedback saved successfully" });
+  } catch (error) {
+    res.status(500).json({ message: "Error saving feedback", error });
+  }
+});
+
+
+// create the get rated feedback and analysed stats 
+// GET FEEDBACK ANALYTICS
+app.get(`${BASE_ROUTE}/admin/feedback/analytics`, async (req, res) => {
+  try {
+    const stats = await Feedback.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalResponses: { $sum: 1 },
+          avgOverall: { $avg: "$overall" },
+          avgEaseOfUse: { $avg: "$easeOfUse" },
+          avgResponsiveness: { $avg: "$responsiveness" },
+          avgSpeed: { $avg: "$speed" },
+          avgClocking: { $avg: "$clocking" },
+          avgUiDesign: { $avg: "$uiDesign" },
+          avgReliability: { $avg: "$reliability" },
+        }
+      }
+    ]);
+
+    const distribution = await Feedback.aggregate([
+      {
+        $bucket: {
+          groupBy: "$overall",
+          boundaries: [0, 4, 7, 9, 11],
+          default: "Other",
+          output: {
+            count: { $sum: 1 }
+          }
+        }
+      }
+    ]);
+
+    res.json({
+      summary: stats[0],
+      distribution
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: "Error generating analytics", error });
+  }
+});
