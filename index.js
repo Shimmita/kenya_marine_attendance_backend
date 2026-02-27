@@ -668,89 +668,245 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
 // Admin Overall Stats
 app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
   try {
-    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
 
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
+    const workingDaysSoFar =
+      Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
+
     const [records, allUsers] = await Promise.all([
       Clocking.find({ clock_in: { $gte: startOfMonth } }),
-      User.find({}, 'email name department station')
+      User.find({}, "email name department station isAccountActive role")
     ]);
+
+    const totalStaff = allUsers.length;
 
     const stats = {
       orgTotalHours: 0,
       orgTotalOvertime: 0,
-      departmentData: {},
-      stationData: {}, // Track which branches are most active
+      stations: {},
       employeeMetrics: {},
-      lateToday: 0
+      inactiveUsers: allUsers.filter(u => !u.isAccountActive).length
     };
+
+    // -----------------------------------
+    // PROCESS RECORDS
+    // -----------------------------------
 
     records.forEach(rec => {
       const email = rec.email;
-      const dept = rec.department || "Unassigned";
-      const station = rec.station || "Main";
+      const station = rec.station || "Unassigned";
+      const department = rec.department || "Unassigned";
 
       if (!stats.employeeMetrics[email]) {
-        stats.employeeMetrics[email] = { hours: 0, overtime: 0, lateCount: 0, earlyCount: 0, days: new Set() };
+        stats.employeeMetrics[email] = {
+          hours: 0,
+          overtime: 0,
+          lateCount: 0,
+          earlyCount: 0,
+          daysPresent: new Set()
+        };
       }
 
-      // 1. Calculate Hours
+      let hoursWorked = 0;
+
       if (rec.clock_out) {
-        const diff = (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
-        stats.employeeMetrics[email].hours += diff;
-        if (diff > 9) stats.employeeMetrics[email].overtime += (diff - 9);
+        hoursWorked =
+          (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
+
+        stats.employeeMetrics[email].hours += hoursWorked;
+
+        if (hoursWorked > 9) {
+          stats.employeeMetrics[email].overtime += hoursWorked - 9;
+        }
+
+        stats.employeeMetrics[email].daysPresent.add(
+          rec.clock_in.toDateString()
+        );
       }
 
-      // 2. Punctuality
       if (rec.isLate) stats.employeeMetrics[email].lateCount++;
       else stats.employeeMetrics[email].earlyCount++;
 
-      // 3. Dept & Station Aggregation
-      if (!stats.departmentData[dept]) stats.departmentData[dept] = { hours: 0, staff: new Set() };
-      stats.departmentData[dept].hours += (rec.clock_out ? (rec.clock_out - rec.clock_in) / (1000 * 60 * 60) : 0);
-      stats.departmentData[dept].staff.add(email);
+      // -----------------------------------
+      // STATION INIT
+      // -----------------------------------
 
-      if (!stats.stationData[station]) stats.stationData[station] = { checkins: 0 };
-      stats.stationData[station].checkins++;
+      if (!stats.stations[station]) {
+        stats.stations[station] = {
+          totalHours: 0,
+          totalOvertime: 0,
+          totalCheckins: 0,
+          lateCount: 0,
+          staffSet: new Set(),
+          departments: {},
+          employeeScores: []
+        };
+      }
+
+      const stationObj = stats.stations[station];
+
+      stationObj.totalHours += hoursWorked;
+      stationObj.totalCheckins++;
+      stationObj.staffSet.add(email);
+      if (rec.isLate) stationObj.lateCount++;
+
+      if (hoursWorked > 9) {
+        stationObj.totalOvertime += hoursWorked - 9;
+      }
+
+      // -----------------------------------
+      // DEPARTMENT INIT
+      // -----------------------------------
+
+      if (!stationObj.departments[department]) {
+        stationObj.departments[department] = {
+          totalHours: 0,
+          totalOvertime: 0,
+          lateCount: 0,
+          staffSet: new Set(),
+          employeeScores: []
+        };
+      }
+
+      const deptObj = stationObj.departments[department];
+
+      deptObj.totalHours += hoursWorked;
+      deptObj.staffSet.add(email);
+      if (rec.isLate) deptObj.lateCount++;
+
+      if (hoursWorked > 9) {
+        deptObj.totalOvertime += hoursWorked - 9;
+      }
     });
 
-    // Final Org-wide Calculations
-    const totalStaff = allUsers.length;
-    let burnoutAlerts = 0;
-    let topPerformers = [];
+    // -----------------------------------
+    // BUILD EMPLOYEE SCORES
+    // -----------------------------------
+
+    const employeeScores = [];
 
     Object.entries(stats.employeeMetrics).forEach(([email, data]) => {
+
+      const attendanceRate =
+        (data.daysPresent.size / workingDaysSoFar) * 100;
+
+      const productivityScore =
+        (data.hours * 0.6) +
+        (data.earlyCount * 2) -
+        (data.lateCount * 1.5) +
+        (data.overtime * 0.5);
+
+      let burnoutLevel = "Low";
+      if (data.overtime > 20) burnoutLevel = "High";
+      else if (data.overtime > 10) burnoutLevel = "Moderate";
+
       stats.orgTotalHours += data.hours;
       stats.orgTotalOvertime += data.overtime;
-      if (data.overtime > 20) burnoutAlerts++; // More than 20h overtime/month is high risk
 
-      topPerformers.push({
+      employeeScores.push({
         email,
-        score: (data.hours * 0.6) + (data.earlyCount * 2) - (data.lateCount * 1)
+        hours: data.hours.toFixed(1),
+        overtime: data.overtime.toFixed(1),
+        attendanceRate: attendanceRate.toFixed(1) + "%",
+        burnoutLevel,
+        score: productivityScore
+      });
+
+      // assign to station & department
+      const user = allUsers.find(u => u.email === email);
+      if (!user) return;
+
+      const station = user.station || "Unassigned";
+      const department = user.department || "Unassigned";
+
+      if (stats.stations[station]) {
+        stats.stations[station].employeeScores.push({
+          email,
+          score: productivityScore
+        });
+
+        if (stats.stations[station].departments[department]) {
+          stats.stations[station].departments[department].employeeScores.push({
+            email,
+            score: productivityScore
+          });
+        }
+      }
+    });
+
+    // -----------------------------------
+    // FINALIZE STATION & DEPT METRICS
+    // -----------------------------------
+
+    Object.values(stats.stations).forEach(station => {
+
+      station.headcount = station.staffSet.size;
+      station.averageHoursPerStaff =
+        station.headcount > 0
+          ? (station.totalHours / station.headcount).toFixed(1)
+          : 0;
+
+      station.efficiencyScore =
+        ((station.totalHours / (station.headcount * 160)) * 100).toFixed(1) + "%";
+
+      station.disciplineRate =
+        ((station.lateCount / station.totalCheckins) * 100).toFixed(1) + "%";
+
+      station.topPerformers =
+        station.employeeScores
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5);
+
+      delete station.staffSet;
+      delete station.employeeScores;
+
+      Object.values(station.departments).forEach(dept => {
+
+        dept.headcount = dept.staffSet.size;
+        dept.averageHoursPerStaff =
+          dept.headcount > 0
+            ? (dept.totalHours / dept.headcount).toFixed(1)
+            : 0;
+
+        dept.overworked =
+          dept.averageHoursPerStaff > 160 ? true : false;
+
+        dept.disciplineRate =
+          ((dept.lateCount / dept.headcount) * 100).toFixed(1) + "%";
+
+        dept.topPerformers =
+          dept.employeeScores
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5);
+
+        delete dept.staffSet;
+        delete dept.employeeScores;
       });
     });
+
+    // -----------------------------------
+    // FINAL RESPONSE
+    // -----------------------------------
 
     res.status(200).json({
       overview: {
         totalStaff,
         activeStaffThisMonth: Object.keys(stats.employeeMetrics).length,
+        inactiveAccounts: stats.inactiveUsers,
         totalOrgHours: stats.orgTotalHours.toFixed(1),
         totalOrgOvertime: stats.orgTotalOvertime.toFixed(1),
-        averageStaffEfficiency: (stats.orgTotalHours / (totalStaff * 160) * 100).toFixed(1) + "%", // Based on 160h standard month
+        averageStaffEfficiency:
+          ((stats.orgTotalHours / (totalStaff * 160)) * 100).toFixed(1) + "%"
       },
-      healthSignals: {
-        burnoutRiskCount: burnoutAlerts,
-        chronicLatenessDept: Object.keys(stats.departmentData).sort((a, b) => b.hours - a.hours)[0],
-        mostActiveStation: Object.keys(stats.stationData).sort((a, b) => b.checkins - a.checkins)[0]
-      },
-      departmentBreakdown: Object.keys(stats.departmentData).map(d => ({
-        name: d,
-        totalHours: stats.departmentData[d].hours.toFixed(1),
-        headcount: stats.departmentData[d].staff.size
-      })),
-      topPerformers: topPerformers.sort((a, b) => b.score - a.score).slice(0, 5)
+      topPerformersOverall:
+        employeeScores
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5),
+      stations: stats.stations
     });
 
   } catch (error) {
