@@ -783,6 +783,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       }
     });
 
+
+
     // -----------------------------------
     // BUILD EMPLOYEE SCORES
     // -----------------------------------
@@ -911,6 +913,123 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+
+
+// departmental stats
+ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+    const currentSupervisor = await User.findById(req.session.userID);
+    if (!currentSupervisor) throw new Error("User not found");
+
+    // supervisor dept
+    const department=currentSupervisor.department
+
+     if (!["supervisor"].includes(currentSupervisor.rank))
+      return res.status(400).json({ message: "Selected user is not eligible to be a supervisor" });
+
+    // Fetch all staff in the department
+    const staff = await User.find(
+      { department },
+      "email name department station isAccountActive role"
+    ).lean();
+
+    if (!staff.length)
+      return res.status(404).json({ message: "No staff found in this department" });
+
+    const emails = staff.map(u => u.email);
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const workingDaysSoFar =
+      Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
+
+    // Fetch clocking records for these staff
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: startOfMonth },
+    }).lean();
+
+    const deptStats = {
+      totalHours: 0,
+      totalOvertime: 0,
+      lateCount: 0,
+      employeeMetrics: [],
+    };
+
+    const metricsMap = {};
+    staff.forEach(u => {
+      metricsMap[u.email] = {
+        name: u.name,
+        email: u.email,
+        station: u.station,
+        hours: 0,
+        overtime: 0,
+        lateCount: 0,
+        daysPresent: new Set(),
+      };
+    });
+
+    records.forEach(rec => {
+      const metric = metricsMap[rec.email];
+      if (!metric) return;
+
+      let hoursWorked = 0;
+      if (rec.clock_out) {
+        hoursWorked = (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
+        metric.hours += hoursWorked;
+        if (hoursWorked > 9) metric.overtime += hoursWorked - 9;
+        metric.daysPresent.add(rec.clock_in.toDateString());
+      }
+
+      if (rec.isLate) metric.lateCount++;
+    });
+
+    // Build department totals
+    Object.values(metricsMap).forEach(m => {
+      deptStats.totalHours += m.hours;
+      deptStats.totalOvertime += m.overtime;
+      deptStats.lateCount += m.lateCount;
+
+      const attendanceRate = (m.daysPresent.size / workingDaysSoFar) * 100;
+
+      const productivityScore =
+        m.hours * 0.6 + m.overtime * 0.5 - m.lateCount * 1.5;
+
+      let burnoutLevel = "Low";
+      if (m.overtime > 20) burnoutLevel = "High";
+      else if (m.overtime > 10) burnoutLevel = "Moderate";
+
+      deptStats.employeeMetrics.push({
+        name: m.name,
+        email: m.email,
+        station: m.station,
+        hours: m.hours.toFixed(1),
+        overtime: m.overtime.toFixed(1),
+        lateCount: m.lateCount,
+        daysPresent: m.daysPresent.size,
+        attendanceRate: attendanceRate.toFixed(1) + "%",
+        productivityScore: productivityScore.toFixed(1),
+        burnoutLevel,
+      });
+    });
+
+    res.json({
+      department,
+      totalStaff: staff.length,
+      activeStaffThisMonth: Object.keys(metricsMap).length,
+      totalHours: deptStats.totalHours.toFixed(1),
+      totalOvertime: deptStats.totalOvertime.toFixed(1),
+      totalLateCount: deptStats.lateCount,
+      employeeMetrics: deptStats.employeeMetrics,
+    });
+  } catch (error) {
+    console.error("Department stats error:", error);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
