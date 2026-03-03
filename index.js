@@ -919,36 +919,45 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
 
 // departmental stats
- app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
+app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
   try {
     if (!req.session?.isOnline)
       return res.status(401).json({ message: "Unauthorized" });
+
     const currentSupervisor = await User.findById(req.session.userID);
-    if (!currentSupervisor) throw new Error("User not found");
+    if (!currentSupervisor)
+      return res.status(404).json({ message: "User not found" });
 
-    // supervisor dept
-    const department=currentSupervisor.department
+    if (currentSupervisor.rank !== "supervisor")
+      return res.status(403).json({
+        message: "Selected user is not eligible to be a supervisor",
+      });
 
-     if (!["supervisor"].includes(currentSupervisor.rank))
-      return res.status(400).json({ message: "Selected user is not eligible to be a supervisor" });
+    const department = currentSupervisor.department;
 
-    // Fetch all staff in the department
+    // -----------------------------------
+    // FETCH STAFF
+    // -----------------------------------
     const staff = await User.find(
       { department },
       "email name department station isAccountActive role"
     ).lean();
 
     if (!staff.length)
-      return res.status(404).json({ message: "No staff found in this department" });
+      return res.status(404).json({
+        message: "No staff found in this department",
+      });
 
-    const emails = staff.map(u => u.email);
+    const emails = staff.map((u) => u.email);
 
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const workingDaysSoFar =
       Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
 
-    // Fetch clocking records for these staff
+    // -----------------------------------
+    // FETCH CLOCKING RECORDS
+    // -----------------------------------
     const records = await Clocking.find({
       email: { $in: emails },
       clock_in: { $gte: startOfMonth },
@@ -962,7 +971,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     };
 
     const metricsMap = {};
-    staff.forEach(u => {
+
+    staff.forEach((u) => {
       metricsMap[u.email] = {
         name: u.name,
         email: u.email,
@@ -974,31 +984,47 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       };
     });
 
-    records.forEach(rec => {
+    // -----------------------------------
+    // PROCESS RECORDS
+    // -----------------------------------
+    records.forEach((rec) => {
       const metric = metricsMap[rec.email];
       if (!metric) return;
 
       let hoursWorked = 0;
+
       if (rec.clock_out) {
-        hoursWorked = (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
+        hoursWorked =
+          (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
+
         metric.hours += hoursWorked;
-        if (hoursWorked > 9) metric.overtime += hoursWorked - 9;
-        metric.daysPresent.add(rec.clock_in.toDateString());
+
+        if (hoursWorked > 9)
+          metric.overtime += hoursWorked - 9;
+
+        metric.daysPresent.add(
+          rec.clock_in.toDateString()
+        );
       }
 
       if (rec.isLate) metric.lateCount++;
     });
 
-    // Build department totals
-    Object.values(metricsMap).forEach(m => {
+    // -----------------------------------
+    // BUILD EMPLOYEE METRICS
+    // -----------------------------------
+    Object.values(metricsMap).forEach((m) => {
       deptStats.totalHours += m.hours;
       deptStats.totalOvertime += m.overtime;
       deptStats.lateCount += m.lateCount;
 
-      const attendanceRate = (m.daysPresent.size / workingDaysSoFar) * 100;
+      const attendanceRate =
+        (m.daysPresent.size / workingDaysSoFar) * 100;
 
       const productivityScore =
-        m.hours * 0.6 + m.overtime * 0.5 - m.lateCount * 1.5;
+        m.hours * 0.6 +
+        m.overtime * 0.5 -
+        m.lateCount * 1.5;
 
       let burnoutLevel = "Low";
       if (m.overtime > 20) burnoutLevel = "High";
@@ -1013,11 +1039,23 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
         lateCount: m.lateCount,
         daysPresent: m.daysPresent.size,
         attendanceRate: attendanceRate.toFixed(1) + "%",
-        productivityScore: productivityScore.toFixed(1),
+        productivityScore,
         burnoutLevel,
       });
     });
 
+    // -----------------------------------
+    // SORT + TOP 3 PERFORMERS
+    // -----------------------------------
+    const sortedEmployees = [...deptStats.employeeMetrics].sort(
+      (a, b) => b.productivityScore - a.productivityScore
+    );
+
+    const top3Performers = sortedEmployees.slice(0, 3);
+
+    // -----------------------------------
+    // RESPONSE
+    // -----------------------------------
     res.json({
       department,
       totalStaff: staff.length,
@@ -1025,8 +1063,10 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       totalHours: deptStats.totalHours.toFixed(1),
       totalOvertime: deptStats.totalOvertime.toFixed(1),
       totalLateCount: deptStats.lateCount,
-      employeeMetrics: deptStats.employeeMetrics,
+      topPerformers: top3Performers,   // 🔥 NEW
+      employeeMetrics: sortedEmployees,
     });
+
   } catch (error) {
     console.error("Department stats error:", error);
     res.status(500).json({ message: "Server error" });
@@ -1661,6 +1701,27 @@ app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
   }
 });
 
+// get all users per department
+app.get(`${BASE_ROUTE}/supervisor/users`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["supervisor"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const users = await User.find({ department: currentUser.department }).sort({ createdAt: -1 });
+
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 
 // change or add department
 app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
@@ -1862,6 +1923,38 @@ app.get(`${BASE_ROUTE}/admin/all/leaves`, async (req, res) => {
     );
 
     res.status(200).json(enrichedLeaves);
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+
+// supervisor get leaves of their department
+app.get(`${BASE_ROUTE}/supervisor/leaves`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentSupervisor = await User.findById(req.session.userID);
+    if (!currentSupervisor)
+      return res.status(404).json({ message: "User not found" });
+
+    if (currentSupervisor.rank !== "supervisor")
+      return res.status(403).json({
+        message: "Selected user is not eligible to be a supervisor",
+      });
+
+    const department = currentSupervisor.department;
+
+    // Get all users in the supervisor's department
+    const departmentUsers = await User.find({ department }).select("email");
+
+    const departmentEmails = departmentUsers.map((u) => u.email);
+
+    // Fetch leaves for users in the supervisor's department
+    const leaves = await Leave.find({ email: { $in: departmentEmails } });
+
+    res.status(200).json(leaves);
   } catch (error) {
     res.status(400).send(error.message);
   }
