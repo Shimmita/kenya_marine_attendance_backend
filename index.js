@@ -16,12 +16,14 @@ import validator from "validator";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
+import Feedback from "./model/Feedback.js";
 import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
+import uploadAvatar from "./model/middleware/UploadFile.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
-import Feedback from "./model/Feedback.js";
+import sharp from "sharp";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -161,6 +163,71 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     return res.status(400).json({ message: error.message });
   }
 });
+
+
+// UPDATE USER PROFILE
+app.put(
+  `${BASE_ROUTE}/user/update-profile`,
+  uploadAvatar.single("avatar"),
+  async (req, res) => {
+    try {
+
+      if (!req.session?.userID) {
+        return res.status(401).json({ message: "Unauthorized" });
+      }
+
+      const { phone, newPassword } = req.body;
+      const userId = req.session.userID;
+
+      const updateData = {};
+
+      /* update phone */
+      if (phone) {
+        updateData.phone = phone.trim();
+      }
+
+      /* update password */
+      if (newPassword) {
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        updateData.password = hashedPassword;
+      }
+
+      /* update avatar */
+      if (req.file) {
+
+        const compressed = await sharp(req.file.buffer)
+          .resize(400, 400, { fit: "cover" })
+          .jpeg({ quality: 70 })
+          .toBuffer();
+
+        const base64Image =
+          `data:image/jpeg;base64,${compressed.toString("base64")}`;
+
+        updateData.avatar = base64Image;
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({ message: "No changes provided" });
+      }
+
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        { $set: updateData },
+        { new: true, select: "-password" }
+      );
+
+      res.status(200).json({
+        user: updatedUser,
+      });
+
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: "Failed to update profile" });
+    }
+  }
+);
+
+
 
 // ─── Biometrics ───────────────────────────────────────────────────────────────
 
