@@ -63,6 +63,15 @@ const userSchema = new mongoose.Schema(
     isAccountActive: { type: Boolean, default: false },
     // 🔐 BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
     authenticator: authenticatorSchema,
+    // will be set to true if user is allowed to clock out outside the station premises (e.g. for field work)
+    canClockOutside: { type: Boolean, default: false },
+    outsideClockingDetails: {
+      startDate: { type: Date, default: null },
+      endDate: { type: Date, default: null },
+      reason: { type: String, default: "" },
+      authorizedBy: { type: String, default: "" },
+      authorizedByRole: { type: String, default: "" }
+    },
   },
   { timestamps: true }
 );

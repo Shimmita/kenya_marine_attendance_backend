@@ -18,6 +18,8 @@ const clockingSchema = new mongoose.Schema(
         clock_in: { type: Date, required: true },
         clock_out: { type: Date, default: null },
         isPresent: { type: Boolean, default: false },
+        clockedOutSide: { type: Boolean, default: false },
+        outSideReason: { type: String, default: ""},
         isLate: { type: Boolean, default: false },
 
     },

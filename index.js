@@ -1805,7 +1805,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+    if (!["admin", "hr","supervisor"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -1844,7 +1844,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo", "supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr","supervisor"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -2108,5 +2108,90 @@ app.get(`${BASE_ROUTE}/admin/feedback/analytics`, async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ message: "Error generating analytics", error });
+  }
+});
+
+
+// supervisor/admin/hr allowing user to clock outside
+app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) => {
+  try {
+    // 1. Session Check
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const { startDate, endDate, reason } = req.body;
+
+    // 2. Validation
+    if (!startDate || !endDate || !reason) {
+      return res.status(400).json({ message: "Start date, end date, and reason are required" });
+    }
+
+    // 3. Authorization Check
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "supervisor"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    // 4. Update Target User
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    // Update the permission and the details
+    targetUser.canClockOutside = true; 
+    targetUser.outsideClockingDetails = {
+        startDate: new Date(startDate),
+        endDate: new Date(endDate),
+        reason: reason,
+        // Tracking who gave permission
+        authorizedBy: currentUser.name,
+        authorizedByRole: currentUser.rank
+    };
+
+    await targetUser.save();
+
+    res.json({
+      message: `Clock outside authorization updated for ${targetUser.name}`,
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!["admin", "hr", "supervisor","user"].includes(currentUser?.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    // Reset fields to default values
+    targetUser.canClockOutside = false;
+    targetUser.outsideClockingDetails = {
+      startDate: null,
+      endDate: null,
+      reason: "",
+      authorizedBy: "",
+      authorizedByRole: ""
+    };
+
+    await targetUser.save();
+
+    res.json({
+      message: `Clock outside authorization revoked for ${targetUser.name}`,
+      user: targetUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 });
