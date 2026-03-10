@@ -30,8 +30,8 @@ const allowedOrigins = [
 ];
 const mongoDBSession = connectMongoStore(session);
 const app = express();
-app.use(bodyParser.json());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(
   cors({
     origin: function (origin, callback) {
@@ -42,6 +42,7 @@ app.use(
       }
     },
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -399,7 +400,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     }
 
     // extract selected station and auth response from request body
-    const { selectedStation, ...authResponse } = req.body;
+    const { selectedStation, userCoords, ...authResponse } = req.body;
 
     const verification = await verifyAuthenticationResponse({
       response: authResponse,
@@ -457,6 +458,10 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
         isLate: isLate,
         // will update later when clocking out
         isPresent: false,
+        userLocation: {
+          latitude: userCoords?.latitude || null,
+          longitude: userCoords?.longitude || null,
+        }
       };
 
       await Clocking.create(clockingData);
@@ -1805,7 +1810,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr","supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr", "supervisor"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -1844,7 +1849,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr","supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr", "supervisor"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -2140,14 +2145,14 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
       return res.status(404).json({ message: "User not found" });
 
     // Update the permission and the details
-    targetUser.canClockOutside = true; 
+    targetUser.canClockOutside = true;
     targetUser.outsideClockingDetails = {
-        startDate: new Date(startDate),
-        endDate: new Date(endDate),
-        reason: reason,
-        // Tracking who gave permission
-        authorizedBy: currentUser.name,
-        authorizedByRole: currentUser.rank
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      reason: reason,
+      // Tracking who gave permission
+      authorizedBy: currentUser.name,
+      authorizedByRole: currentUser.rank
     };
 
     await targetUser.save();
@@ -2168,7 +2173,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
       return res.status(401).json({ message: "Unauthorized" });
 
     const currentUser = await User.findById(req.session.userID);
-    if (!["admin", "hr", "supervisor","user"].includes(currentUser?.rank))
+    if (!["admin", "hr", "supervisor", "user"].includes(currentUser?.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);

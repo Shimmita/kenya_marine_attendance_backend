@@ -21,6 +21,10 @@ const clockingSchema = new mongoose.Schema(
         clockedOutSide: { type: Boolean, default: false },
         outSideReason: { type: String, default: ""},
         isLate: { type: Boolean, default: false },
+        userLocation: {
+            latitude: { type: Number, required: false },
+            longitude: { type: Number, required: false },
+        },
 
     },
     { timestamps: true }
