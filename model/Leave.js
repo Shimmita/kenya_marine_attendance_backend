@@ -15,7 +15,11 @@ const leaveSchema = new mongoose.Schema({
         lowercase: true,
         trim: true,
     },
-    type: { type: String, required: true },
+    type: {
+        type: String, required: true,
+        enum:["Adoption Leave", "Annual Leave", "Compassionate Leave", "Paternity Leave", "Sick Leave", "Study Leave","Terminal Leave"],
+        default: "Annual Leave"
+    },
     reliever: { type: String },
     remarks: { type: String },
     attachment: { type: String },

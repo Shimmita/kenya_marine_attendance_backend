@@ -5,13 +5,13 @@ import {
   verifyRegistrationResponse,
 } from "@simplewebauthn/server";
 import bcrypt from "bcrypt";
-import bodyParser from "body-parser";
 import { default as connectMongoStore } from "connect-mongodb-session";
 import cors from "cors";
 import "dotenv/config";
 import express from "express";
 import session from "express-session";
 import mongoose from "mongoose";
+import sharp from "sharp";
 import validator from "validator";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
@@ -23,7 +23,6 @@ import MessageUser from "./model/MessageUser.js";
 import uploadAvatar from "./model/middleware/UploadFile.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
-import sharp from "sharp";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
