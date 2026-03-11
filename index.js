@@ -1839,7 +1839,6 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
       return res.status(401).json({ message: "Unauthorized" });
 
     const { station } = req.body;
-    console.log(station)
 
     if (!station || station === undefined || station === null)
       return res.status(400).json({ message: "Station is required" });
@@ -1946,6 +1945,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
 // post
 app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
   try {
+    if (!req.session.isOnline) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
     if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
       return res.status(400).json("end date should be higher than start date");
@@ -2197,5 +2199,34 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+
+// get colleagues of the same station and department
+app.get(`${BASE_ROUTE}/user/colleagues`, async (req, res) => {
+  try {
+    // 1. Check authentication
+    if (!req.session.isOnline || !req.session.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    // 2. Fetch the current user's profile to get their context
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser) {
+      return res.status(404).json({ message: "Current user not found" });
+    }
+
+    // 3. Find users in the same station AND department, excluding the current user
+    const colleagues = await User.find({
+      station: currentUser.station,
+      department: currentUser.department,
+      _id: { $ne: currentUser._id } // Custom Semantics: "Not Equal" to current ID
+    }).select("-password"); // Security: Ensure passwords aren't sent
+
+    res.status(200).json(colleagues);
+  } catch (error) {
+    console.error("Error fetching colleagues:", error);
+    res.status(500).json({ message: "Server error while fetching colleagues" });
   }
 });

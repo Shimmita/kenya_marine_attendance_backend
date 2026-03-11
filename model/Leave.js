@@ -17,12 +17,12 @@ const leaveSchema = new mongoose.Schema({
     },
     type: {
         type: String, required: true,
-        enum:["Adoption Leave", "Annual Leave", "Compassionate Leave", "Paternity Leave", "Sick Leave", "Study Leave","Terminal Leave"],
+        enum: ["Adoption Leave", "Annual Leave", "Compassionate Leave", "Paternity Leave", "Sick Leave", "Study Leave", "Terminal Leave"],
         default: "Annual Leave"
     },
-    reliever: { type: String },
-    remarks: { type: String },
-    attachment: { type: String },
+    reliever: { type: String, required: true, },
+    remarks: { type: String, required: true, },
+    attachment: { type: String, required: true },
 }, { timestamps: true });
 
 export default mongoose.model("leave", leaveSchema);
