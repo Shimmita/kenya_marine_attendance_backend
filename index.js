@@ -23,6 +23,7 @@ import MessageUser from "./model/MessageUser.js";
 import uploadAvatar from "./model/middleware/UploadFile.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
+import PasswordReset from "./model/PasswordReset.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -161,6 +162,210 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
   } catch (error) {
     console.error("Signin error:", error);
     return res.status(400).json({ message: error.message });
+  }
+});
+
+
+// ─── Password Reset ───────────────────────────────────────────────────────────
+
+// Request password reset - user initiates the reset request
+app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) throw new Error("Email is required");
+    if (!validator.isEmail(email)) throw new Error("Invalid email format");
+
+    const user = await User.findOne({ email });
+    if (!user) throw new Error("User not found");
+
+    // Already approved by admin, allow password change step
+    if (user.isPasswordReset) {
+      return res.status(200).json({
+        status: "approved",
+        message: "Your reset request has been approved. Please set a new password.",
+      });
+    }
+
+    // Already requested, waiting on admin
+    const existingRequest = await PasswordReset.findOne({ email: user.email });
+    if (existingRequest) {
+      return res.status(200).json({
+        status: "pending",
+        message: "Password reset request already submitted. Please contact your admin for approval.",
+      });
+    }
+
+    // Create a request record
+    await PasswordReset.create({ email: user.email });
+
+    res.status(200).json({
+      status: "requested",
+      message: "Password reset request submitted. Please contact your admin for approval.",
+    });
+  } catch (error) {
+    console.error("Password reset request error:", error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Get all password reset requests (admin only)
+app.get(`${BASE_ROUTE}/auth/password-reset-requests`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const admin = await User.findById(req.session.userID);
+    if (!admin || !["admin", "hr"].includes(admin.rank)) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const requests = await PasswordReset.find().sort({ createdAt: -1 }).lean();
+
+    // enrich with user details when available
+    const enriched = await Promise.all(requests.map(async (r) => {
+      const user = await User.findOne({ email: r.email }).lean();
+      return {
+        ...r,
+        userName: user?.name || 'N/A',
+        department: user?.department || 'N/A',
+        station: user?.station || 'N/A',
+        role: user?.role || 'N/A',
+        userIsPasswordReset: user?.isPasswordReset || false,
+      };
+    }));
+
+    res.json(enriched);
+  } catch (error) {
+    console.error("Fetch password reset requests error:", error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Allow password reset - Admin approves a request
+app.post(`${BASE_ROUTE}/auth/allow-password-reset`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const admin = await User.findById(req.session.userID);
+    if (!admin || !["admin", "hr"].includes(admin.rank)) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const { email } = req.body;
+    if (!email) throw new Error("Email is required");
+    if (!validator.isEmail(email)) throw new Error("Invalid email format");
+
+    const user = await User.findOne({ email });
+    if (!user) throw new Error("User not found");
+
+    const request = await PasswordReset.findOne({ email });
+    if (!request) throw new Error("Password reset request not found");
+
+    user.isPasswordReset = true;
+    await user.save();
+
+    // Keep request until user changes password (as a record of workflow), or optional remove to avoid duplicates
+    await PasswordReset.deleteOne({ email });
+
+    res.json({ message: "Password reset approved", status: "approved" });
+  } catch (error) {
+    console.error("Allow password reset error:", error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Reset password - User sets new password after admin approval
+app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+
+    if (!email) throw new Error("Email is required");
+    if (!validator.isEmail(email)) throw new Error("Invalid email format");
+    if (!newPassword || newPassword.length < 4) throw new Error("Password must be at least 4 characters");
+
+    const user = await User.findOne({ email });
+    if (!user) throw new Error("User not found");
+
+    if (!user.isPasswordReset) {
+      throw new Error("Password reset not approved yet. Contact your admin.");
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
+    user.isPasswordReset = false;
+    await user.save();
+
+    await PasswordReset.deleteOne({ email });
+
+    res.json({ message: "Password reset successfully" });
+  } catch (error) {
+    console.error("Reset password error:", error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Allow password reset - Admin approves the reset request
+app.post(`${BASE_ROUTE}/auth/allow-password-reset`, async (req, res) => {
+  try {
+    // Check if user has admin privileges
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const admin = await User.findById(req.session.userID);
+    if (!admin || !['admin', 'hr'].includes(admin.rank)) {
+      return res.status(403).json({ message: "Only admin or HR can approve password resets" });
+    }
+
+    const { email } = req.body;
+
+    if (!email) throw new Error("Email is required");
+    if (!validator.isEmail(email)) throw new Error("Invalid email format");
+
+    const user = await User.findOne({ email });
+    if (!user) throw new Error("User not found");
+
+    // isPasswordReset flag is already true, it just needs to stay true until user resets
+    // Admin approval is confirmed by this endpoint being called
+    res.status(200).json({ message: "Password reset approved for user" });
+  } catch (error) {
+    console.error("Allow password reset error:", error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Reset password - User sets new password after admin approval
+app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+
+    if (!email) throw new Error("Email is required");
+    if (!validator.isEmail(email)) throw new Error("Invalid email format");
+    if (!newPassword || newPassword.length < 4) throw new Error("Password must be at least 4 characters");
+
+    const user = await User.findOne({ email });
+    if (!user) throw new Error("User not found");
+
+    if (!user.isPasswordReset) {
+      throw new Error("Password reset not approved. Contact your admin.");
+    }
+
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update user password and reset the flag
+    user.password = hashedPassword;
+    user.isPasswordReset = false;
+    await user.save();
+
+    res.status(200).json({ message: "Password reset successful" });
+  } catch (error) {
+    console.error("Reset password error:", error);
+    res.status(400).json({ message: error.message });
   }
 });
 
@@ -1623,8 +1828,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/toggle-active`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    // Only admin/hr/ceo can manage users
-    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+    // Only HR can manage users
+    if (currentUser.rank !== "hr")
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -1902,11 +2107,6 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
-    if (!targetUser)
-      return res.status(404).json({ message: "User not found" });
-
-    // fetch the gen user data for the potential supervisor be
-    const supervisorInUserDB = await User.findOne({ email: supervisor.email })
     if (!supervisorInUserDB) {
       return res.status(404).json({ message: "Supervisor not found" });
     }

@@ -61,6 +61,7 @@ const userSchema = new mongoose.Schema(
     isOnLeave: { type: Boolean, default: false },
     isToClockOut: { type: Boolean, default: false },
     isAccountActive: { type: Boolean, default: false },
+    isPasswordReset: { type: Boolean, default: false },
     // 🔐 BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
     authenticator: authenticatorSchema,
     // will be set to true if user is allowed to clock out outside the station premises (e.g. for field work)
@@ -82,5 +83,6 @@ userSchema.set("toJSON", {
     return ret;
   },
 });
+
 
 export default mongoose.model("User", userSchema);
