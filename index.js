@@ -154,7 +154,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
   const { email, password } = req.body;
   try {
     if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
-    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters!");
+    if (!password || password.length < 6) throw new Error("Password must be at least 6 characters!");
 
     const user = await User.findOne({ email });
     if (!user) throw new Error("Create a new account to continue!");
@@ -226,10 +226,10 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
   const { userId, password } = req.body;
   try {
     if (!userId || !userId.trim()) throw new Error("User ID is required");
-    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters");
+    if (!password || password.length < 6) throw new Error("Password must be at least 6 characters");
 
     // Authenticate with LDAP
-    await authenticateWithLDAP(userId, password);
+   /*  await authenticateWithLDAP(userId, password);
 
     // Find user in database by employeeId
     const user = await User.findOne({ employeeId: userId });
@@ -237,7 +237,18 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
 
     if (!user.email_verified) throw new Error("Account not activated. Contact admin.");
 
-    if (!user.isAccountActive) throw new Error("Account is inactive. Contact admin.");
+    if (!user.isAccountActive) throw new Error("Account is inactive. Contact admin."); */
+
+
+    // temp login for all staff included b4 AD activated
+    const user = await User.findOne({ email:userId });
+    if (!user) throw new Error("Create a new account to continue!");
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) throw new Error("Invalid credentials!");
+
+    if (!user.email_verified) throw new Error("Email not verified. Contact admin.");
+    //
 
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
