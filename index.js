@@ -10,6 +10,7 @@ import cors from "cors";
 import "dotenv/config";
 import express from "express";
 import session from "express-session";
+import ldapjs from "ldapjs";
 import mongoose from "mongoose";
 import sharp from "sharp";
 import validator from "validator";
@@ -21,9 +22,9 @@ import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
 import uploadAvatar from "./model/middleware/UploadFile.js";
+import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
-import PasswordReset from "./model/PasswordReset.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -120,6 +121,14 @@ app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
 
 app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
   try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    const currentUser = await User.findById(req.session.userID);
+    if (!["hr"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Access denied, only HR personnel can create accounts." });
+    }
+
     const data = req.body.formData
     const { email, password } = data
 
@@ -165,6 +174,84 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
   }
 });
 
+// ─── LDAP Authentication Helper ───────────────────────────────────────────────
+
+const authenticateWithLDAP = async (userId, password) => {
+  return new Promise((resolve, reject) => {
+    const ldapClient = ldapjs.createClient({
+      url: process.env.LDAP_URL || 'ldap://localhost:389',
+      timeout: 5000,
+      connectTimeout: 5000,
+    });
+
+    // Build the DN from User ID using the configured base
+    const baseDN = process.env.LDAP_BASE_DN || 'dc=kmfri,dc=local';
+    const searchBase = process.env.LDAP_SEARCH_BASE || `cn=users,${baseDN}`;
+    const userDN = `cn=${userId},${searchBase}`;
+
+    // Handle connection errors
+    ldapClient.on('error', (err) => {
+      console.error('LDAP connection error:', err);
+      reject(new Error('Unable to connect to authentication server'));
+    });
+
+    // Attempt bind with user credentials
+    ldapClient.bind(userDN, password, (err) => {
+      if (err) {
+        ldapClient.unbind();
+        if (err.name === 'InvalidCredentialsError') {
+          reject(new Error('Invalid User ID or password'));
+        } else {
+          reject(new Error('Authentication failed: ' + err.message));
+        }
+        return;
+      }
+
+      // Successfully authenticated
+      ldapClient.unbind();
+      resolve({ success: true, userId });
+    });
+
+    // Timeout handling
+    setTimeout(() => {
+      ldapClient.unbind(() => { });
+      reject(new Error('LDAP authentication timeout'));
+    }, 10000);
+  });
+};
+
+// ─── Sign In (Staff - LDAP) ──────────────────────────────────────────────────
+
+app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
+  const { userId, password } = req.body;
+  try {
+    if (!userId || !userId.trim()) throw new Error("User ID is required");
+    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters");
+
+    // Authenticate with LDAP
+    await authenticateWithLDAP(userId, password);
+
+    // Find user in database by employeeId
+    const user = await User.findOne({ employeeId: userId });
+    if (!user) throw new Error("User not found in system. Please contact HR.");
+
+    if (!user.email_verified) throw new Error("Account not activated. Contact admin.");
+
+    if (!user.isAccountActive) throw new Error("Account is inactive. Contact admin.");
+
+    req.session.isOnline = true;
+    req.session.userID = user._id.toString();
+
+    return res.status(200).json(user);
+  } catch (error) {
+    console.error("Staff signin error:", error);
+    let message = error.message;
+    if (message?.includes("ECONNREFUSED")) {
+      message="server unreachable, please try again!"
+    }
+    return res.status(400).json({ message });
+  }
+});
 
 // ─── Password Reset ───────────────────────────────────────────────────────────
 
