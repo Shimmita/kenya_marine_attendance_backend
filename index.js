@@ -148,6 +148,134 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
   }
 });
 
+// ─── Batch User Registration (HR Only) ────────────────────────────────────────
+
+app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
+  try {
+    //  1. Check if user is authenticated
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized. Please log in first." });
+    }
+
+    //  2. Verify user has HR rank
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser || !["hr"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Only HR personnel can perform this operation." });
+    }
+
+    //  3. Validate request body
+    const { users } = req.body;
+    if (!Array.isArray(users) || users.length === 0) {
+      return res.status(400).json({ message: "Please provide at least one record of data" });
+    }
+
+
+    //  5. Validate and prepare user data
+    const validatedUsers = [];
+    const errors = [];
+
+    for (let i = 0; i < users.length; i++) {
+      const user = users[i];
+
+      try {
+        // Required fields validation
+        if (!user.email || !validator.isEmail(user.email)) {
+          errors.push(`Row ${i + 1}: Invalid or missing email.`);
+          continue;
+        }
+
+        if (!user.name || user.name.trim().length === 0) {
+          errors.push(`Row ${i + 1}: Name is required.`);
+          continue;
+        }
+
+        if (!user.employeeId || user.employeeId.toString().trim().length === 0) {
+          errors.push(`Row ${i + 1}: Employee ID is required.`);
+          continue;
+        }
+
+        // Check for duplicate email in batch
+        if (validatedUsers.some(u => u.email === user.email)) {
+          errors.push(`Row ${i + 1}: Duplicate email in batch.`);
+          continue;
+        }
+
+        // Check if email already exists in database
+        const existingUser = await User.findOne({ email: user.email });
+        if (existingUser) {
+          errors.push(`\nRow ${i + 1}: ${existingUser.email} Email already registered.`);
+          continue;
+        }
+
+        // Check if employeeId already exists
+        const existingEmployee = await User.findOne({ employeeId: user.employeeId });
+        if (existingEmployee) {
+          errors.push(`\nRow ${i + 1}: ${existingEmployee.employeeId} Employee ID already exists.`);
+          continue;
+        }
+
+        // Generate default password, interns and attachee default password
+        const defaultPassword = process.env.DEFAULT_PASSWORD_SUFFIX || existingEmployee.employeeId;
+        const hashedPassword = await bcrypt.hash(defaultPassword, 10);
+
+        // Prepare user object
+        validatedUsers.push({
+          employeeId: user.employeeId.toString().trim(),
+          staffNo: user.staffNo || '',
+          name: user.name.trim(),
+          email: user.email.toLowerCase().trim(),
+          phone: user.phone || '',
+          role: user.role || 'employee', // employee, attachee, etc.
+          station: user.station || '',
+          department: user.department || '',
+          gender: user.gender || '',
+          password: hashedPassword,
+          email_verified: false,
+          isPasswordReset: false,
+        });
+      } catch (error) {
+        errors.push(`Row ${i + 1}: ${error.message}`);
+      }
+    }
+
+    // 6. If there are validation errors, return them
+    if (errors.length > 0) {
+      return res.status(400).json({
+        message: `Validation failed. ${errors.length} error(s) found.\n ${errors.slice(0, 20).join("\n")}`,
+        errors: errors.slice(0, 20), // Return first 20 errors
+        totalErrors: errors.length
+      });
+    }
+
+    // 7. Batch insert all validated users
+    const createdUsers = await User.insertMany(validatedUsers, { ordered: false });
+
+    return res.status(200).json({
+      message: `Successfully registered ${createdUsers.length} users.`,
+      count: createdUsers.length,
+      registeredUsers: createdUsers.map(u => ({
+        id: u._id,
+        email: u.email,
+        name: u.name,
+        employeeId: u.employeeId
+      }))
+    });
+
+  } catch (error) {
+    console.error("Batch registration error:", error);
+
+    // Handle MongoDB duplicate key errors
+    if (error.code === 11000) {
+      const field = Object.keys(error.keyPattern)[0];
+      return res.status(400).json({
+        message: `Duplicate value for ${field}. Batch registration partially failed.`
+      });
+    }
+
+    return res.status(400).json({ message: error.message || "Batch registration failed." });
+  }
+});
+
 // ─── Sign In ──────────────────────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
@@ -164,6 +292,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
 
     if (!user.email_verified) throw new Error("Email not verified. Contact admin.");
 
+    // init user session
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
 
@@ -174,95 +303,157 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
   }
 });
 
+
 // ─── LDAP Authentication Helper ───────────────────────────────────────────────
 
 const authenticateWithLDAP = async (userId, password) => {
-  return new Promise((resolve, reject) => {
-    const ldapClient = ldapjs.createClient({
-      url: process.env.LDAP_URL || 'ldap://localhost:389',
-      timeout: 5000,
-      connectTimeout: 5000,
+  const url = process.env.LDAP_URL;
+  const baseDN = process.env.LDAP_BASE_DN;
+
+  const client = ldapjs.createClient({ url });
+
+  const tryBind = (dn) =>
+    new Promise((resolve, reject) => {
+      client.bind(dn, password, (err) => {
+        if (err) return reject(err);
+        resolve(true);
+      });
     });
 
-    // Build the DN from User ID using the configured base
-    const baseDN = process.env.LDAP_BASE_DN || 'dc=kmfri,dc=local';
-    const searchBase = process.env.LDAP_SEARCH_BASE || `cn=users,${baseDN}`;
-    const userDN = `cn=${userId},${searchBase}`;
+  try {
+    //  1. UPN
+    try {
+      const upn = `${userId}${process.env.UPN_METHOD_URL}`;
+      await tryBind(upn);
+      return { success: true, method: "UPN" };
+    } catch (err) {
+      console.log("UPN failed:", err.message);
+    }
 
-    // Handle connection errors
-    ldapClient.on('error', (err) => {
-      console.error('LDAP connection error:', err);
-      reject(new Error('Unable to connect to authentication server'));
-    });
+    //  2. DOMAIN
+    try {
+      const domainUser = `${process.env.LDAP_DOMAIN}\\${userId}`;
 
-    // Attempt bind with user credentials
-    ldapClient.bind(userDN, password, (err) => {
-      if (err) {
-        ldapClient.unbind();
-        if (err.name === 'InvalidCredentialsError') {
-          reject(new Error('Invalid User ID or password'));
-        } else {
-          reject(new Error('Authentication failed: ' + err.message));
+      await tryBind(domainUser);
+      return { success: true, method: "DOMAIN" };
+    } catch (err) {
+      console.log("DOMAIN failed:", err.message);
+    }
+
+    //  3. SEARCH + BIND
+    await new Promise((resolve, reject) => {
+      client.bind(
+        process.env.LDAP_BIND_DN,
+        process.env.LDAP_BIND_PASSWORD,
+        (err) => {
+          if (err) {
+            console.log("Service bind failed:", err.message);
+            return reject(new Error("Invalid credentials!"));
+          }
+
+          const opts = {
+            scope: "sub",
+            filter: `(|(sAMAccountName=${userId})(employeeID=${userId})(cn=${userId}))`,
+            attributes: ["dn"],
+          };
+
+          client.search(baseDN, opts, (err, res) => {
+            if (err) return reject(err);
+
+            let userDN = null;
+
+            res.on("searchEntry", (entry) => {
+              userDN = entry.objectName;
+              console.log("Found user DN:", userDN);
+            });
+
+            res.on("end", async () => {
+              if (!userDN) {
+                return reject(new Error("User not found!"));
+              }
+
+              try {
+                await tryBind(userDN);
+                resolve(true);
+              } catch (err) {
+                console.log("Final bind failed:", err.message);
+                reject(new Error("Invalid credentials!"));
+              }
+            });
+          });
         }
-        return;
-      }
-
-      // Successfully authenticated
-      ldapClient.unbind();
-      resolve({ success: true, userId });
+      );
     });
 
-    // Timeout handling
-    setTimeout(() => {
-      ldapClient.unbind(() => { });
-      reject(new Error('LDAP authentication timeout'));
-    }, 10000);
-  });
+    return { success: true, method: "SEARCH" };
+
+  } catch (err) {
+    throw err;
+  } finally {
+    client.unbind();
+  }
 };
+
+
 
 // ─── Sign In (Staff - LDAP) ──────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
   const { userId, password } = req.body;
+
   try {
-    if (!userId || !userId.trim()) throw new Error("User ID is required");
-    if (!password || password.length < 6) throw new Error("Password must be at least 6 characters");
+    if (!userId || !userId.trim()) {
+      throw new Error("User ID is required");
+    }
+    if (!password || !password.trim()) {
+      throw new Error("Password is required");
+    }
 
-    // Authenticate with LDAP
-   /*  await authenticateWithLDAP(userId, password);
+    //  1. Authenticate with LDAP
+    const isValidStaff = await authenticateWithLDAP(userId, password);
 
-    // Find user in database by employeeId
+    if (!isValidStaff.success) {
+      throw new Error("Invalid credentials!");
+    }
+
+    //  2. Find user in DB (employeeId match)
     const user = await User.findOne({ employeeId: userId });
-    if (!user) throw new Error("User not found in system. Please contact HR.");
 
-    if (!user.email_verified) throw new Error("Account not activated. Contact admin.");
+    if (!user) {
+      throw new Error("You don't have access contact HR !");
+    }
 
-    if (!user.isAccountActive) throw new Error("Account is inactive. Contact admin."); */
 
+    //  3. Hash password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    // temp login for all staff included b4 AD activated
-    const user = await User.findOne({ email:userId });
-    if (!user) throw new Error("Create a new account to continue!");
+    //  4. Update password
+    user.password = hashedPassword;
+    user.isPasswordReset = true;
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) throw new Error("Invalid credentials!");
+    await user.save();
 
-    if (!user.email_verified) throw new Error("Email not verified. Contact admin.");
-    //
-
+    // create session for the currenly logged in user
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
 
     return res.status(200).json(user);
+
   } catch (error) {
     console.error("Staff signin error:", error);
+
     let message = error.message;
+
     if (message?.includes("ECONNREFUSED")) {
-      message="server unreachable, please try again!"
+      message = "Server unreachable, please try again!";
     }
+
     return res.status(400).json({ message });
   }
 });
+
+
 
 // ─── Password Reset ───────────────────────────────────────────────────────────
 
@@ -306,6 +497,7 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
     res.status(400).json({ message: error.message });
   }
 });
+
 
 // Get all password reset requests (admin only)
 app.get(`${BASE_ROUTE}/auth/password-reset-requests`, async (req, res) => {

@@ -40,9 +40,13 @@ const userSchema = new mongoose.Schema(
     employeeId: {
       type: String, default: ""
     },
+    staffNo: {
+      type: String, default: ""
+    },
     role: {
       type: String,
-      enum: ["employee", "intern", "attachee", "employee-contract", "admin", "hr", "supervisor", "ceo"],
+      lowercase: true,
+      enum: ["employee", "intern", "attachee"],
       default: "employee",
     },
     rank: {
@@ -61,8 +65,10 @@ const userSchema = new mongoose.Schema(
     isToClockOut: { type: Boolean, default: false },
     isAccountActive: { type: Boolean, default: true },
     isPasswordReset: { type: Boolean, default: false },
-    // 🔐 BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
+
+    // BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
     authenticator: authenticatorSchema,
+
     // will be set to true if user is allowed to clock out outside the station premises (e.g. for field work)
     canClockOutside: { type: Boolean, default: false },
     outsideClockingDetails: {
