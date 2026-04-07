@@ -14,6 +14,7 @@ import ldapjs from "ldapjs";
 import mongoose from "mongoose";
 import sharp from "sharp";
 import validator from "validator";
+import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
@@ -21,10 +22,12 @@ import Feedback from "./model/Feedback.js";
 import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
-import uploadAvatar from "./model/middleware/UploadFile.js";
+import uploadAvatar from "./middleware/UploadFile.js";
 import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
+import crypto from "crypto";
+import Verification from "./model/VerifyReport.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -50,6 +53,13 @@ app.use(
 const PORT = process.env.PORT || 5000;
 const BASE_ROUTE = process.env.BASE_ROUTE;
 const environment = process.env.ENVIRONMENT_MODE;
+const PRIVILEGED_AUDIT_RANKS = ["admin", "hr"];
+const CLIENT_AUDIT_ACTIONS = {
+  "attendance.history_exported": {
+    category: "attendance",
+    description: "Attendance history exported",
+  },
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -62,6 +72,52 @@ const getExpectedOrigin = () =>
   environment === "SANDBOX"
     ? process.env.ORIGIN_LOCAL || "http://localhost:5173"
     : process.env.ORIGIN_PROD;
+
+const snapshotUser = (user) => ({
+  userId: user?._id?.toString?.() || user?.userId || "",
+  name: user?.name || "",
+  email: user?.email || "",
+  rank: user?.rank || "",
+  role: user?.role || "",
+  department: user?.department || "",
+  station: user?.station || "",
+});
+
+const buildAuditRequestContext = (req) => ({
+  ipAddress:
+    req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "",
+  userAgent: req.get("user-agent") || "",
+});
+
+const createAuditLog = async ({
+  req,
+  category,
+  action,
+  description,
+  actor,
+  target = null,
+  metadata = {},
+  status = "success",
+}) => {
+  try {
+    const context = buildAuditRequestContext(req);
+    await AuditLog.create({
+      category,
+      action,
+      description,
+      status,
+      actor: snapshotUser(actor),
+      target: target ? snapshotUser(target) : null,
+      metadata,
+      ...context,
+      occurredAt: new Date(),
+    });
+  } catch (error) {
+    console.error("Audit log creation failed:", error);
+  }
+};
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 
@@ -296,6 +352,15 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
 
+    await createAuditLog({
+      req,
+      category: "authentication",
+      action: "auth.signin",
+      description: "User signed in",
+      actor: user,
+      metadata: { signInMethod: "password" },
+    });
+
     return res.status(200).json(user);
   } catch (error) {
     console.error("Signin error:", error);
@@ -438,6 +503,15 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
 
+    await createAuditLog({
+      req,
+      category: "authentication",
+      action: "auth.signin",
+      description: "User signed in",
+      actor: user,
+      metadata: { signInMethod: "ldap" },
+    });
+
     return res.status(200).json(user);
 
   } catch (error) {
@@ -487,6 +561,15 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
 
     // Create a request record
     await PasswordReset.create({ email: user.email });
+
+    await createAuditLog({
+      req,
+      category: "password_reset",
+      action: "password_reset.requested",
+      description: "Password reset requested",
+      actor: user,
+      metadata: { requestedFor: user.email },
+    });
 
     res.status(200).json({
       status: "requested",
@@ -561,6 +644,16 @@ app.post(`${BASE_ROUTE}/auth/allow-password-reset`, async (req, res) => {
     // Keep request until user changes password (as a record of workflow), or optional remove to avoid duplicates
     await PasswordReset.deleteOne({ email });
 
+    await createAuditLog({
+      req,
+      category: "password_reset",
+      action: "password_reset.approved",
+      description: "Password reset approved",
+      actor: admin,
+      target: user,
+      metadata: { approvedFor: user.email },
+    });
+
     res.json({ message: "Password reset approved", status: "approved" });
   } catch (error) {
     console.error("Allow password reset error:", error);
@@ -590,6 +683,15 @@ app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
     await user.save();
 
     await PasswordReset.deleteOne({ email });
+
+    await createAuditLog({
+      req,
+      category: "password_reset",
+      action: "password_reset.completed",
+      description: "Password reset completed",
+      actor: user,
+      metadata: { resetFor: user.email },
+    });
 
     res.json({ message: "Password reset successfully" });
   } catch (error) {
@@ -710,6 +812,39 @@ app.put(
         { $set: updateData },
         { new: true, select: "-password" }
       );
+
+      if (updateData.phone) {
+        await createAuditLog({
+          req,
+          category: "profile",
+          action: "profile.phone_updated",
+          description: "User updated phone number",
+          actor: updatedUser,
+          metadata: { changedFields: ["phone"] },
+        });
+      }
+
+      if (updateData.password) {
+        await createAuditLog({
+          req,
+          category: "profile",
+          action: "profile.password_updated",
+          description: "User updated password",
+          actor: updatedUser,
+          metadata: { changedFields: ["password"] },
+        });
+      }
+
+      if (updateData.avatar) {
+        await createAuditLog({
+          req,
+          category: "profile",
+          action: "profile.avatar_updated",
+          description: "User updated profile avatar",
+          actor: updatedUser,
+          metadata: { changedFields: ["avatar"] },
+        });
+      }
 
       res.status(200).json({
         user: updatedUser,
@@ -964,6 +1099,19 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       user.isToClockOut = true;
 
       await user.save();
+
+      await createAuditLog({
+        req,
+        category: "attendance",
+        action: "attendance.clock_in",
+        description: "User clocked in",
+        actor: user,
+        metadata: {
+          station: selectedStation,
+          clockedOutside: false,
+          userLocation: clockingData.userLocation,
+        },
+      });
     }
     else {
 
@@ -993,6 +1141,19 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       user.isToClockOut = false;
 
       await user.save();
+
+      await createAuditLog({
+        req,
+        category: "attendance",
+        action: "attendance.clock_out",
+        description: "User clocked out",
+        actor: user,
+        metadata: {
+          station: latestClocking.station,
+          workedHours: Number(diffHours.toFixed(2)),
+          isPresent: latestClocking.isPresent,
+        },
+      });
     }
 
 
@@ -1759,6 +1920,20 @@ System Automator`;
     user.deviceLost = true;
     await user.save();
 
+    await createAuditLog({
+      req,
+      category: "device",
+      action: "device.lost_reported",
+      description: "User reported a lost device",
+      actor: user,
+      metadata: {
+        startDate,
+        endDate,
+        deviceFingerprint: device_fingerprint,
+        latestStation: stationName || "",
+      },
+    });
+
 
     res.json({
       message: "Lost device request submitted",
@@ -1861,6 +2036,20 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
       status: action,
       user_email: affectedUser.email
     })
+
+    await createAuditLog({
+      req,
+      category: "device",
+      action: "device.lost_request_responded",
+      description: "Lost device request reviewed",
+      actor: responder,
+      target: affectedUser,
+      metadata: {
+        requestId: request._id.toString(),
+        response: action,
+        deviceFingerprint: request.device_fingerprint,
+      },
+    });
 
     res.json({
       message: `Request ${action} successfully`,
@@ -2056,6 +2245,20 @@ app.delete(`${BASE_ROUTE}/user/notification/:id`, async (req, res) => {
 // signOut user
 app.post(`${BASE_ROUTE}/user/signout`, async (req, res) => {
   try {
+    const currentUser = req.session?.userID
+      ? await User.findById(req.session.userID)
+      : null;
+
+    if (currentUser) {
+      await createAuditLog({
+        req,
+        category: "authentication",
+        action: "auth.signout",
+        description: "User signed out",
+        actor: currentUser,
+      });
+    }
+
     // destroy the session
     req.session.destroy();
     // clear cookie if any
@@ -2194,6 +2397,16 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
     targetUser.rank = rank;
     await targetUser.save();
 
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_rank_updated",
+      description: "User rank updated",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { newRank: rank },
+    });
+
     res.json({
       message: `User rank updated to ${rank}`,
       user: targetUser,
@@ -2235,6 +2448,16 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-role`, async (req, res) => {
 
     targetUser.role = role;
     await targetUser.save();
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_role_updated",
+      description: "User role updated",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { newRole: role },
+    });
 
     res.json({
       message: `User role updated to ${role}`,
@@ -2314,6 +2537,16 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
     targetUser.department = department.trim();
     await targetUser.save();
 
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_department_updated",
+      description: "User department updated",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { newDepartment: targetUser.department },
+    });
+
     res.json({
       message: `Department updated successfully`,
       user: targetUser,
@@ -2351,6 +2584,16 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
 
     targetUser.station = station;
     await targetUser.save();
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_station_updated",
+      description: "User station updated",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { newStation: station },
+    });
 
     res.json({
       message: `station updated successfully`,
@@ -2439,11 +2682,32 @@ app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser) {
+      return res.status(404).json({ message: "Current user not found" });
+    }
+
     if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
       return res.status(400).json("end date should be higher than start date");
     }
 
     const leave = await Leave.create(req.body);
+
+    await createAuditLog({
+      req,
+      category: "leave",
+      action: "leave.request_submitted",
+      description: "Leave request submitted",
+      actor: currentUser,
+      metadata: {
+        leaveId: leave._id.toString(),
+        leaveType: leave.type,
+        startDate: leave.startDate,
+        endDate: leave.endDate,
+        status: leave.status,
+      },
+    });
+
     res.status(201).json(leave);
   } catch (error) {
     res.status(400).send(error.message);
@@ -2648,6 +2912,21 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
 
     await targetUser.save();
 
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.clock_outside_updated",
+      description: "Clock outside access granted",
+      actor: currentUser,
+      target: targetUser,
+      metadata: {
+        startDate,
+        endDate,
+        reason,
+        canClockOutside: true,
+      },
+    });
+
     res.json({
       message: `Clock outside authorization updated for ${targetUser.name}`,
       user: targetUser,
@@ -2683,12 +2962,152 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
 
     await targetUser.save();
 
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.clock_outside_revoked",
+      description: "Clock outside access revoked",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { canClockOutside: false },
+    });
+
     res.json({
       message: `Clock outside authorization revoked for ${targetUser.name}`,
       user: targetUser,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+});
+
+app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser || !["auditor", "admin"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const {
+      category = "all",
+      action = "all",
+      actorRank = "all",
+      search = "",
+      dateFrom,
+      dateTo,
+      limit = 250,
+    } = req.query;
+
+    const parsedLimit = Math.min(Math.max(Number(limit) || 250, 1), 500);
+    const query = {};
+
+    if (category !== "all") query.category = category;
+    if (action !== "all") query.action = action;
+    if (actorRank !== "all") query["actor.rank"] = actorRank;
+
+    if (dateFrom || dateTo) {
+      query.occurredAt = {};
+      if (dateFrom) {
+        query.occurredAt.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+      }
+      if (dateTo) {
+        query.occurredAt.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+      }
+    }
+
+    if (search?.trim()) {
+      const regex = new RegExp(search.trim(), "i");
+      query.$or = [
+        { action: regex },
+        { description: regex },
+        { "actor.name": regex },
+        { "actor.email": regex },
+        { "target.name": regex },
+        { "target.email": regex },
+      ];
+    }
+
+    const logs = await AuditLog.find(query)
+      .sort({ occurredAt: -1 })
+      .limit(parsedLimit)
+      .lean();
+
+    const categoryCounts = logs.reduce((acc, log) => {
+      acc[log.category] = (acc[log.category] || 0) + 1;
+      return acc;
+    }, {});
+
+    const actionCounts = logs.reduce((acc, log) => {
+      acc[log.action] = (acc[log.action] || 0) + 1;
+      return acc;
+    }, {});
+
+    const uniqueActors = new Set(
+      logs
+        .map((log) => log.actor?.email || log.actor?.userId || "")
+        .filter(Boolean)
+    ).size;
+
+    const privilegedActions = logs.filter((log) =>
+      PRIVILEGED_AUDIT_RANKS.includes(log.actor?.rank)
+    ).length;
+
+    res.json({
+      logs,
+      metrics: {
+        total: logs.length,
+        uniqueActors,
+        privilegedActions,
+        today: logs.filter((log) => {
+          const current = new Date(log.occurredAt);
+          const now = new Date();
+          return current.toDateString() === now.toDateString();
+        }).length,
+      },
+      categoryCounts,
+      actionCounts,
+    });
+  } catch (error) {
+    console.error("Fetch audit logs error:", error);
+    res.status(500).json({ message: "Failed to fetch audit logs" });
+  }
+});
+
+app.post(`${BASE_ROUTE}/audit/logs/client-event`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser) {
+      return res.status(404).json({ message: "Current user not found" });
+    }
+
+    const { action, metadata = {} } = req.body;
+    const eventConfig = CLIENT_AUDIT_ACTIONS[action];
+
+    if (!eventConfig) {
+      return res.status(400).json({ message: "Unsupported audit event" });
+    }
+
+    await createAuditLog({
+      req,
+      category: eventConfig.category,
+      action,
+      description: eventConfig.description,
+      actor: currentUser,
+      metadata,
+    });
+
+    res.status(201).json({ message: "Audit event recorded" });
+  } catch (error) {
+    console.error("Create client audit log error:", error);
+    res.status(500).json({ message: "Failed to record audit event" });
   }
 });
 
@@ -2718,5 +3137,73 @@ app.get(`${BASE_ROUTE}/user/colleagues`, async (req, res) => {
   } catch (error) {
     console.error("Error fetching colleagues:", error);
     res.status(500).json({ message: "Server error while fetching colleagues" });
+  }
+});
+
+
+// Report Document Verification
+app.post(`${BASE_ROUTE}/verify/create`, async (req, res) => {
+  try {
+    const { data } = req.body;
+
+    //  Generate secure token
+    const token = crypto.randomBytes(32).toString('hex');
+
+    //  Hash the data
+    const dataHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(data))
+      .digest('hex');
+
+    await Verification.create({
+      token,
+      dataHash,
+      userId: req.user?._id || null, // optional
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
+    });
+
+    res.json({ token, dataHash });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to create verification' });
+  }
+});
+
+
+// verify
+app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const record = await Verification.findOne({ token });
+
+    if (!record) {
+      return res.json({ valid: false });
+    }
+
+    // check expiry
+    if (record.expiresAt && record.expiresAt < new Date()) {
+      return res.json({ valid: false, expired: true });
+    }
+
+    const providedHash = req.query.hash;
+    let contentMatch = null;
+
+    if (providedHash) {
+      contentMatch = providedHash === record.dataHash;
+    }
+
+    res.json({
+      valid: true,
+      createdAt: record.createdAt,
+      type: record.type,
+      message: "This is an official KMFRI attendance report",
+      dataHash: record.dataHash,
+      contentMatch // true/false/null
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: 'Verification failed' });
   }
 });
