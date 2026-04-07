@@ -7,6 +7,7 @@ import {
 import bcrypt from "bcrypt";
 import { default as connectMongoStore } from "connect-mongodb-session";
 import cors from "cors";
+import crypto from "crypto";
 import "dotenv/config";
 import express from "express";
 import session from "express-session";
@@ -14,6 +15,7 @@ import ldapjs from "ldapjs";
 import mongoose from "mongoose";
 import sharp from "sharp";
 import validator from "validator";
+import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
@@ -22,11 +24,9 @@ import Feedback from "./model/Feedback.js";
 import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
-import uploadAvatar from "./middleware/UploadFile.js";
 import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
-import crypto from "crypto";
 import Verification from "./model/VerifyReport.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
@@ -65,7 +65,8 @@ const CLIENT_AUDIT_ACTIONS = {
 
 const getRpID = () =>
   environment === "SANDBOX"
-    ? process.env.DOMAIN_NAME_LOCAL   // e.g. "localhost"
+    // "localhost or domain names in production"
+    ? process.env.DOMAIN_NAME_LOCAL
     : process.env.DOMAIN_NAME_PROD;
 
 const getExpectedOrigin = () =>
@@ -371,11 +372,24 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
 
 // ─── LDAP Authentication Helper ───────────────────────────────────────────────
 
+const LDAP_TIMEOUT_MS = 5000; // 5 second timeout for LDAP connection
+const LDAP_REQUEST_TIMEOUT_MS = 10000; // 10 second timeout for entire LDAP auth process
+
 const authenticateWithLDAP = async (userId, password) => {
   const url = process.env.LDAP_URL;
   const baseDN = process.env.LDAP_BASE_DN;
 
-  const client = ldapjs.createClient({ url });
+  // Create LDAP client with timeout settings
+  const client = ldapjs.createClient({
+    url,
+    timeout: LDAP_TIMEOUT_MS,
+    connectTimeout: LDAP_TIMEOUT_MS,
+  });
+
+  // Handle connection errors at the client level
+  client.on('error', (err) => {
+    console.error('LDAP client error:', err.code, err.message);
+  });
 
   const tryBind = (dn) =>
     new Promise((resolve, reject) => {
@@ -385,78 +399,95 @@ const authenticateWithLDAP = async (userId, password) => {
       });
     });
 
-  try {
-    //  1. UPN
-    try {
-      const upn = `${userId}${process.env.UPN_METHOD_URL}`;
-      await tryBind(upn);
-      return { success: true, method: "UPN" };
-    } catch (err) {
-      console.log("UPN failed:", err.message);
-    }
-
-    //  2. DOMAIN
-    try {
-      const domainUser = `${process.env.LDAP_DOMAIN}\\${userId}`;
-
-      await tryBind(domainUser);
-      return { success: true, method: "DOMAIN" };
-    } catch (err) {
-      console.log("DOMAIN failed:", err.message);
-    }
-
-    //  3. SEARCH + BIND
-    await new Promise((resolve, reject) => {
-      client.bind(
-        process.env.LDAP_BIND_DN,
-        process.env.LDAP_BIND_PASSWORD,
-        (err) => {
-          if (err) {
-            console.log("Service bind failed:", err.message);
-            return reject(new Error("Invalid credentials!"));
-          }
-
-          const opts = {
-            scope: "sub",
-            filter: `(|(sAMAccountName=${userId})(employeeID=${userId})(cn=${userId}))`,
-            attributes: ["dn"],
-          };
-
-          client.search(baseDN, opts, (err, res) => {
-            if (err) return reject(err);
-
-            let userDN = null;
-
-            res.on("searchEntry", (entry) => {
-              userDN = entry.objectName;
-              console.log("Found user DN:", userDN);
-            });
-
-            res.on("end", async () => {
-              if (!userDN) {
-                return reject(new Error("User not found!"));
-              }
-
-              try {
-                await tryBind(userDN);
-                resolve(true);
-              } catch (err) {
-                console.log("Final bind failed:", err.message);
-                reject(new Error("Invalid credentials!"));
-              }
-            });
-          });
+  // Wrap entire LDAP process in a timeout promise  
+  return Promise.race([
+    // Main LDAP authentication logic
+    (async () => {
+      try {
+        //  1. UPN
+        try {
+          const upn = `${userId}${process.env.UPN_METHOD_URL}`;
+          await tryBind(upn);
+          return { success: true, method: "UPN" };
+        } catch (err) {
+          console.log("UPN failed:", err.message);
         }
-      );
-    });
 
-    return { success: true, method: "SEARCH" };
+        //  2. DOMAIN
+        try {
+          const domainUser = `${process.env.LDAP_DOMAIN}\\${userId}`;
+          await tryBind(domainUser);
+          return { success: true, method: "DOMAIN" };
+        } catch (err) {
+          console.log("DOMAIN failed:", err.message);
+        }
 
-  } catch (err) {
+        //  3. SEARCH + BIND
+        return new Promise((resolve, reject) => {
+          client.bind(
+            process.env.LDAP_BIND_DN,
+            process.env.LDAP_BIND_PASSWORD,
+            (err) => {
+              if (err) {
+                console.log("Service bind failed:", err.message);
+                return reject(new Error("Invalid credentials!"));
+              }
+
+              const opts = {
+                scope: "sub",
+                filter: `(|(sAMAccountName=${userId})(employeeID=${userId})(cn=${userId}))`,
+                attributes: ["dn"],
+              };
+
+              client.search(baseDN, opts, (err, res) => {
+                if (err) return reject(err);
+
+                let userDN = null;
+
+                res.on("searchEntry", (entry) => {
+                  userDN = entry.objectName;
+                  console.log("Found user DN:", userDN);
+                });
+
+                res.on("end", async () => {
+                  if (!userDN) {
+                    return reject(new Error("User not found!"));
+                  }
+
+                  try {
+                    await tryBind(userDN);
+                    resolve({ success: true, method: "SEARCH" });
+                  } catch (err) {
+                    console.log("Final bind failed:", err.message);
+                    reject(new Error("Invalid credentials!"));
+                  }
+                });
+              });
+            }
+          );
+        });
+      } catch (err) {
+        throw err;
+      } finally {
+        client.unbind();
+      }
+    })(),
+    // Timeout promise - rejects after LDAP_REQUEST_TIMEOUT_MS
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("ETIMEDOUT")),
+        LDAP_REQUEST_TIMEOUT_MS
+      )
+    ),
+  ]).catch((err) => {
+    // Ensure cleanup on any error
+    try {
+      client.unbind();
+    } catch (e) {
+      // ignore unbind errors
+    }
     throw err;
-  } finally {
-    client.unbind();
-  }
+  });
 };
 
 
@@ -518,12 +549,24 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     console.error("Staff signin error:", error);
 
     let message = error.message;
+    let statusCode = 400;
 
-    if (message?.includes("ECONNREFUSED")) {
-      message = "Server unreachable, please try again!";
+    // Handle various LDAP connection errors gracefully
+    if (error.code === "ETIMEDOUT" || message?.includes("ETIMEDOUT") || message?.includes("timeout")) {
+      message = "Active Directory server is currently unavailable. Please try again later or contact your administrator.";
+      statusCode = 503; // Service Unavailable
+    } else if (error.code === "ECONNREFUSED" || message?.includes("ECONNREFUSED")) {
+      message = "Active Directory server is unreachable. Please try again later or contact your administrator.";
+      statusCode = 503;
+    } else if (error.code === "ENOTFOUND" || message?.includes("ENOTFOUND")) {
+      message = "Active Directory server address not found. Please contact your administrator.";
+      statusCode = 503;
+    } else if (message?.includes("Invalid credentials") || message?.includes("User not found")) {
+      message = "Invalid credentials. Please check your user ID and password.";
+      statusCode = 401; // Unauthorized
     }
 
-    return res.status(400).json({ message });
+    return res.status(statusCode).json({ message });
   }
 });
 
@@ -2355,7 +2398,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
 
     const { rank } = req.body;
 
-    const allowedRanks = ["admin", "user", "hr", "supervisor", "ceo"];
+    const allowedRanks = ["admin", "user", "hr", "supervisor", "ceo", "auditor"];
     if (!allowedRanks.includes(rank))
       return res.status(400).json({ message: "Invalid rank value" });
 
