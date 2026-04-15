@@ -633,7 +633,7 @@ app.get(`${BASE_ROUTE}/auth/password-reset-requests`, async (req, res) => {
     }
 
     const admin = await User.findById(req.session.userID);
-    if (!admin || !["admin", "hr"].includes(admin.rank)) {
+    if (!admin || !["admin", "hr","auditor"].includes(admin.rank)) {
       return res.status(403).json({ message: "Access denied" });
     }
 
@@ -1687,6 +1687,22 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 });
 
 
+// added overall stats
+app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
+  if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+  const { station, department, startDate, endDate } = req.query;
+  const query = {};
+  if (station) query.station = station;
+  if (department) query.department = department;
+  const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  const end = endDate ? new Date(endDate) : new Date();
+  end.setHours(23, 59, 59, 999);
+  query.clock_in = { $gte: start, $lte: end };
+  const records = await Clocking.find(query).sort({ clock_in: -1 }).limit(2000);
+  res.status(200).json(records);
+});
+
+
 
 // departmental stats
 app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
@@ -1999,7 +2015,7 @@ app.get(`${BASE_ROUTE}/device/lost/all`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    if (!["admin", "hr", "supervisor", "ceo"].includes(user.rank))
+    if (!["admin", "hr", "supervisor", "ceo","auditor"].includes(user.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const requests = await DeviceLost.find()
@@ -2522,7 +2538,7 @@ app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo", "supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr", "ceo", "supervisor","auditor"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const users = await User.find().sort({ createdAt: -1 });
