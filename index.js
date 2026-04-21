@@ -28,6 +28,7 @@ import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 import Verification from "./model/VerifyReport.js";
+import { transporter } from "./util/MailTransport.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -60,6 +61,11 @@ const CLIENT_AUDIT_ACTIONS = {
     description: "Attendance history exported",
   },
 };
+const PASSWORD_RESET_CODE_TTL_MS = 1000 * 60 * 15;
+const hashResetCode = (code) =>
+  crypto.createHash("sha256").update(String(code)).digest("hex");
+const generateResetCode = () =>
+  String(Math.floor(100000 + Math.random() * 900000));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -574,230 +580,170 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
 
 // ─── Password Reset ───────────────────────────────────────────────────────────
 
-// Request password reset - user initiates the reset request
 app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = String(req.body?.email || "").trim().toLowerCase();
 
     if (!email) throw new Error("Email is required");
-    if (!validator.isEmail(email)) throw new Error("Invalid email format");
+    if (!validator.isEmail(email)) throw new Error("Invalid email");
 
     const user = await User.findOne({ email });
-    if (!user) throw new Error("User not found");
+    if (!user) {
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.request_rejected",
+        description: "Password reset requested for unknown email",
+        actor: { email, name: email },
+        metadata: { reason: "user_not_found" },
+        status: "failed",
+      });
+      throw new Error("No account was found for that email address");
+    }
 
-    // Already approved by admin, allow password change step
-    if (user.isPasswordReset) {
-      return res.status(200).json({
-        status: "approved",
-        message: "Your reset request has been approved. Please set a new password.",
+    const resetCode = generateResetCode();
+    const expiresAt = new Date(Date.now() + PASSWORD_RESET_CODE_TTL_MS);
+    const existing = await PasswordReset.findOne({ email });
+
+    if (existing) {
+      existing.codeHash = hashResetCode(resetCode);
+      existing.expiresAt = expiresAt;
+      existing.lastSentAt = new Date();
+      existing.attempts = 0;
+      await existing.save();
+    } else {
+      await PasswordReset.create({
+        email,
+        codeHash: hashResetCode(resetCode),
+        expiresAt,
+        lastSentAt: new Date(),
       });
     }
 
-    // Already requested, waiting on admin
-    const existingRequest = await PasswordReset.findOne({ email: user.email });
-    if (existingRequest) {
-      return res.status(200).json({
-        status: "pending",
-        message: "Password reset request already submitted. Please contact your admin for approval.",
-      });
-    }
-
-    // Create a request record
-    await PasswordReset.create({ email: user.email });
+    await transporter.sendMail({
+      from: `"KMFRI ICT Support" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: "KMFRI Password Reset Code",
+      html: `
+        <div style="font-family:Arial,Helvetica,sans-serif;max-width:580px;margin:0 auto;padding:24px;background:#f8fbfd;border-radius:16px;border:1px solid #d8e6ef;">
+          <div style="background:linear-gradient(135deg,#0a3560 0%,#0a5b8c 100%);padding:20px;border-radius:14px;color:#fff;">
+            <h2 style="margin:0 0 8px;">Password Reset Request</h2>
+            <p style="margin:0;opacity:0.9;">Use the code below to reset your KMFRI attendance account password.</p>
+          </div>
+          <div style="padding:24px 8px 8px;">
+            <p style="font-size:15px;color:#12344d;">Hi ${user.name || "there"},</p>
+            <p style="font-size:15px;color:#12344d;line-height:1.6;">Enter this verification code on the password reset page to continue:</p>
+            <div style="margin:22px 0;padding:18px 20px;background:#ffffff;border:1px dashed #0a5b8c;border-radius:14px;text-align:center;">
+              <span style="font-size:32px;letter-spacing:10px;font-weight:800;color:#0a3560;">${resetCode}</span>
+            </div>
+            <p style="font-size:14px;color:#486581;line-height:1.6;">This code expires in 15 minutes. If you did not request a password reset, you can ignore this email.</p>
+            <p style="font-size:14px;color:#486581;line-height:1.6;">Reset page: <a href="${process.env.FRONTEND_URL || ""}/reset-password" style="color:#0a5b8c;font-weight:700;">Open password reset</a></p>
+          </div>
+        </div>
+      `,
+    });
 
     await createAuditLog({
       req,
       category: "password_reset",
-      action: "password_reset.requested",
-      description: "Password reset requested",
+      action: "password_reset.code_sent",
+      description: "Password reset code sent by email",
       actor: user,
-      metadata: { requestedFor: user.email },
-    });
-
-    res.status(200).json({
-      status: "requested",
-      message: "Password reset request submitted. Please contact your admin for approval.",
-    });
-  } catch (error) {
-    console.error("Password reset request error:", error);
-    res.status(400).json({ message: error.message });
-  }
-});
-
-
-// Get all password reset requests (admin only)
-app.get(`${BASE_ROUTE}/auth/password-reset-requests`, async (req, res) => {
-  try {
-    if (!req.session?.isOnline || !req.session?.userID) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    const admin = await User.findById(req.session.userID);
-    if (!admin || !["admin", "hr","auditor"].includes(admin.rank)) {
-      return res.status(403).json({ message: "Access denied" });
-    }
-
-    const requests = await PasswordReset.find().sort({ createdAt: -1 }).lean();
-
-    // enrich with user details when available
-    const enriched = await Promise.all(requests.map(async (r) => {
-      const user = await User.findOne({ email: r.email }).lean();
-      return {
-        ...r,
-        userName: user?.name || 'N/A',
-        department: user?.department || 'N/A',
-        station: user?.station || 'N/A',
-        role: user?.role || 'N/A',
-        userIsPasswordReset: user?.isPasswordReset || false,
-      };
-    }));
-
-    res.json(enriched);
-  } catch (error) {
-    console.error("Fetch password reset requests error:", error);
-    res.status(400).json({ message: error.message });
-  }
-});
-
-// Allow password reset - Admin approves a request
-app.post(`${BASE_ROUTE}/auth/allow-password-reset`, async (req, res) => {
-  try {
-    if (!req.session?.isOnline || !req.session?.userID) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    const admin = await User.findById(req.session.userID);
-    if (!admin || !["admin", "hr"].includes(admin.rank)) {
-      return res.status(403).json({ message: "Access denied" });
-    }
-
-    const { email } = req.body;
-    if (!email) throw new Error("Email is required");
-    if (!validator.isEmail(email)) throw new Error("Invalid email format");
-
-    const user = await User.findOne({ email });
-    if (!user) throw new Error("User not found");
-
-    const request = await PasswordReset.findOne({ email });
-    if (!request) throw new Error("Password reset request not found");
-
-    user.isPasswordReset = true;
-    await user.save();
-
-    // Keep request until user changes password (as a record of workflow), or optional remove to avoid duplicates
-    await PasswordReset.deleteOne({ email });
-
-    await createAuditLog({
-      req,
-      category: "password_reset",
-      action: "password_reset.approved",
-      description: "Password reset approved",
-      actor: admin,
       target: user,
-      metadata: { approvedFor: user.email },
+      metadata: { email, expiresAt: expiresAt.toISOString() },
     });
 
-    res.json({ message: "Password reset approved", status: "approved" });
-  } catch (error) {
-    console.error("Allow password reset error:", error);
-    res.status(400).json({ message: error.message });
+    res.json({
+      status: "code_sent",
+      message: "A password reset code has been sent to your email",
+      email,
+    });
+  } catch (err) {
+    console.error("Request password reset error:", err);
+    res.status(400).json({ message: err.message });
   }
 });
 
-// Reset password - User sets new password after admin approval
 app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
   try {
-    const { email, newPassword } = req.body;
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    const newPassword = String(req.body?.newPassword || "");
 
     if (!email) throw new Error("Email is required");
     if (!validator.isEmail(email)) throw new Error("Invalid email format");
-    if (!newPassword || newPassword.length < 4) throw new Error("Password must be at least 4 characters");
+    if (!code) throw new Error("Reset code is required");
+    if (!newPassword || newPassword.length < 6) {
+      throw new Error("Password must be at least 6 characters");
+    }
 
     const user = await User.findOne({ email });
     if (!user) throw new Error("User not found");
 
-    if (!user.isPasswordReset) {
-      throw new Error("Password reset not approved yet. Contact your admin.");
+    const resetRequest = await PasswordReset.findOne({ email });
+    if (!resetRequest) {
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.verification_failed",
+        description: "Password reset attempted without active request",
+        actor: { email, name: email },
+        target: user,
+        metadata: { reason: "missing_request" },
+        status: "failed",
+      });
+      throw new Error("No active password reset request was found for this email");
     }
 
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    user.password = hashedPassword;
+    if (resetRequest.expiresAt && resetRequest.expiresAt.getTime() < Date.now()) {
+      await PasswordReset.deleteOne({ email });
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.verification_failed",
+        description: "Expired password reset code used",
+        actor: { email, name: email },
+        target: user,
+        metadata: { reason: "expired_code" },
+        status: "failed",
+      });
+      throw new Error("This reset code has expired. Please request a new one");
+    }
+
+    const matches = resetRequest.codeHash === hashResetCode(code);
+    if (!matches) {
+      resetRequest.attempts = (resetRequest.attempts || 0) + 1;
+      await resetRequest.save();
+
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.verification_failed",
+        description: "Invalid password reset code submitted",
+        actor: { email, name: email },
+        target: user,
+        metadata: { reason: "invalid_code", attempts: resetRequest.attempts },
+        status: "failed",
+      });
+      throw new Error("The reset code you entered is invalid");
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
     user.isPasswordReset = false;
     await user.save();
-
     await PasswordReset.deleteOne({ email });
 
     await createAuditLog({
       req,
       category: "password_reset",
       action: "password_reset.completed",
-      description: "Password reset completed",
+      description: "Password reset completed using emailed code",
       actor: user,
-      metadata: { resetFor: user.email },
+      target: user,
+      metadata: { email },
     });
 
-    res.json({ message: "Password reset successfully" });
-  } catch (error) {
-    console.error("Reset password error:", error);
-    res.status(400).json({ message: error.message });
-  }
-});
-
-// Allow password reset - Admin approves the reset request
-app.post(`${BASE_ROUTE}/auth/allow-password-reset`, async (req, res) => {
-  try {
-    // Check if user has admin privileges
-    if (!req.session?.isOnline || !req.session?.userID) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    const admin = await User.findById(req.session.userID);
-    if (!admin || !['admin', 'hr'].includes(admin.rank)) {
-      return res.status(403).json({ message: "Only admin or HR can approve password resets" });
-    }
-
-    const { email } = req.body;
-
-    if (!email) throw new Error("Email is required");
-    if (!validator.isEmail(email)) throw new Error("Invalid email format");
-
-    const user = await User.findOne({ email });
-    if (!user) throw new Error("User not found");
-
-    // isPasswordReset flag is already true, it just needs to stay true until user resets
-    // Admin approval is confirmed by this endpoint being called
-    res.status(200).json({ message: "Password reset approved for user" });
-  } catch (error) {
-    console.error("Allow password reset error:", error);
-    res.status(400).json({ message: error.message });
-  }
-});
-
-// Reset password - User sets new password after admin approval
-app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
-  try {
-    const { email, newPassword } = req.body;
-
-    if (!email) throw new Error("Email is required");
-    if (!validator.isEmail(email)) throw new Error("Invalid email format");
-    if (!newPassword || newPassword.length < 4) throw new Error("Password must be at least 4 characters");
-
-    const user = await User.findOne({ email });
-    if (!user) throw new Error("User not found");
-
-    if (!user.isPasswordReset) {
-      throw new Error("Password reset not approved. Contact your admin.");
-    }
-
-    // Hash the new password
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    // Update user password and reset the flag
-    user.password = hashedPassword;
-    user.isPasswordReset = false;
-    await user.save();
-
-    res.status(200).json({ message: "Password reset successful" });
+    res.json({ message: "Password reset successful" });
   } catch (error) {
     console.error("Reset password error:", error);
     res.status(400).json({ message: error.message });
