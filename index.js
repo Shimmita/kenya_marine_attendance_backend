@@ -161,7 +161,7 @@ app.use(
     name: process.env.SESSION_NAME,
     store,
     cookie: {
-      maxAge: 60 * 60 * 24 * 1000,
+      maxAge: 60 * 15 * 1000,
       secure: environment !== "SANDBOX",
       sameSite: environment === "SANDBOX" ? "lax" : "none",
     },

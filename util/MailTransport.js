@@ -10,5 +10,7 @@ export const transporter = nodemailer.createTransport({
     user: process.env.EMAIL_USER, // xyz@kmfri.go.ke
     pass: process.env.EMAIL_PASSWORD, // your_email_password
   },
-  
+  tls: {
+    rejectUnauthorized: true, // Allow self-signed certificates (if needed)
+  },
 });
