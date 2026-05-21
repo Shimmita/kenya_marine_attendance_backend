@@ -202,9 +202,29 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
     if (existingUser) throw new Error("User already registered!");
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    await User.create({ ...data, password: hashedPassword });
+    const createdUser = await User.create({ ...data, password: hashedPassword });
 
-    return res.status(200).json({ message: "Account created successfully" });
+    // Create audit log for single user registration by HR
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user.create",
+      description: `HR created a new user account for ${createdUser.name}`,
+      actor: currentUser,
+      target: createdUser,
+      metadata: {
+        registeredUser: {
+          name: createdUser.name,
+          department: createdUser.department || "",
+          station: createdUser.station || "",
+          gender: createdUser.gender || "",
+          email: createdUser.email || "",
+          employeeId: createdUser.employeeId || "",
+        },
+      },
+    });
+
+    return res.status(200).json({ message: "Account created successfully", user: createdUser });
   } catch (error) {
     console.error("Signup error:", error);
     return res.status(400).json({ message: error.message });
@@ -312,6 +332,27 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
 
     // 7. Batch insert all validated users
     const createdUsers = await User.insertMany(validatedUsers, { ordered: false });
+
+    // Build registered users summary for audit metadata
+    const registeredSummary = createdUsers.map((u) => ({
+      id: u._id?.toString?.() || null,
+      name: u.name || "",
+      email: u.email || "",
+      employeeId: u.employeeId || "",
+      department: u.department || "",
+      station: u.station || "",
+      gender: u.gender || "",
+    }));
+
+    // Create audit log for batch registration
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.batch_register",
+      description: `HR batch-registered ${createdUsers.length} users`,
+      actor: currentUser,
+      metadata: { registeredUsers: registeredSummary },
+    });
 
     return res.status(200).json({
       message: `Successfully registered ${createdUsers.length} users.`,
@@ -1961,7 +2002,7 @@ app.get(`${BASE_ROUTE}/device/lost/all`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    if (!["admin", "hr", "supervisor", "ceo","auditor"].includes(user.rank))
+    if (!["admin", "hr", "supervisor", "ceo", "auditor"].includes(user.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const requests = await DeviceLost.find()
@@ -2484,7 +2525,7 @@ app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo", "supervisor","auditor"].includes(currentUser.rank))
+    if (!["admin", "hr", "ceo", "supervisor", "auditor"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const users = await User.find().sort({ createdAt: -1 });
