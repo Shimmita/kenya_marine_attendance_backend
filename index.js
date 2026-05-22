@@ -3027,6 +3027,85 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
   }
 });
 
+// ─── Delete User (HR Only) ──────────────────────────────────────────────────
+
+app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser || currentUser.rank !== "hr")
+      return res.status(403).json({ message: "Only HR can delete users" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    // Prevent HR from deleting themselves
+    if (targetUser._id.toString() === currentUser._id.toString())
+      return res.status(400).json({ message: "You cannot delete your own account" });
+
+    // Capture user details for audit log before deletion
+    const deletedUserSnapshot = snapshotUser(targetUser);
+    const deletedUserDetails = {
+      id: targetUser._id?.toString?.() || null,
+      name: targetUser.name || "",
+      email: targetUser.email || "",
+      rank: targetUser.rank || "",
+      role: targetUser.role || "",
+      department: targetUser.department || "",
+      station: targetUser.station || "",
+      employeeId: targetUser.employeeId || "",
+      phone: targetUser.phone || "",
+      gender: targetUser.gender || "",
+      dateCreated: targetUser.createdAt || null,
+    };
+
+    // Delete user from all related collections
+    try {
+      // Delete from related models
+      await Clocking.deleteMany({ user_id: req.params.id });
+      await Leave.deleteMany({ requestedBy: req.params.id });
+      await Feedback.deleteMany({ $or: [{ submittedBy: req.params.id }, { ratedUser: req.params.id }] });
+      await Devices.deleteMany({ user: req.params.id });
+      await deviceLost.deleteMany({ user_id: req.params.id });
+      await MessageUser.deleteMany({ $or: [{ userId: req.params.id }, { sender: req.params.id }] });
+      await MessageAdmin.deleteMany({ $or: [{ userId: req.params.id }, { sender: req.params.id }] });
+      await PasswordReset.deleteMany({ userId: req.params.id });
+      await VerifyReport.deleteMany({ $or: [{ userId: req.params.id }, { verifier: req.params.id }] });
+    } catch (err) {
+      console.error("Error deleting related records:", err);
+    }
+
+    // Delete user from User collection
+    await User.findByIdAndDelete(req.params.id);
+
+    // Create audit log for user deletion
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user.delete",
+      description: `HR deleted user account: ${targetUser.name} (${targetUser.email})`,
+      actor: currentUser,
+      target: null, // User no longer exists
+      metadata: {
+        deletedUser: deletedUserDetails,
+        deletedAt: new Date(),
+      },
+      status: "success",
+    });
+
+    res.json({
+      message: `User ${targetUser.name} and all associated data have been permanently deleted`,
+      deletedUser: deletedUserSnapshot,
+    });
+  } catch (error) {
+    console.error("Delete user error:", error);
+    res.status(500).json({ message: error.message || "Failed to delete user" });
+  }
+});
+
 app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
   try {
     if (!req.session?.isOnline || !req.session?.userID) {
