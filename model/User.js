@@ -5,6 +5,12 @@ const authenticatorSchema = new mongoose.Schema({
   credentialID: { type: String, required: true },
   credentialPublicKey: { type: String, required: true },
   counter: { type: Number, required: true, default: 0 },
+  deviceFingerprint: { type: String, default: "" },
+  deviceName: { type: String, default: "" },
+  deviceOS: { type: String, default: "" },
+  deviceBrowser: { type: String, default: "" },
+  registeredAt: { type: Date, default: Date.now },
+  lastUsedAt: { type: Date, default: null },
 });
 
 
@@ -66,8 +72,10 @@ const userSchema = new mongoose.Schema(
     isAccountActive: { type: Boolean, default: true },
     isPasswordReset: { type: Boolean, default: false },
 
-    // BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
+    // Legacy single biometric credential. Kept for migration of already-enrolled users.
     authenticator: authenticatorSchema,
+    // BIOMETRICS — credentialID and credentialPublicKey stored as Base64URL strings
+    authenticators: { type: [authenticatorSchema], default: [] },
 
     // will be set to true if user is allowed to clock out outside the station premises (e.g. for field work)
     canClockOutside: { type: Boolean, default: false },

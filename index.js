@@ -90,6 +90,14 @@ const snapshotUser = (user) => ({
   station: user?.station || "",
 });
 
+const sanitizeUserResponse = (user) => {
+  const safeUser = user?.toObject?.() || { ...user };
+  delete safeUser.password;
+  delete safeUser.authenticator;
+  delete safeUser.authenticators;
+  return safeUser;
+};
+
 const buildAuditRequestContext = (req) => ({
   ipAddress:
     req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
@@ -124,6 +132,55 @@ const createAuditLog = async ({
   } catch (error) {
     console.error("Audit log creation failed:", error);
   }
+};
+
+const MAX_USER_DEVICES = 2;
+
+const getUserAuthenticators = (user) => {
+  const authenticators = Array.isArray(user?.authenticators) ? [...user.authenticators] : [];
+
+  if (user?.authenticator?.credentialID) {
+    const hasLegacyCredential = authenticators.some(
+      (authenticator) => authenticator.credentialID === user.authenticator.credentialID
+    );
+
+    if (!hasLegacyCredential) {
+      authenticators.push(user.authenticator);
+    }
+  }
+
+  return authenticators;
+};
+
+const getActiveUserDevices = async (email) =>
+  Devices.find({ user_email: email, device_lost: { $ne: true } }).sort({ createdAt: 1 });
+
+const syncUserDeviceFlags = async (user) => {
+  const activeDevices = await getActiveUserDevices(user.email);
+  user.hasDevices = activeDevices.length > 1;
+  user.doneBiometric = getUserAuthenticators(user).length > 0 && activeDevices.length > 0;
+  user.deviceLost = activeDevices.length === 0 && user.deviceLost;
+  await user.save();
+  return activeDevices;
+};
+
+const ensureSinglePrimaryDevice = async (email) => {
+  const activeDevices = await getActiveUserDevices(email);
+  if (!activeDevices.length) return [];
+
+  const primaryDevice =
+    activeDevices.find((device) => device.device_primary) || activeDevices[0];
+
+  await Devices.updateMany(
+    { user_email: email },
+    { $set: { device_primary: false } }
+  );
+  await Devices.updateOne(
+    { _id: primaryDevice._id },
+    { $set: { device_primary: true, device_lost: false } }
+  );
+
+  return getActiveUserDevices(email);
 };
 
 // ─── Database ─────────────────────────────────────────────────────────────────
@@ -409,7 +466,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
       metadata: { signInMethod: "password" },
     });
 
-    return res.status(200).json(user);
+    return res.status(200).json(sanitizeUserResponse(user));
   } catch (error) {
     console.error("Signin error:", error);
     return res.status(400).json({ message: error.message });
@@ -590,7 +647,7 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
       metadata: { signInMethod: "ldap" },
     });
 
-    return res.status(200).json(user);
+    return res.status(200).json(sanitizeUserResponse(user));
 
   } catch (error) {
     console.error("Staff signin error:", error);
@@ -791,6 +848,70 @@ app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
   }
 });
 
+app.get(`${BASE_ROUTE}/admin/password-reset/requests`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser || currentUser.rank !== "admin")
+      return res.status(403).json({ message: "Only admin can view password reset requests" });
+
+    const requests = await PasswordReset.find().sort({ createdAt: -1 }).lean();
+    const enriched = await Promise.all(requests.map(async (request) => {
+      const user = await User.findOne({ email: request.email }).lean();
+      return {
+        ...request,
+        userName: user?.name || "Unknown User",
+        role: user?.role || "Unknown",
+        department: user?.department || "",
+        station: user?.station || "",
+        userIsPasswordReset: Boolean(user?.isPasswordReset),
+      };
+    }));
+
+    res.json(enriched);
+  } catch (error) {
+    console.error("Fetch password reset requests error:", error);
+    res.status(500).json({ message: "Failed to load password reset requests" });
+  }
+});
+
+app.put(`${BASE_ROUTE}/admin/password-reset/approve`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser || currentUser.rank !== "admin")
+      return res.status(403).json({ message: "Only admin can approve password reset requests" });
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ message: "Email is required" });
+
+    const user = await User.findOne({ email });
+    const resetRequest = await PasswordReset.findOne({ email });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    if (!resetRequest) return res.status(404).json({ message: "Password reset request not found" });
+
+    user.isPasswordReset = true;
+    await user.save();
+
+    await createAuditLog({
+      req,
+      category: "password_reset",
+      action: "password_reset.admin_approved",
+      description: "Admin approved password reset request",
+      actor: currentUser,
+      target: user,
+      metadata: { email, approvedBy: currentUser.email },
+    });
+
+    res.json({ message: `Password reset request for ${email} has been approved`, email, approved: true });
+  } catch (error) {
+    console.error("Approve password reset request error:", error);
+    res.status(500).json({ message: error.message || "Failed to approve password reset request" });
+  }
+});
+
 
 // UPDATE USER PROFILE
 app.put(
@@ -901,6 +1022,11 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
+    const activeDevices = await getActiveUserDevices(user.email);
+    if (activeDevices.length >= MAX_USER_DEVICES) {
+      throw new Error(`You can only enroll up to ${MAX_USER_DEVICES} devices. Report a lost device or contact admin to clear one.`);
+    }
+
     // temp fix so that it can register outside google emails
     // can make use of platform to force using device bound auth
     /* const options = await generateRegistrationOptions({
@@ -953,8 +1079,21 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
     const expectedChallenge = req.session.registrationChallenge;
     if (!expectedChallenge) throw new Error("No registration challenge found. Please restart.");
 
+    const { credential: credentialResponse, device = {} } = req.body;
+    const response = credentialResponse || req.body;
+    const {
+      device_name,
+      device_os,
+      device_browser,
+      device_fingerprint,
+    } = device;
+
+    if (!device_fingerprint || !device_name || !device_os || !device_browser) {
+      throw new Error("Device details are required to complete enrollment.");
+    }
+
     const verification = await verifyRegistrationResponse({
-      response: req.body,
+      response,
       expectedChallenge,
       expectedOrigin: getExpectedOrigin(),
       expectedRPID: getRpID(),
@@ -963,18 +1102,91 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
     if (!verification.verified) return res.status(400).json({ registered: false });
 
     const { credential } = verification.registrationInfo;
+    const activeDevices = await getActiveUserDevices(user.email);
+    const existingOwnDevice = activeDevices.find(
+      (deviceRecord) => deviceRecord.device_fingerprint === device_fingerprint
+    );
+    const existingOtherDevice = await Devices.findOne({
+      device_fingerprint,
+      user_email: { $ne: user.email },
+    });
 
-    user.authenticator = {
-      credentialID: credential.id,                                              // ✅ already base64url — store directly
-      credentialPublicKey: Buffer.from(credential.publicKey).toString("base64url"), // ✅ raw bytes → base64url
+    if (existingOtherDevice) {
+      throw new Error("This device is already enrolled by another account.");
+    }
+
+    if (!existingOwnDevice && activeDevices.length >= MAX_USER_DEVICES) {
+      throw new Error(`You can only enroll up to ${MAX_USER_DEVICES} devices.`);
+    }
+
+    const credentialRecord = {
+      credentialID: credential.id,
+      credentialPublicKey: Buffer.from(credential.publicKey).toString("base64url"),
       counter: credential.counter,
+      deviceFingerprint: device_fingerprint,
+      deviceName: device_name,
+      deviceOS: device_os,
+      deviceBrowser: device_browser,
+      registeredAt: new Date(),
     };
+
+    const authenticators = getUserAuthenticators(user).filter(
+      (authenticator) =>
+        authenticator.deviceFingerprint !== device_fingerprint
+    );
+    authenticators.push(credentialRecord);
+
+    user.authenticators = authenticators;
+    user.authenticator = undefined;
+
+    await Devices.updateMany(
+      { user_email: user.email },
+      { $set: { device_primary: false } }
+    );
+
+    const devicePayload = {
+      device_name,
+      user_email: user.email,
+      device_os,
+      device_browser,
+      device_primary: activeDevices.length === 0,
+      device_lost: false,
+      device_fingerprint,
+    };
+
+    if (existingOwnDevice) {
+      await Devices.updateOne(
+        { _id: existingOwnDevice._id },
+        { $set: { ...devicePayload, device_primary: existingOwnDevice.device_primary || activeDevices.length === 0 } }
+      );
+    } else {
+      await Devices.create(devicePayload);
+    }
+
+    await ensureSinglePrimaryDevice(user.email);
 
     // update user to mark biometric registration complete
     user.doneBiometric = true;
+    user.hasDevices = (await getActiveUserDevices(user.email)).length > 1;
+    user.deviceLost = false;
 
     await user.save();
     delete req.session.registrationChallenge;
+
+    await createAuditLog({
+      req,
+      category: "device",
+      action: "device.enrolled",
+      description: "User enrolled a clocking device",
+      actor: user,
+      metadata: {
+        deviceName: device_name,
+        deviceOS: device_os,
+        deviceBrowser: device_browser,
+        deviceFingerprint: device_fingerprint,
+        credentialID: credential.id,
+      },
+    });
 
     res.json({ registered: true });
   } catch (err) {
@@ -994,19 +1206,30 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
     if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
 
     const user = await User.findById(req.session.userID);
-    if (!user || !user.authenticator) {
+    if (!user) throw new Error("User not found");
+    const activeDevices = await getActiveUserDevices(user.email);
+    const activeDeviceFingerprints = activeDevices.map((device) => device.device_fingerprint);
+    const authenticators = getUserAuthenticators(user).filter(
+      (authenticator) =>
+        !authenticator.deviceFingerprint ||
+        activeDeviceFingerprints.includes(authenticator.deviceFingerprint)
+    );
+    if (!user || authenticators.length === 0) {
       return res.status(400).json({ message: "Biometric not registered for this account" });
     }
 
     const options = await generateAuthenticationOptions({
       rpID: getRpID(),
       userVerification: "required",
-      allowCredentials: [
-        {
-          id: user.authenticator.credentialID, // base64url string — correct for v10+
-          type: "public-key",
-        },
-      ],
+      allowCredentials: [...new Map(
+        authenticators.map((authenticator) => [
+          authenticator.credentialID,
+          {
+            id: authenticator.credentialID,
+            type: "public-key",
+          },
+        ])
+      ).values()],
     });
 
     req.session.authChallenge = options.challenge;
@@ -1046,7 +1269,8 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     }
 
     const user = await User.findById(req.session.userID);
-    if (!user || !user.authenticator) {
+    const authenticators = getUserAuthenticators(user);
+    if (!user || authenticators.length === 0) {
       return res.status(400).json({ verified: false, message: "Fingerprint not registered" });
     }
 
@@ -1059,7 +1283,35 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     }
 
     // extract selected station and auth response from request body
-    const { selectedStation, userCoords, ...authResponse } = req.body;
+    const { selectedStation, userCoords, device_fingerprint, ...authResponse } = req.body;
+    const matchedAuthenticator =
+      authenticators.find(
+        (authenticator) =>
+          authenticator.credentialID === authResponse.id &&
+          authenticator.deviceFingerprint === device_fingerprint
+      ) ||
+      authenticators.find(
+        (authenticator) =>
+          authenticator.credentialID === authResponse.id &&
+          !authenticator.deviceFingerprint
+      ) ||
+      authenticators.find(
+        (authenticator) => authenticator.credentialID === authResponse.id
+      );
+
+    if (!matchedAuthenticator) {
+      return res.status(401).json({ verified: false, message: "This device is not enrolled for clocking." });
+    }
+
+    const matchedDevice = await Devices.findOne({
+      user_email: user.email,
+      device_fingerprint: matchedAuthenticator.deviceFingerprint || device_fingerprint,
+      device_lost: { $ne: true },
+    });
+
+    if (!matchedDevice) {
+      return res.status(403).json({ verified: false, message: "This device has not been approved for clocking." });
+    }
 
     const verification = await verifyAuthenticationResponse({
       response: authResponse,
@@ -1069,11 +1321,11 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // ✅ v10+ shape: `credential` not `authenticator`, `id` not `credentialID`,
       //    `publicKey` (Uint8Array) not `credentialPublicKey` (Buffer)
       credential: {
-        id: user.authenticator.credentialID,                                         // base64url string
+        id: matchedAuthenticator.credentialID,                                         // base64url string
         publicKey: new Uint8Array(
-          Buffer.from(user.authenticator.credentialPublicKey, "base64url")           // base64url → Uint8Array
+          Buffer.from(matchedAuthenticator.credentialPublicKey, "base64url")           // base64url → Uint8Array
         ),
-        counter: user.authenticator.counter,
+        counter: matchedAuthenticator.counter,
       },
       requireUserVerification: true,
     });
@@ -1081,7 +1333,17 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     if (!verification.verified) return res.status(401).json({ verified: false });
 
     // Update counter to prevent replay attacks
-    user.authenticator.counter = verification.authenticationInfo.newCounter;
+    user.authenticators = authenticators.map((authenticator) =>
+      authenticator.credentialID === matchedAuthenticator.credentialID &&
+        (authenticator.deviceFingerprint || "") === (matchedAuthenticator.deviceFingerprint || "")
+        ? {
+          ...(authenticator.toObject?.() || authenticator),
+          counter: verification.authenticationInfo.newCounter,
+          lastUsedAt: new Date(),
+        }
+        : authenticator
+    );
+    user.authenticator = undefined;
 
     // save in the db
     await user.save();
@@ -1236,7 +1498,7 @@ app.get(`${BASE_ROUTE}/user/profile`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
-    const user = await User.findById(req.session.userID).select("-password").select("-authenticator");
+    const user = await User.findById(req.session.userID).select("-password").select("-authenticator").select("-authenticators");
     if (!user) throw new Error("User not found");
 
     res.json(user);
@@ -1921,6 +2183,13 @@ System Automator`;
     if (existingPending)
       throw new Error("You already have a pending request");
 
+    const reportedDevice = userDevices.find(
+      (device) => device.device_fingerprint === device_fingerprint
+    );
+    if (!reportedDevice) {
+      throw new Error("Selected device is not enrolled on your profile.");
+    }
+
     const lostRequest = await DeviceLost.create({
       description,
       user_email: user.email,
@@ -1928,27 +2197,6 @@ System Automator`;
       endDate,
       device_fingerprint
     });
-
-
-    // if user has no multiple devices, then flag them to do biometric false for forced 
-    // fingerprint registration
-    if (!user.hasDevices || !userDevices.length > 1) {
-      user.doneBiometric = false
-      user.authenticator = null
-
-      // flag the device in question as lost
-      const myLostDevice = await Devices.findOne({ device_fingerprint })
-      myLostDevice.device_lost = true
-      await myLostDevice.save()
-    } else {
-      // mark the other device(could be a browser check on that precisely) available as primary
-      const primaryDevice = userDevices.find(d => d.device_fingerprint !== device_fingerprint)
-
-      if (primaryDevice) {
-        primaryDevice.device_primary = true
-        await primaryDevice.save()
-      }
-    }
 
 
     // send message/notification to the admin+hr+supervisor
@@ -1962,7 +2210,7 @@ System Automator`;
     })
 
 
-    // mark user as device lost (temporary state)
+    // Mark user as having an open lost-device report. Access is changed only after approval.
     user.deviceLost = true;
     await user.save();
 
@@ -2050,27 +2298,40 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     if (!affectedUser) throw new Error("User not found");
 
     if (action === "granted" || action === "success") {
-      // mark all devices lost
-      await Devices.updateMany(
-        { user_email: affectedUser.email },
-        { device_lost: true, device_primary: false }
+      const reportedDevice = await Devices.findOne({
+        user_email: affectedUser.email,
+        device_fingerprint: request.device_fingerprint,
+      });
+
+      await Devices.deleteOne({
+        user_email: affectedUser.email,
+        device_fingerprint: request.device_fingerprint,
+      });
+
+      const authenticators = getUserAuthenticators(affectedUser).filter(
+        (authenticator) =>
+          authenticator.deviceFingerprint !== request.device_fingerprint &&
+          !(reportedDevice?.device_primary && !authenticator.deviceFingerprint)
       );
-
-      // clear biometric (force re-registration)
+      affectedUser.authenticators = authenticators;
       affectedUser.authenticator = undefined;
-      affectedUser.doneBiometric = false;
-      affectedUser.hasDevices = false;
-      // affectedUser.deviceLost = false;
-      affectedUser.deviceLost = true;
+      affectedUser.deviceLost = false;
 
+      await ensureSinglePrimaryDevice(affectedUser.email);
+      await syncUserDeviceFlags(affectedUser);
+    } else {
+      affectedUser.deviceLost = false;
       await affectedUser.save();
     }
 
     // update the admin message
     const messageAdmin = await MessageAdmin.findOne({ device_fingerprint: request.device_fingerprint })
-    messageAdmin.status = action
-    messageAdmin.responded = responder.rank
-    messageAdmin.respondedName = responder.name
+    if (messageAdmin) {
+      messageAdmin.status = action
+      messageAdmin.responded = responder.rank
+      messageAdmin.respondedName = responder.name
+      await messageAdmin.save()
+    }
 
     const message = generateAdminResponse(affectedUser, responder, action)
 
