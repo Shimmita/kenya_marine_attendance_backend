@@ -370,7 +370,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           department: user.department || '',
           gender: user.gender || '',
           password: hashedPassword,
-          email_verified: false,
           isPasswordReset: false,
         });
       } catch (error) {
@@ -699,10 +698,46 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
       throw new Error("No account was found for that email address");
     }
 
+    // Only interns and attachees may use this password reset flow; staff/employees use AD
+    if (user.role === "employee") {
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.request_rejected",
+        description: "Password reset requested for AD-managed account",
+        actor: user,
+        target: user,
+        metadata: { reason: "ad_managed_account" },
+        status: "failed",
+      });
+      return res.status(403).json({ message: "This account is managed by Active Directory. Contact ICT support to reset your password." });
+    }
+
     const resetCode = generateResetCode();
     const expiresAt = new Date(Date.now() + PASSWORD_RESET_CODE_TTL_MS);
     const existing = await PasswordReset.findOne({ email });
 
+    // If there's an active (non-expired) reset request, notify the requester
+    if (existing && existing.expiresAt && existing.expiresAt.getTime() > Date.now()) {
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.request_duplicate",
+        description: "Duplicate password reset request while a pending request exists",
+        actor: { email, name: email },
+        target: user,
+        metadata: { email, existingExpiresAt: existing.expiresAt.toISOString() },
+        status: "failed",
+      });
+
+      return res.status(409).json({
+        message:
+          "You have a previous password reset request pending. Contact System administrator at ICT department.",
+        email,
+      });
+    }
+
+    // Either create a new reset entry or overwrite an expired/old one
     if (existing) {
       existing.codeHash = hashResetCode(resetCode);
       existing.expiresAt = expiresAt;
@@ -718,7 +753,7 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
       });
     }
 
-    await transporter.sendMail({
+    /* await transporter.sendMail({
       from: `"KMFRI ICT Support" <${process.env.EMAIL_USER}>`,
       to: email,
       subject: "KMFRI Password Reset Code",
@@ -739,7 +774,7 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
           </div>
         </div>
       `,
-    });
+    }); */
 
     await createAuditLog({
       req,
@@ -753,7 +788,7 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
 
     res.json({
       status: "code_sent",
-      message: "A password reset code has been sent to your email",
+      message: "A password reset request has been initiated. Contact System administrator at ICT department.",
       email,
     });
   } catch (err) {
@@ -892,6 +927,55 @@ app.put(`${BASE_ROUTE}/admin/password-reset/approve`, async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
     if (!resetRequest) return res.status(404).json({ message: "Password reset request not found" });
 
+    const newPassword = String(req.body?.newPassword || "");
+
+    // If admin provided a new password, perform the reset immediately
+    if (newPassword) {
+      if (newPassword.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
+
+      user.password = await bcrypt.hash(newPassword, 10);
+      user.isPasswordReset = false;
+      await user.save();
+
+      // Remove the reset request after successful admin reset
+      await PasswordReset.deleteOne({ email });
+
+      // Send email notification to user
+      /* await transporter.sendMail({
+        from: `"KMFRI ICT Support" <${process.env.EMAIL_USER}>`,
+        to: email,
+        subject: "Your Password Has Been Reset",
+        html: `
+          <div style="font-family:Arial,Helvetica,sans-serif;max-width:580px;margin:0 auto;padding:24px;background:#f8fbfd;border-radius:16px;border:1px solid #d8e6ef;">
+            <div style="background:linear-gradient(135deg,#0a3560 0%,#0a5b8c 100%);padding:20px;border-radius:14px;color:#fff;">
+              <h2 style="margin:0 0 8px;">Password Reset Complete</h2>
+              <p style="margin:0;opacity:0.9;">Your KMFRI attendance account password has been reset by the administrator.</p>
+            </div>
+            <div style="padding:24px 8px 8px;">
+              <p style="font-size:15px;color:#12344d;">Hi ${user.name || "there"},</p>
+              <p style="font-size:15px;color:#12344d;line-height:1.6;">Your password has been reset by the ICT administrator. You can now sign in with your new password.</p>
+              <p style="font-size:15px;color:#12344d;line-height:1.6;"><strong>New password:</strong> ${newPassword}</p>
+              <p style="font-size:14px;color:#d97706;line-height:1.6;"><strong>⚠️ Important:</strong> Please change this password immediately after logging in for security reasons.</p>
+              <p style="font-size:14px;color:#486581;line-height:1.6;">If you did not request a password reset, please contact ICT support immediately.</p>
+            </div>
+          </div>
+        `,
+      }); */
+
+      await createAuditLog({
+        req,
+        category: "password_reset",
+        action: "password_reset.admin_reset",
+        description: "Admin performed password reset and set a new password",
+        actor: currentUser,
+        target: user,
+        metadata: { email, approvedBy: currentUser.email, method: "admin_set_password" },
+      });
+
+      return res.json({ message: `Password for ${email} has been reset by admin`, email, reset: true });
+    }
+
+    // Backwards compatible behavior: mark user as awaiting reset (legacy flow)
     user.isPasswordReset = true;
     await user.save();
 
@@ -899,7 +983,7 @@ app.put(`${BASE_ROUTE}/admin/password-reset/approve`, async (req, res) => {
       req,
       category: "password_reset",
       action: "password_reset.admin_approved",
-      description: "Admin approved password reset request",
+      description: "Admin approved password reset request (awaiting admin-provided password)",
       actor: currentUser,
       target: user,
       metadata: { email, approvedBy: currentUser.email },
