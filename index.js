@@ -2584,6 +2584,71 @@ app.get(`${BASE_ROUTE}/device/lost/my-requests`, async (req, res) => {
 });
 
 
+// remove device
+app.delete(`${BASE_ROUTE}/device/remove/:deviceId`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const { deviceId } = req.params;
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    // Find device and verify it belongs to the user
+    const device = await Devices.findById(deviceId);
+    if (!device) 
+      return res.status(404).json({ message: "Device not found" });
+    
+    if (device.user_email !== user.email)
+      return res.status(403).json({ message: "You can only remove your own devices" });
+
+    // Prevent removal of primary device
+    if (device.device_primary)
+      return res.status(400).json({ message: "Cannot remove your primary device" });
+
+    // Store device info for audit log
+    const deviceInfo = `${device.device_name} (${device.device_os} - ${device.device_browser})`;
+
+    // Delete the device
+    await Devices.findByIdAndDelete(deviceId);
+
+    // Remove associated biometric authenticator from user
+    if (device.device_fingerprint && user.authenticators) {
+      user.authenticators = user.authenticators.filter(
+        auth => auth.deviceFingerprint !== device.device_fingerprint
+      );
+      await user.save();
+    }
+
+    // Sync device flags after removal
+    await syncUserDeviceFlags(user);
+
+    // Create audit log
+    await createAuditLog({
+      req,
+      category: 'device',
+      action: 'device_removed',
+      description: `User removed device: ${deviceInfo}`,
+      actor: snapshotUser(user),
+      target: null,
+      metadata: {
+        deviceName: device.device_name,
+        deviceOS: device.device_os,
+        deviceBrowser: device.device_browser,
+        deviceFingerprint: device.device_fingerprint,
+      },
+      status: 'success',
+    });
+
+    res.json({ message: "Device removed successfully" });
+
+  } catch (err) {
+    console.error("Remove device error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
+
 // notifications
 
 // HIGH RANK NOTIF
