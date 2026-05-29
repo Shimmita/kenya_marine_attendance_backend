@@ -1121,17 +1121,34 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
       authenticatorSelection: { userVerification: "required" },
     }); */
 
+    const existingAuthenticators = getUserAuthenticators(user);
+
     const options = await generateRegistrationOptions({
       rpName: "KMFRI Attendance",
       rpID: getRpID(),
+
       userID: Uint8Array.from(Buffer.from(user._id.toString())),
       userName: user.email,
+
       attestationType: "none",
+
       supportedAlgorithmIDs: [-7, -257],
+
       authenticatorSelection: {
-        residentKey: "preferred",
+        authenticatorAttachment: "platform", // force device authenticator
+        residentKey: "preferred", // preserve laptop compatibility
         userVerification: "required",
       },
+
+      // improves Android/Pixel reliability
+      timeout: 60000,
+
+      // prevents duplicate registrations
+      excludeCredentials: existingAuthenticators.map((authenticator) => ({
+        id: authenticator.credentialID,
+        type: "public-key",
+        transports: ["internal"],
+      })),
     });
 
 
@@ -1304,13 +1321,21 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
 
     const options = await generateAuthenticationOptions({
       rpID: getRpID(),
+
       userVerification: "required",
+
+      // improves auth reliability across devices
+      timeout: 30000,
+
       allowCredentials: [...new Map(
         authenticators.map((authenticator) => [
           authenticator.credentialID,
           {
             id: authenticator.credentialID,
             type: "public-key",
+
+            // force device/platform auth only
+            transports: ["internal"],
           },
         ])
       ).values()],
