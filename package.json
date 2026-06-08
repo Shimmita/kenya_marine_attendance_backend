@@ -22,6 +22,7 @@
     "express-session": "^1.19.0",
     "jsonwebtoken": "^9.0.3",
     "ldapjs": "^3.0.7",
+    "local-reverse-geocoder": "^0.16.7",
     "mongoose": "^9.1.6",
     "multer": "^2.0.2",
     "nodemailer": "^8.0.5",

@@ -17,10 +17,14 @@ const clockingSchema = new mongoose.Schema(
 
         clock_in: { type: Date, required: true },
         clock_out: { type: Date, default: null },
+        missedClockOut: { type: Boolean, default: false },
         isPresent: { type: Boolean, default: false },
         clockedOutSide: { type: Boolean, default: false },
         outSideReason: { type: String, default: ""},
         isLate: { type: Boolean, default: false },
+        outsideLocation: { type: String, default: "" },
+        clockInLocationName: { type: String, default: "" },
+        clockOutLocationName: { type: String, default: "" },
         userLocation: {
             latitude: { type: Number, required: false },
             longitude: { type: Number, required: false },

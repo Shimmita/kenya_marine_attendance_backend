@@ -28,7 +28,6 @@ import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 import Verification from "./model/VerifyReport.js";
-import { transporter } from "./util/MailTransport.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -61,7 +60,7 @@ const CLIENT_AUDIT_ACTIONS = {
     description: "Attendance history exported",
   },
 };
-const PASSWORD_RESET_CODE_TTL_MS = 1000 * 60 * 15;
+const PASSWORD_RESET_CODE_TTL_MS = 1000 * 60 * 20;
 const hashResetCode = (code) =>
   crypto.createHash("sha256").update(String(code)).digest("hex");
 const generateResetCode = () =>
@@ -218,7 +217,7 @@ app.use(
     name: process.env.SESSION_NAME,
     store,
     cookie: {
-      maxAge: 60 * 15 * 1000,
+      maxAge: 60 * 20 * 1000,
       secure: environment !== "SANDBOX",
       sameSite: environment === "SANDBOX" ? "lax" : "none",
     },
@@ -445,7 +444,7 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     if (!password || password.length < 6) throw new Error("Password must be at least 6 characters!");
 
     const user = await User.findOne({ email });
-    if (!user) throw new Error("Create a new account to continue!");
+    if (!user) throw new Error("Access not granted contact HR!");
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) throw new Error("Invalid credentials!");
@@ -1351,6 +1350,68 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
   }
 });
 
+const isOutsideClockingAuthorizedNow = (user, now = new Date()) => {
+  if (!user?.canClockOutside || !user?.outsideClockingDetails) return false;
+
+  try {
+    const start = new Date(user.outsideClockingDetails.startDate);
+    const end = new Date(user.outsideClockingDetails.endDate);
+    return now >= start && now <= end;
+  } catch (e) {
+    console.warn('Outside clocking date validation failed:', e.message);
+    return false;
+  }
+};
+
+const clearExpiredOutsideClocking = async (user, now = new Date()) => {
+  if (!user?.canClockOutside || !user?.outsideClockingDetails?.endDate) return user;
+
+  const end = new Date(user.outsideClockingDetails.endDate);
+  if (now <= end) return user;
+
+  user.canClockOutside = false;
+  user.outsideClockingDetails = {
+    startDate: null,
+    endDate: null,
+    reason: "",
+    authorizedBy: "",
+    authorizedByRole: "",
+  };
+
+  await user.save();
+  return user;
+};
+
+const getNairobiLocalDate = (date = new Date()) => {
+  const local = new Date(date.toLocaleString("en-US", { timeZone: "Africa/Nairobi" }));
+  return new Date(local.getFullYear(), local.getMonth(), local.getDate());
+};
+
+const isBeforeNairobiDate = (date, compareDate = new Date()) => {
+  const d = getNairobiLocalDate(date);
+  const now = getNairobiLocalDate(compareDate);
+  return d < now;
+};
+
+const finalizeStaleClocking = async (user, now = new Date()) => {
+  if (!user || !user.isToClockOut) return user;
+
+  const latestOpen = await Clocking.findOne({ email: user.email, clock_out: null }).sort({ clock_in: -1 });
+  if (!latestOpen) return user;
+
+  if (!isBeforeNairobiDate(latestOpen.clock_in, now)) return user;
+
+  latestOpen.missedClockOut = true;
+  latestOpen.isPresent = true;
+  await latestOpen.save();
+
+  user.hasClockedIn = false;
+  user.isToClockOut = false;
+  await user.save();
+
+  return user;
+};
+
 /**
  * 4. Verify Authentication Response
  *
@@ -1373,11 +1434,14 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
  */
 app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
   try {
+    // metadata returned to client for debugging/confirmation
+    let verifyResultMeta = { clockedOutside: false, outsideLocation: null };
     if (!req.session.isOnline) {
       return res.status(401).json({ verified: false, message: "Unauthorized" });
     }
 
-    const user = await User.findById(req.session.userID);
+    let user = await clearExpiredOutsideClocking(await User.findById(req.session.userID));
+    user = await finalizeStaleClocking(user);
     const authenticators = getUserAuthenticators(user);
     if (!user || authenticators.length === 0) {
       return res.status(400).json({ verified: false, message: "Fingerprint not registered" });
@@ -1391,8 +1455,9 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       });
     }
 
-    // extract selected station and auth response from request body
-    const { selectedStation, userCoords, device_fingerprint, ...authResponse } = req.body;
+    // extract selected station, optional outsideLocation and auth response from request body
+    const { selectedStation, userCoords, device_fingerprint, outsideLocation, ...authResponse } = req.body;
+    console.debug('biometric/verify payload:', { selectedStation, userCoords, device_fingerprint, hasOutsideLocation: !!outsideLocation });
     const matchedAuthenticator =
       authenticators.find(
         (authenticator) =>
@@ -1494,6 +1559,22 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
         }
       };
 
+      const canClockOutsideNow = isOutsideClockingAuthorizedNow(user, now);
+
+      // Only persist outside-clock metadata while the user's dated authorization is active.
+      if (canClockOutsideNow) {
+        clockingData.outsideLocation = outsideLocation || "";
+        clockingData.clockInLocationName = outsideLocation || "";
+        clockingData.clockedOutSide = true;
+        clockingData.outSideReason = user.outsideClockingDetails?.reason || "";
+        verifyResultMeta.clockedOutside = true;
+        verifyResultMeta.outsideLocation = outsideLocation || null;
+      } else {
+        if (outsideLocation) {
+          console.debug('outsideLocation provided but user not authorized', { email: user.email, canClockOutside: user.canClockOutside, outsideClockingDetails: user.outsideClockingDetails });
+        }
+      }
+
       await Clocking.create(clockingData);
 
       user.hasClockedIn = true;
@@ -1509,7 +1590,8 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
         actor: user,
         metadata: {
           station: selectedStation,
-          clockedOutside: false,
+          clockedOutside: verifyResultMeta.clockedOutside,
+          outsideLocation: verifyResultMeta.outsideLocation,
           userLocation: clockingData.userLocation,
         },
       });
@@ -1526,6 +1608,19 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
       const now = new Date();
       latestClocking.clock_out = now;
+
+      const canClockOutsideNow = isOutsideClockingAuthorizedNow(user, now);
+
+      if (canClockOutsideNow) {
+        latestClocking.clockOutLocationName = outsideLocation || "";
+        latestClocking.outsideLocation = latestClocking.outsideLocation || outsideLocation || "";
+        latestClocking.clockedOutSide = true;
+        latestClocking.outSideReason = user.outsideClockingDetails?.reason || latestClocking.outSideReason || "";
+        verifyResultMeta.clockedOutside = true;
+        verifyResultMeta.outsideLocation = outsideLocation || null;
+      } else if (outsideLocation) {
+        console.debug('outsideLocation provided at clock-out but user not authorized', { email: user.email, canClockOutside: user.canClockOutside, outsideClockingDetails: user.outsideClockingDetails });
+      }
 
       // Calculate difference in milliseconds
       const diffMs = now - latestClocking.clock_in;
@@ -1553,6 +1648,8 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           station: latestClocking.station,
           workedHours: Number(diffHours.toFixed(2)),
           isPresent: latestClocking.isPresent,
+          clockedOutside: verifyResultMeta.clockedOutside,
+          outsideLocation: verifyResultMeta.outsideLocation,
         },
       });
     }
@@ -1561,7 +1658,8 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     req.session.biometricVerified = true;
     req.session.biometricVerifiedAt = Date.now();
     delete req.session.authChallenge;
-    res.json({ verified: true });
+    // include metadata so frontend can show whether outsideLocation was saved
+    res.json({ verified: true, meta: verifyResultMeta });
   } catch (err) {
     console.error("Auth verify error:", err);
     res.status(401).json({ verified: false, message: err.message });
@@ -1607,7 +1705,10 @@ app.get(`${BASE_ROUTE}/user/profile`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
-    const user = await User.findById(req.session.userID).select("-password").select("-authenticator").select("-authenticators");
+    let user = await clearExpiredOutsideClocking(
+      await User.findById(req.session.userID).select("-password").select("-authenticator").select("-authenticators")
+    );
+    user = await finalizeStaleClocking(user);
     if (!user) throw new Error("User not found");
 
     res.json(user);
@@ -1651,8 +1752,9 @@ app.get(`${BASE_ROUTE}/user/attendance/history`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await finalizeStaleClocking(user);
 
     const limit = parseInt(req.query.limit) || 0;
     if (limit == 0) {
@@ -1676,8 +1778,9 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await finalizeStaleClocking(user);
 
     const userEmail = user.email;
     const now = new Date();
@@ -1714,12 +1817,14 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
       filteredRecords.forEach(rec => {
         const dateKey = new Date(rec.clock_in).toISOString().split('T')[0];
         if (!dailyMap[dateKey]) {
-          dailyMap[dateKey] = { hours: 0, isLateAny: false, isEarlyAny: false, clockings: 0 };
+          dailyMap[dateKey] = { hours: 0, isLateAny: false, isEarlyAny: false, clockings: 0, missedClockOut: false };
         }
 
         if (rec.clock_out) {
           const duration = (new Date(rec.clock_out) - new Date(rec.clock_in)) / (1000 * 60 * 60);
           dailyMap[dateKey].hours += duration;
+        } else if (rec.missedClockOut) {
+          dailyMap[dateKey].missedClockOut = true;
         }
 
         // Punctuality: If any clock-in today was early, the day counts as early
@@ -1743,6 +1848,7 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
         // Logical Classification
         if (day.hours >= 5) presentDays++;
         else if (day.hours > 0) halfDays++;
+        else if (day.missedClockOut) presentDays++;
 
         // Punctuality Strategy: Early trump's Late for the day
         if (day.isEarlyAny) earlyDays++;
@@ -2078,13 +2184,37 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       });
 
     const department = currentSupervisor.department;
+    const dateKey = (date) => new Date(date).toISOString().split("T")[0];
+    const hourDecimal = (date) => {
+      const d = new Date(date);
+      return d.getHours() + d.getMinutes() / 60;
+    };
+    const hourLabel = (value) => {
+      if (value == null || Number.isNaN(value)) return "—";
+      const h = Math.floor(value);
+      const m = Math.round((value - h) * 60);
+      return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    };
+    const countWeekdays = (start, end) => {
+      let count = 0;
+      const cursor = new Date(start);
+      cursor.setHours(0, 0, 0, 0);
+      const last = new Date(end);
+      last.setHours(0, 0, 0, 0);
+      while (cursor <= last) {
+        const day = cursor.getDay();
+        if (day !== 0 && day !== 6) count++;
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      return Math.max(count, 1);
+    };
 
     // -----------------------------------
     // FETCH STAFF
     // -----------------------------------
     const staff = await User.find(
       { department },
-      "email name department station isAccountActive role"
+      "email name department station isAccountActive role isOnLeave hasClockedIn isToClockOut canClockOutside outsideClockingDetails"
     ).lean();
 
     if (!staff.length)
@@ -2096,8 +2226,8 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const workingDaysSoFar =
-      Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
+    const workingDaysSoFar = countWeekdays(startOfMonth, now);
+    const todayKey = dateKey(now);
 
     // -----------------------------------
     // FETCH CLOCKING RECORDS
@@ -2115,17 +2245,50 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     };
 
     const metricsMap = {};
+    const dailyMap = {};
+    const stationMap = {};
+    const employeesWithRecords = new Set();
+    let outsideClockingCount = 0;
+    let outsideClockingStaff = new Set();
+    let completedSessions = 0;
+    let totalClockInHour = 0;
+    let totalClockOutHour = 0;
+    let totalPresentDays = 0;
+    let halfDayCount = 0;
 
     staff.forEach((u) => {
       metricsMap[u.email] = {
         name: u.name,
         email: u.email,
         station: u.station,
+        role: u.role,
+        isAccountActive: u.isAccountActive,
+        isOnLeave: u.isOnLeave,
+        hasClockedIn: u.hasClockedIn,
+        canClockOutside: u.canClockOutside,
+        outsideClockingDetails: u.outsideClockingDetails,
         hours: 0,
         overtime: 0,
         lateCount: 0,
+        outsideClockingCount: 0,
+        openSessions: 0,
+        presentCount: 0,
+        halfDayCount: 0,
         daysPresent: new Set(),
       };
+
+      const station = u.station || "Unassigned";
+      if (!stationMap[station]) {
+        stationMap[station] = {
+          station,
+          staff: 0,
+          hours: 0,
+          lateCount: 0,
+          outsideClockingCount: 0,
+          openSessions: 0,
+        };
+      }
+      stationMap[station].staff++;
     });
 
     // -----------------------------------
@@ -2136,12 +2299,47 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       if (!metric) return;
 
       let hoursWorked = 0;
+      const key = dateKey(rec.clock_in);
+      const station = rec.station || metric.station || "Unassigned";
+      employeesWithRecords.add(rec.email);
+
+      if (!dailyMap[key]) {
+        dailyMap[key] = {
+          date: key,
+          clockIns: 0,
+          clockOuts: 0,
+          present: 0,
+          halfDays: 0,
+          late: 0,
+          outsideClocking: 0,
+          hours: 0,
+        };
+      }
+
+      if (!stationMap[station]) {
+        stationMap[station] = {
+          station,
+          staff: 0,
+          hours: 0,
+          lateCount: 0,
+          outsideClockingCount: 0,
+          openSessions: 0,
+        };
+      }
+
+      dailyMap[key].clockIns++;
+      totalClockInHour += hourDecimal(rec.clock_in);
 
       if (rec.clock_out) {
         hoursWorked =
           (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
 
         metric.hours += hoursWorked;
+        stationMap[station].hours += hoursWorked;
+        dailyMap[key].hours += hoursWorked;
+        dailyMap[key].clockOuts++;
+        completedSessions++;
+        totalClockOutHour += hourDecimal(rec.clock_out);
 
         if (hoursWorked > 9)
           metric.overtime += hoursWorked - 9;
@@ -2149,9 +2347,34 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
         metric.daysPresent.add(
           rec.clock_in.toDateString()
         );
+
+        if (rec.isPresent) {
+          metric.presentCount++;
+          dailyMap[key].present++;
+          totalPresentDays++;
+        } else {
+          metric.halfDayCount++;
+          dailyMap[key].halfDays++;
+          halfDayCount++;
+        }
+      } else {
+        metric.openSessions++;
+        stationMap[station].openSessions++;
       }
 
-      if (rec.isLate) metric.lateCount++;
+      if (rec.isLate) {
+        metric.lateCount++;
+        stationMap[station].lateCount++;
+        dailyMap[key].late++;
+      }
+
+      if (rec.clockedOutSide || rec.outsideLocation) {
+        metric.outsideClockingCount++;
+        stationMap[station].outsideClockingCount++;
+        dailyMap[key].outsideClocking++;
+        outsideClockingCount++;
+        outsideClockingStaff.add(rec.email);
+      }
     });
 
     // -----------------------------------
@@ -2178,9 +2401,18 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
         name: m.name,
         email: m.email,
         station: m.station,
+        role: m.role,
+        isAccountActive: m.isAccountActive,
+        isOnLeave: m.isOnLeave,
+        hasClockedIn: m.hasClockedIn,
+        canClockOutside: m.canClockOutside,
         hours: m.hours.toFixed(1),
         overtime: m.overtime.toFixed(1),
         lateCount: m.lateCount,
+        outsideClockingCount: m.outsideClockingCount,
+        openSessions: m.openSessions,
+        presentCount: m.presentCount,
+        halfDayCount: m.halfDayCount,
         daysPresent: m.daysPresent.size,
         attendanceRate: attendanceRate.toFixed(1) + "%",
         productivityScore,
@@ -2203,10 +2435,40 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     res.json({
       department,
       totalStaff: staff.length,
-      activeStaffThisMonth: Object.keys(metricsMap).length,
+      activeStaffThisMonth: employeesWithRecords.size,
+      inactiveStaffThisMonth: staff.length - employeesWithRecords.size,
+      onLeaveCount: staff.filter((u) => u.isOnLeave).length,
+      clockedInNow: staff.filter((u) => u.hasClockedIn && u.isToClockOut).length,
+      outsideAuthorizedCount: staff.filter((u) => u.canClockOutside).length,
       totalHours: deptStats.totalHours.toFixed(1),
       totalOvertime: deptStats.totalOvertime.toFixed(1),
       totalLateCount: deptStats.lateCount,
+      outsideClockingCount,
+      outsideClockingStaffCount: outsideClockingStaff.size,
+      presentDays: totalPresentDays,
+      halfDays: halfDayCount,
+      avgClockIn: hourLabel(records.length ? totalClockInHour / records.length : null),
+      avgClockOut: hourLabel(completedSessions ? totalClockOutHour / completedSessions : null),
+      today: {
+        clockIns: dailyMap[todayKey]?.clockIns || 0,
+        clockOuts: dailyMap[todayKey]?.clockOuts || 0,
+        present: dailyMap[todayKey]?.present || 0,
+        late: dailyMap[todayKey]?.late || 0,
+        outsideClocking: dailyMap[todayKey]?.outsideClocking || 0,
+      },
+      dailyTrend: Object.values(dailyMap)
+        .sort((a, b) => new Date(a.date) - new Date(b.date))
+        .map((item) => ({
+          ...item,
+          hours: Number(item.hours.toFixed(1)),
+          day: new Date(item.date).toLocaleDateString("en-KE", { day: "2-digit", month: "short" }),
+        })),
+      stationSummary: Object.values(stationMap)
+        .map((item) => ({
+          ...item,
+          hours: Number(item.hours.toFixed(1)),
+        }))
+        .sort((a, b) => b.hours - a.hours),
       topPerformers: top3Performers,   // 🔥 NEW
       employeeMetrics: sortedEmployees,
     });
@@ -2596,9 +2858,9 @@ app.delete(`${BASE_ROUTE}/device/remove/:deviceId`, async (req, res) => {
 
     // Find device and verify it belongs to the user
     const device = await Devices.findById(deviceId);
-    if (!device) 
+    if (!device)
       return res.status(404).json({ message: "Device not found" });
-    
+
     if (device.user_email !== user.email)
       return res.status(403).json({ message: "You can only remove your own devices" });
 
