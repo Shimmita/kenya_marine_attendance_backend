@@ -32,6 +32,7 @@ const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
 ];
+
 const mongoDBSession = connectMongoStore(session);
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -54,6 +55,7 @@ const PORT = process.env.PORT || 5000;
 const BASE_ROUTE = process.env.BASE_ROUTE;
 const environment = process.env.ENVIRONMENT_MODE;
 const PRIVILEGED_AUDIT_RANKS = ["admin", "hr"];
+const MAX_USER_DEVICES = 2;
 const CLIENT_AUDIT_ACTIONS = {
   "attendance.history_exported": {
     category: "attendance",
@@ -133,7 +135,6 @@ const createAuditLog = async ({
   }
 };
 
-const MAX_USER_DEVICES = 2;
 
 const getUserAuthenticators = (user) => {
   const authenticators = Array.isArray(user?.authenticators) ? [...user.authenticators] : [];
@@ -421,8 +422,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Batch registration error:", error);
-
     // Handle MongoDB duplicate key errors
     if (error.code === 11000) {
       const field = Object.keys(error.keyPattern)[0];
@@ -1085,7 +1084,6 @@ app.put(
       });
 
     } catch (error) {
-      console.error(error);
       res.status(500).json({ message: "Failed to update profile" });
     }
   }
@@ -2509,39 +2507,16 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
     const phone = user.phone
     const email = user.email
     const department = user.department
-    const gender = user.gender
     const role = user.role
     // Check if station exists and extract the value
     const stationName = latestStation?.station;
-    // 1. Determine Pronouns/Subject Reference based on Gender
-    const genderKey = gender?.toLowerCase();
-    const pronoun = genderKey === "male" ? "He" : genderKey === "female" ? "She" : "The user";
 
     // 2. Format Role (Capitalize first letter)
     const formattedRole = role.charAt(0).toUpperCase() + role.slice(1);
 
-    // 3. Define the Station Text (only if available)
-    const stationText = latestStation?.station
-      ? `\n- **Latest Clocking Station:** ${latestStation.station}`
-      : "";
 
-    // 4. Construct the letter-style message (Now including stationText)
-    const message = `**SUBJECT: Lost Device Report - ${name}**
-
-Hello Admin Team,
-
-**${formattedRole} ${name}** (Phone: ${phone}) from ${stationName} - **${department}** department has reported a lost device. ${pronoun} was last seen at a station.
-
-**Details:**
-- **Email:** ${email}${stationText}
-
-**Next Steps:**
-Please navigate to the **User Requests** section to review this case and resolve the issue. Most likely, this will involve deregistering the device from the system to ensure security.
-
-Best regards,
-System Automator`;
-
-
+    const message = `Hello Admin Team, ${formattedRole} ${name} (Phone: ${phone} and Email: ${email}) from ${stationName} - ${department} department has reported a lost device. 
+Please navigate to the lost device section to review this case and resolve the issue by deregistering the stolen device from the system for security reasons.`;
 
     const userDevices = await Devices.find({ user_email: user.email })
 
@@ -2606,7 +2581,6 @@ System Automator`;
     });
 
   } catch (err) {
-    console.error("Lost device request error:", err);
     res.status(400).json({ message: err.message });
   }
 });
@@ -3957,7 +3931,6 @@ app.get(`${BASE_ROUTE}/user/colleagues`, async (req, res) => {
 
     res.status(200).json(colleagues);
   } catch (error) {
-    console.error("Error fetching colleagues:", error);
     res.status(500).json({ message: "Server error while fetching colleagues" });
   }
 });
@@ -3987,7 +3960,6 @@ app.post(`${BASE_ROUTE}/verify/create`, async (req, res) => {
     res.json({ token, dataHash });
 
   } catch (err) {
-    console.error(err);
     res.status(500).json({ message: 'Failed to create verification' });
   }
 });
