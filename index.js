@@ -1455,7 +1455,6 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
     // extract selected station, optional outsideLocation and auth response from request body
     const { selectedStation, userCoords, device_fingerprint, outsideLocation, ...authResponse } = req.body;
-    console.debug('biometric/verify payload:', { selectedStation, userCoords, device_fingerprint, hasOutsideLocation: !!outsideLocation });
     const matchedAuthenticator =
       authenticators.find(
         (authenticator) =>
@@ -3314,6 +3313,54 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
 
     res.json({
       message: `station updated successfully`,
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// admin reset biometrics of user
+app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    targetUser.authenticators = [];
+    targetUser.authenticator = undefined;
+    targetUser.doneBiometric=false;
+    targetUser.hasDevices=false;
+    await targetUser.save();
+
+    // delete any devices that have been saved in the model of the target user email
+    // this makes the user by default to be like they have not added any devices
+
+    await Devices.deleteMany({ user_email: targetUser.email })
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_biometrics_reset",
+      description: "User biometrics reset",
+      actor: currentUser,
+      target: targetUser,
+    });
+
+    res.json({
+      message: `User biometrics reset successfully`,
       user: targetUser,
     });
 
