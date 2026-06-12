@@ -2150,7 +2150,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
 // added overall stats
 app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
-  if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
+  if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized Access" });
   const { station, department, startDate, endDate } = req.query;
   const query = {};
   if (station) query.station = station;
@@ -2169,7 +2169,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
   try {
     if (!req.session?.isOnline)
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).json({ message: "Unauthorized Access" });
 
     const currentSupervisor = await User.findById(req.session.userID);
     if (!currentSupervisor)
@@ -2177,10 +2177,15 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
     if (currentSupervisor.rank !== "supervisor")
       return res.status(403).json({
-        message: "Selected user is not eligible to be a supervisor",
+        message: "Unauthorized Access",
       });
 
+    // filter details based on the department and station of the supervisor.
+    // supervisors of another station cannot view records of other staions even if
+    // they are of the same department
     const department = currentSupervisor.department;
+    const station = currentSupervisor.station;
+
     const dateKey = (date) => new Date(date).toISOString().split("T")[0];
     const hourDecimal = (date) => {
       const d = new Date(date);
@@ -2210,7 +2215,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     // FETCH STAFF
     // -----------------------------------
     const staff = await User.find(
-      { department },
+      { department,station },
       "email name department station isAccountActive role isOnLeave hasClockedIn isToClockOut canClockOutside outsideClockingDetails"
     ).lean();
 
@@ -2424,7 +2429,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       (a, b) => b.productivityScore - a.productivityScore
     );
 
-    const top3Performers = sortedEmployees.slice(0, 3);
+    const top3Performers = sortedEmployees.slice(0, 4);
 
     // -----------------------------------
     // RESPONSE
@@ -3341,8 +3346,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
 
     targetUser.authenticators = [];
     targetUser.authenticator = undefined;
-    targetUser.doneBiometric=false;
-    targetUser.hasDevices=false;
+    targetUser.doneBiometric = false;
+    targetUser.hasDevices = false;
     await targetUser.save();
 
     // delete any devices that have been saved in the model of the target user email
