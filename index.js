@@ -28,6 +28,11 @@ import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 import Verification from "./model/VerifyReport.js";
+import {
+  formatDateKey,
+  isPublicHoliday,
+  isWeekend
+} from "./util/Holiday.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -2148,21 +2153,327 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 });
 
 
-// added overall stats
+// ============================================================================
+// ADMIN - ATTENDANCE RECORDS
+// ============================================================================
+
 app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
-  if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized Access" });
-  const { station, department, startDate, endDate } = req.query;
-  const query = {};
-  if (station) query.station = station;
-  if (department) query.department = department;
-  const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-  const end = endDate ? new Date(endDate) : new Date();
-  end.setHours(23, 59, 59, 999);
-  query.clock_in = { $gte: start, $lte: end };
-  const records = await Clocking.find(query).sort({ clock_in: -1 }).limit(2000);
-  res.status(200).json(records);
+  try {
+
+    if (!req.session.isOnline) {
+      return res.status(401).json({
+        message: "Unauthorized Access"
+      });
+    }
+
+    const {
+      station,
+      department,
+      role,
+      startDate,
+      endDate,
+    } = req.query;
+
+    //----------------------------------------------------
+    // Attendance Query
+    //----------------------------------------------------
+
+    const attendanceQuery = {};
+
+    if (station && station !== "all") {
+      attendanceQuery.station = station;
+    }
+
+    if (department && department !== "all") {
+      attendanceQuery.department = department;
+    }
+
+    const start = startDate
+      ? new Date(startDate)
+      : new Date(
+        new Date().getFullYear(),
+        new Date().getMonth(),
+        1
+      );
+
+    const end = endDate
+      ? new Date(endDate)
+      : new Date();
+
+    end.setHours(23, 59, 59, 999);
+
+    attendanceQuery.clock_in = {
+      $gte: start,
+      $lte: end
+    };
+
+    //----------------------------------------------------
+    // User Query
+    //----------------------------------------------------
+
+    const userQuery = {};
+
+    if (role && role !== "all") {
+      userQuery.role = role;
+    }
+
+    const users = await User.find(
+      userQuery,
+      `
+      email
+      employeeId
+      role
+      name
+      department
+      station
+      `
+    ).lean();
+
+    const userLookup = {};
+
+    users.forEach((user) => {
+      userLookup[user.email] = user;
+    });
+
+    attendanceQuery.email = {
+      $in: users.map((u) => u.email)
+    };
+
+    //----------------------------------------------------
+    // Fetch Attendance Records
+    //----------------------------------------------------
+
+    const records = await Clocking.find(attendanceQuery)
+      .sort({ clock_in: -1 })
+      .lean();
+
+    //----------------------------------------------------
+    // Merge User Details
+    //----------------------------------------------------
+
+    const mergedRecords = records.map((record) => {
+
+      const user = userLookup[record.email] || {};
+
+      return {
+
+        ...record,
+
+        employeeId: user.employeeId || "",
+
+        role: user.role || "",
+
+        name: user.name || record.name,
+
+        department:
+          user.department || record.department,
+
+        station:
+          user.station || record.station
+
+      };
+
+    });
+
+    res.status(200).json(mergedRecords);
+
+  } catch (error) {
+
+    console.error(error);
+
+    res.status(500).json({
+      message: error.message
+    });
+
+  }
 });
 
+
+// ============================================================================
+// ADMIN - MONTHLY / DATE RANGE ATTENDANCE SUMMARY
+// ============================================================================
+
+app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) {
+      return res.status(401).json({
+        message: "Unauthorized Access",
+      });
+    }
+
+    const {
+      startDate,
+      endDate,
+      station,
+      department,
+      role,
+    } = req.query;
+
+    //---------------------------------------------------------
+    // Date Range
+    //---------------------------------------------------------
+
+    const start = startDate
+      ? new Date(startDate)
+      : new Date(
+        new Date().getFullYear(),
+        new Date().getMonth(),
+        1
+      );
+
+    const end = endDate
+      ? new Date(endDate)
+      : new Date();
+
+    end.setHours(23, 59, 59, 999);
+
+    //---------------------------------------------------------
+    // Working Days
+    //---------------------------------------------------------
+
+    const workingDates = [];
+
+    const current = new Date(start);
+
+    while (current <= end) {
+
+      if (
+        !isWeekend(current) &&
+        !isPublicHoliday(current)
+      ) {
+        workingDates.push(
+          formatDateKey(current)
+        );
+      }
+
+      current.setDate(current.getDate() + 1);
+    }
+
+    const totalWorkingDays = workingDates.length;
+
+    //---------------------------------------------------------
+    // User Filters
+    //---------------------------------------------------------
+
+    const userQuery = {};
+
+    if (station && station !== "all")
+      userQuery.station = station;
+
+    if (department && department !== "all")
+      userQuery.department = department;
+
+    if (role && role !== "all")
+      userQuery.role = role;
+
+    //---------------------------------------------------------
+    // Users
+    //---------------------------------------------------------
+
+    const users = await User.find(
+      userQuery,
+      `
+      name
+      email
+      employeeId
+      role
+      station
+      department
+      `
+    ).lean();
+
+    //---------------------------------------------------------
+    // Attendance Records
+    //---------------------------------------------------------
+
+    const attendanceRecords = await Clocking.find({
+
+      email: {
+        $in: users.map(u => u.email)
+      },
+
+      clock_in: {
+        $gte: start,
+        $lte: end
+      }
+
+    }).lean();
+
+    //---------------------------------------------------------
+    // Present Days
+    //---------------------------------------------------------
+
+    const attendanceMap = {};
+
+    attendanceRecords.forEach(record => {
+
+      if (!attendanceMap[record.email]) {
+        attendanceMap[record.email] = new Set();
+      }
+
+      const dateKey = formatDateKey(record.clock_in);
+
+      if (!workingDates.includes(dateKey))
+        return;
+
+      attendanceMap[record.email].add(dateKey);
+
+    });
+
+    //---------------------------------------------------------
+    // Summary
+    //---------------------------------------------------------
+
+    const summary = users.map(user => {
+
+      const presentDays =
+        attendanceMap[user.email]
+          ? attendanceMap[user.email].size
+          : 0;
+
+      return {
+
+        employeeId: user.employeeId || "",
+
+        name: user.name || "",
+
+        role: user.role || "",
+
+        station: user.station || "",
+
+        department: user.department || "",
+
+        totalDays: totalWorkingDays,
+
+        daysPresent: presentDays,
+
+        daysAbsent: Math.max(
+          totalWorkingDays - presentDays,
+          0
+        )
+
+      };
+
+    });
+
+    //---------------------------------------------------------
+
+    summary.sort((a, b) =>
+      a.name.localeCompare(b.name)
+    );
+
+    return res.status(200).json(summary);
+
+  } catch (error) {
+
+    console.error(error);
+
+    return res.status(500).json({
+      message: error.message,
+    });
+
+  }
+});
 
 
 // departmental stats
@@ -2215,7 +2526,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     // FETCH STAFF
     // -----------------------------------
     const staff = await User.find(
-      { department,station },
+      { department, station },
       "email name department station isAccountActive role isOnLeave hasClockedIn isToClockOut canClockOutside outsideClockingDetails"
     ).lean();
 
