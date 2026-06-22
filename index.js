@@ -2244,7 +2244,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
     //----------------------------------------------------
 
     const records = await Clocking.find(attendanceQuery)
-      .sort({ clock_in: -1 })
+      .sort({ name: 1 })
       .lean();
 
     //----------------------------------------------------
@@ -2273,7 +2273,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 
       };
 
-    });
+    })
 
     res.status(200).json(mergedRecords);
 
@@ -2380,7 +2380,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       station
       department
       `
-    ).lean();
+    ).lean().sort({ name: 1 });
 
     //---------------------------------------------------------
     // Attendance Records
@@ -2443,8 +2443,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
 
         department: user.department || "",
 
-        totalDays: totalWorkingDays,
-
         daysPresent: presentDays,
 
         daysAbsent: Math.max(
@@ -2457,10 +2455,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     });
 
     //---------------------------------------------------------
-
-    summary.sort((a, b) =>
-      a.name.localeCompare(b.name)
-    );
 
     return res.status(200).json(summary);
 
@@ -3395,7 +3389,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "ceo", "hr"].includes(currentUser.rank))
+    if (!["admin", "hr"].includes(currentUser.rank))
       return res.status(403).json({ message: "unauthorised operation!" });
 
     if (!["employee"].includes(currentUser.role))
