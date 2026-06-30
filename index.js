@@ -1920,6 +1920,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
     const totalStaff = allUsers.length;
 
+
+
     const stats = {
       orgTotalHours: 0,
       orgTotalOvertime: 0,
@@ -2129,7 +2131,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     // -----------------------------------
     // FINAL RESPONSE
     // -----------------------------------
-
     res.status(200).json({
       overview: {
         totalStaff,
@@ -2244,7 +2245,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
     //----------------------------------------------------
 
     const records = await Clocking.find(attendanceQuery)
-      .sort({ name: 1 })
+      .sort({ name: 1, clock_in: -1 })
       .lean();
 
     //----------------------------------------------------
@@ -2380,7 +2381,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       station
       department
       `
-    ).lean().sort({ name: 1 });
+    ).lean().sort({ name: 1, clock_in: -1 });
 
     //---------------------------------------------------------
     // Attendance Records
@@ -3712,6 +3713,10 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
 
     if (!["admin", "hr", "ceo"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
+
+    const supervisorInUserDB = await User.findOne({
+      email: supervisor.email,
+    });
 
     const targetUser = await User.findById(req.params.id);
     if (!supervisorInUserDB) {

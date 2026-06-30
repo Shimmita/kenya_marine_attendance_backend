@@ -57,7 +57,7 @@ const userSchema = new mongoose.Schema(
     },
     rank: {
       type: String,
-      enum: ["admin", "user", "hr", "supervisor", "ceo", "auditor"],
+      enum: ["admin", "user", "hr", "supervisor", "ceo", "auditor", "superadmin"],
       default: "user",
     },
     avatarID: { type: String, default: "" },
