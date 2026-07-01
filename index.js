@@ -27,6 +27,7 @@ import MessageUser from "./model/MessageUser.js";
 import PasswordReset from "./model/PasswordReset.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
+import PlatformConfig, { getDefaultPlatformConfig } from "./model/PlatformConfig.js";
 import Verification from "./model/VerifyReport.js";
 import {
   formatDateKey,
@@ -59,7 +60,7 @@ app.use(
 const PORT = process.env.PORT || 5000;
 const BASE_ROUTE = process.env.BASE_ROUTE;
 const environment = process.env.ENVIRONMENT_MODE;
-const PRIVILEGED_AUDIT_RANKS = ["admin", "hr"];
+const PRIVILEGED_AUDIT_RANKS = ["admin", "hr", "superadmin"];
 const MAX_USER_DEVICES = 2;
 const CLIENT_AUDIT_ACTIONS = {
   "attendance.history_exported": {
@@ -250,8 +251,8 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
     const currentUser = await User.findById(req.session.userID);
-    if (!["hr"].includes(currentUser.rank)) {
-      return res.status(403).json({ message: "Access denied, only HR personnel can create accounts." });
+    if (!["hr","superadmin"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Access denied, only HR or Superadmin personnel can create accounts." });
     }
 
     const data = req.body.formData
@@ -304,8 +305,8 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
 
     //  2. Verify user has HR rank
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || !["hr"].includes(currentUser.rank)) {
-      return res.status(403).json({ message: "Only HR personnel can perform this operation." });
+    if (!currentUser || !["hr","superadmin"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Only HR or Superadmin personnel can perform this operation." });
     }
 
     //  3. Validate request body
@@ -2481,7 +2482,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     if (!currentSupervisor)
       return res.status(404).json({ message: "User not found" });
 
-    if (currentSupervisor.rank !== "supervisor")
+    if (!["supervisor","superadmin"].includes(currentSupervisor.rank))
       return res.status(403).json({
         message: "Unauthorized Access",
       });
@@ -3382,7 +3383,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
 
     const { rank } = req.body;
 
-    const allowedRanks = ["admin", "user", "hr", "supervisor", "ceo", "auditor"];
+    const allowedRanks = ["admin", "user", "hr", "supervisor", "ceo", "auditor", "superadmin"];
     if (!allowedRanks.includes(rank))
       return res.status(400).json({ message: "Invalid rank value" });
 
@@ -3390,7 +3391,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr"].includes(currentUser.rank))
+    if (!["admin", "hr", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "unauthorised operation!" });
 
     if (!["employee"].includes(currentUser.role))
@@ -3466,7 +3467,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-role`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+    if (!["admin", "hr", "ceo", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -3506,7 +3507,7 @@ app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo", "supervisor", "auditor"].includes(currentUser.rank))
+    if (!["admin", "hr", "ceo", "supervisor", "auditor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const users = await User.find().sort({ createdAt: -1 });
@@ -3527,7 +3528,7 @@ app.get(`${BASE_ROUTE}/supervisor/users`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["supervisor"].includes(currentUser.rank))
+    if (!["supervisor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const users = await User.find({ department: currentUser.department }).sort({ createdAt: -1 });
@@ -3554,7 +3555,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -3602,7 +3603,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -3643,7 +3644,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr"].includes(currentUser.rank))
+    if (!["admin", "hr", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -3711,7 +3712,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo"].includes(currentUser.rank))
+    if (!["admin", "hr", "ceo", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const supervisorInUserDB = await User.findOne({
@@ -3728,7 +3729,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
       return res.status(404).json({ message: "Supervisor not found" });
 
     // Ensure supervisor has proper rank
-    if (!["supervisor", "admin", "hr", "ceo"].includes(supervisorInUserDB.rank))
+    if (!["supervisor", "admin", "hr", "ceo", "superadmin"].includes(supervisorInUserDB.rank))
       return res.status(400).json({ message: "Selected user is not eligible to be a supervisor" });
 
     // Prevent assigning user as their own supervisor
@@ -3970,7 +3971,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "supervisor"].includes(currentUser.rank))
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     // 4. Update Target User
@@ -4146,7 +4147,7 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
     }
 
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || !["auditor", "admin"].includes(currentUser.rank)) {
+    if (!currentUser || !["auditor", "admin", "superadmin"].includes(currentUser.rank)) {
       return res.status(403).json({ message: "Access denied" });
     }
 
@@ -4361,5 +4362,246 @@ app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
 
   } catch (err) {
     res.status(500).json({ message: 'Verification failed' });
+  }
+});
+
+// -----------------------------
+// Superadmin endpoints (endpoints protected to superadmin)
+// -----------------------------
+
+const ensureSuperadmin = async (req, res, allowBootstrap = false) => {
+  if (!req.session?.isOnline || !req.session?.userID) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  const currentUser = await User.findById(req.session.userID);
+  if (!currentUser) return res.status(401).json({ message: 'Unauthorized' });
+
+  const anySuperadmin = await User.findOne({ rank: 'superadmin' });
+  if (!anySuperadmin && allowBootstrap) {
+    return { allowed: true, currentUser };
+  }
+
+  if (currentUser.rank !== 'superadmin') {
+    return res.status(403).json({ message: 'Access denied. Superadmin only.' });
+  }
+
+  return { allowed: true, currentUser };
+};
+
+app.get(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
+  try {
+    const cfg = await PlatformConfig.getSingleton();
+    return res.status(200).json(cfg);
+  } catch (err) {
+    console.error('Get config error:', err);
+    return res.status(500).json({ message: 'Failed to load configuration' });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+
+    const updates = req.body || {};
+    const cfg = await PlatformConfig.getSingleton();
+    const allowedKeys = ['logoUrl', 'branding', 'activeThemeName', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations'];
+    allowedKeys.forEach((k) => {
+      if (typeof updates[k] !== 'undefined') {
+        cfg[k] = updates[k];
+        cfg.markModified(k);
+      }
+    });
+
+    await cfg.save();
+
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.config.update', description: 'Platform configuration updated', actor: auth.currentUser, metadata: { updates } });
+
+    return res.status(200).json(cfg);
+  } catch (err) {
+    console.error('Update config error:', err);
+    return res.status(400).json({ message: err.message || 'Update failed' });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+
+    const { section = 'all' } = req.body || {};
+    const defaults = getDefaultPlatformConfig();
+    const cfg = await PlatformConfig.getSingleton();
+    const resettableSections = ['branding', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations', 'logoUrl'];
+
+    if (section === 'all') {
+      Object.entries(defaults).forEach(([key, value]) => {
+        cfg[key] = value;
+        cfg.markModified(key);
+      });
+    } else {
+      if (!resettableSections.includes(section)) throw new Error('Unsupported reset section');
+      if (section === 'themes') {
+        const currentBranding = cfg.branding?.toObject?.() || cfg.branding || {};
+        cfg.themes = defaults.themes;
+        cfg.activeThemeName = defaults.activeThemeName;
+        cfg.branding = {
+          ...currentBranding,
+          primaryColor: defaults.branding.primaryColor,
+          secondaryColor: defaults.branding.secondaryColor,
+          accentColor: defaults.branding.accentColor,
+        };
+        cfg.markModified('themes');
+        cfg.markModified('activeThemeName');
+        cfg.markModified('branding');
+      } else {
+        cfg[section] = defaults[section];
+        cfg.markModified(section);
+      }
+    }
+
+    await cfg.save();
+
+    await createAuditLog({
+      req,
+      category: 'superadmin',
+      action: 'superadmin.config.reset',
+      description: section === 'all' ? 'Reset platform configuration to defaults' : `Reset ${section} configuration to defaults`,
+      actor: auth.currentUser,
+      metadata: { section },
+    });
+
+    return res.status(200).json(cfg);
+  } catch (err) {
+    console.error('Reset config error:', err);
+    return res.status(400).json({ message: err.message || 'Reset failed' });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/departments/add`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+    const { name } = req.body;
+    if (!name || !name.trim()) throw new Error('Department name required');
+    const cfg = await PlatformConfig.getSingleton();
+    if (!cfg.departments.includes(name)) cfg.departments.push(name);
+    await cfg.save();
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.department.add', description: `Added department ${name}`, actor: auth.currentUser, metadata: { name } });
+    return res.status(200).json(cfg.departments);
+  } catch (err) {
+    console.error('Add department error:', err);
+    return res.status(400).json({ message: err.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/departments/remove`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+    const { name } = req.body;
+    if (!name) throw new Error('Department name required');
+    const cfg = await PlatformConfig.getSingleton();
+    cfg.departments = cfg.departments.filter((d) => d !== name);
+    await cfg.save();
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.department.remove', description: `Removed department ${name}`, actor: auth.currentUser, metadata: { name } });
+    return res.status(200).json(cfg.departments);
+  } catch (err) {
+    console.error('Remove department error:', err);
+    return res.status(400).json({ message: err.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/stations/add`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+    const { name, lat = 0, lng = 0, radiusMeters, active = true } = req.body;
+    if (!name || !name.trim()) throw new Error('Station name required');
+    const cfg = await PlatformConfig.getSingleton();
+    const station = {
+      name: name.trim(),
+      lat: Number(lat || 0),
+      lng: Number(lng || 0),
+      radiusMeters: Number(radiusMeters || cfg.geofence?.radiusMeters || 100),
+      active: active !== false,
+    };
+    const existingIndex = cfg.stations.findIndex((s) => (typeof s === 'string' ? s : s.name) === station.name);
+    if (existingIndex >= 0) {
+      cfg.stations[existingIndex] = station;
+    } else {
+      cfg.stations.push(station);
+    }
+    await cfg.save();
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.station.add', description: `Saved station ${station.name}`, actor: auth.currentUser, metadata: station });
+    return res.status(200).json(cfg.stations);
+  } catch (err) {
+    console.error('Add station error:', err);
+    return res.status(400).json({ message: err.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/stations/remove`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+    const { name } = req.body;
+    if (!name) throw new Error('Station name required');
+    const cfg = await PlatformConfig.getSingleton();
+    cfg.stations = cfg.stations.filter((s) => (typeof s === 'string' ? s : s.name) !== name);
+    await cfg.save();
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.station.remove', description: `Removed station ${name}`, actor: auth.currentUser, metadata: { name } });
+    return res.status(200).json(cfg.stations);
+  } catch (err) {
+    console.error('Remove station error:', err);
+    return res.status(400).json({ message: err.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/dropdowns/update`, async (req, res) => {
+  try {
+    const auth = await ensureSuperadmin(req, res, true);
+    if (!auth || auth.allowed !== true) return;
+    const { key, values } = req.body;
+    if (!key) throw new Error('Dropdown key required');
+    if (!Array.isArray(values)) throw new Error('Values must be an array');
+    const cfg = await PlatformConfig.getSingleton();
+    cfg.dropdowns.set(key, values);
+    await cfg.save();
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.dropdown.update', description: `Updated dropdown ${key}`, actor: auth.currentUser, metadata: { key, values } });
+    return res.status(200).json({ key, values });
+  } catch (err) {
+    console.error('Update dropdown error:', err);
+    return res.status(400).json({ message: err.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/superadmin/create-superadmin`, async (req, res) => {
+  try {
+    const anySuperadmin = await User.findOne({ rank: 'superadmin' });
+    const { name, email, password, phone } = req.body;
+
+    if (!name || !email || !password) throw new Error('Missing required fields');
+
+    if (!validator.isEmail(email)) throw new Error('Invalid email');
+
+    if (anySuperadmin) {
+      const auth = await ensureSuperadmin(req, res, false);
+      if (!auth || auth.allowed !== true) return;
+    }
+
+    const existing = await User.findOne({ email });
+    if (existing) throw new Error('Email already registered');
+
+    const hashed = await bcrypt.hash(password, 10);
+    const created = await User.create({ name, email: email.toLowerCase(), password: hashed, phone: phone || '', rank: 'superadmin', role: 'employee' });
+
+    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.user.create', description: `Superadmin account created for ${created.email}`, actor: { name: created.name, email: created.email, rank: 'superadmin' }, target: created });
+
+    return res.status(200).json({ message: 'Superadmin created', user: sanitizeUserResponse(created) });
+  } catch (err) {
+    console.error('Create superadmin error:', err);
+    return res.status(400).json({ message: err.message });
   }
 });

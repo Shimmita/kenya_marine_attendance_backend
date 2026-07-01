@@ -27,6 +27,7 @@ const auditLogSchema = new Schema(
         "device",
         "password_reset",
         "admin_action",
+        "superadmin",
       ],
       required: true,
     },
