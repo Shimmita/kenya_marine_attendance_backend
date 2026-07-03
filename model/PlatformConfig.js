@@ -33,18 +33,18 @@ const defaultDepartments = [
 ];
 
 const defaultStations = [
-    { name: 'MOMBASA CENTRE', lat: -4.0546356, lng: 39.6826, radiusMeters: 100, active: true },
-    { name: 'SHIMONI CENTRE', lat: -4.0546356, lng: 39.6826, radiusMeters: 100, active: true },
-    { name: 'KISUMU CENTRE', lat: -0.059149, lng: 34.8066, radiusMeters: 100, active: true },
-    { name: 'KEGATI STATION', lat: -0.644496, lng: 34.7481, radiusMeters: 100, active: true },
-    { name: 'TURKANA STATION', lat: 3.08222, lng: 36.0749, radiusMeters: 100, active: true },
-    { name: 'NAIROBI STATION', lat: -1.24936, lng: 36.7968, radiusMeters: 100, active: true },
-    { name: 'NAIVASHA STATION', lat: -0.664008, lng: 36.4651, radiusMeters: 100, active: true },
-    { name: 'BARINGO STATION', lat: 0.604245, lng: 35.9773, radiusMeters: 100, active: true },
-    { name: 'SANGORO STATION', lat: -0.394861, lng: 34.7374, radiusMeters: 100, active: true },
-    { name: 'SAGANA CENTRE', lat: -0.669415, lng: 37.2061, radiusMeters: 100, active: true },
-    { name: 'GAZI STATION', lat: -4.0546356, lng: 39.6826, radiusMeters: 100, active: true },
-    { name: 'MUTONGA CENTER', lat: -4.0546356, lng: 39.6826, radiusMeters: 100, active: true },
+    { name: 'MOMBASA CENTRE', lat: -4.0546356, lng: 39.6826, radiusMeters: 500, active: true },
+    { name: 'SHIMONI CENTRE', lat: -4.0546356, lng: 39.6826, radiusMeters: 500, active: true },
+    { name: 'KISUMU CENTRE', lat: -0.059149, lng: 34.8066, radiusMeters: 500, active: true },
+    { name: 'KEGATI STATION', lat: -0.644496, lng: 34.7481, radiusMeters: 500, active: true },
+    { name: 'TURKANA STATION', lat: 3.08222, lng: 36.0749, radiusMeters: 500, active: true },
+    { name: 'NAIROBI STATION', lat: -1.24936, lng: 36.7968, radiusMeters: 500, active: true },
+    { name: 'NAIVASHA STATION', lat: -0.664008, lng: 36.4651, radiusMeters: 500, active: true },
+    { name: 'BARINGO STATION', lat: 0.604245, lng: 35.9773, radiusMeters: 500, active: true },
+    { name: 'SANGORO STATION', lat: -0.394861, lng: 34.7374, radiusMeters: 500, active: true },
+    { name: 'SAGANA CENTRE', lat: -0.669415, lng: 37.2061, radiusMeters: 500, active: true },
+    { name: 'GAZI STATION', lat: -4.0546356, lng: 39.6826, radiusMeters: 500, active: true },
+    { name: 'MUTONGA CENTER', lat: -4.0546356, lng: 39.6826, radiusMeters: 500, active: true },
 ];
 
 const defaultDropdowns = {
@@ -67,7 +67,7 @@ const defaultBranding = {
 
 const defaultThemes = [
     {
-        name: 'Midnight Current',
+        name: 'KMFRI Ocean',
         primaryColor: '#031B2E',
         secondaryColor: '#0A3D62',
         accentColor: '#368DC5',
@@ -75,7 +75,7 @@ const defaultThemes = [
         textColor: '#0F172A',
     },
     {
-        name: 'KMFRI Ocean',
+        name: 'Midnight Current',
         primaryColor: '#0A3D62',
         secondaryColor: '#005B96',
         accentColor: '#48C9B0',
@@ -203,13 +203,13 @@ const defaultThemes = [
 const defaultNotificationReminders = {
     clockInReminderMinutes: 15,
     clockOutReminderMinutes: 15,
-    clockInMessage: 'Reminder: please clock in for your scheduled KMFRI workday.',
-    clockOutMessage: 'Reminder: please clock out before leaving your duty station.',
+    clockInMessage: 'Dear {firstName}, please clock in for your scheduled KMFRI workday.',
+    clockOutMessage: 'Dear {firstName}, please clock out before leaving your duty station.',
     channels: ['in_app'],
 };
 
 const defaultGeofence = {
-    radiusMeters: 100,
+    radiusMeters: 500,
     enabled: false,
 };
 
@@ -232,7 +232,7 @@ const stationSchema = new mongoose.Schema({
     name: { type: String, required: true, trim: true },
     lat: { type: Number, default: 0 },
     lng: { type: Number, default: 0 },
-    radiusMeters: { type: Number, default: 100 },
+    radiusMeters: { type: Number, default: 500 },
     active: { type: Boolean, default: true },
 }, { _id: false });
 
@@ -293,13 +293,13 @@ const platformConfigSchema = new mongoose.Schema({
 
 const normalizeStation = (station) => {
     if (typeof station === 'string') {
-        return { name: station, lat: 0, lng: 0, radiusMeters: 100, active: true };
+        return { name: station, lat: 0, lng: 0, radiusMeters: 500, active: true };
     }
     return {
         name: station?.name || '',
         lat: Number(station?.lat ?? 0),
         lng: Number(station?.lng ?? 0),
-        radiusMeters: Number(station?.radiusMeters ?? 100),
+        radiusMeters: Number(station?.radiusMeters ?? 500),
         active: station?.active !== false,
     };
 };

@@ -13,6 +13,7 @@ import express from "express";
 import session from "express-session";
 import ldapjs from "ldapjs";
 import mongoose from "mongoose";
+import os from "os";
 import sharp from "sharp";
 import validator from "validator";
 import uploadAvatar from "./middleware/UploadFile.js";
@@ -25,9 +26,9 @@ import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
 import MessageUser from "./model/MessageUser.js";
 import PasswordReset from "./model/PasswordReset.js";
+import PlatformConfig, { getDefaultPlatformConfig } from "./model/PlatformConfig.js";
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
-import PlatformConfig, { getDefaultPlatformConfig } from "./model/PlatformConfig.js";
 import Verification from "./model/VerifyReport.js";
 import {
   formatDateKey,
@@ -220,6 +221,7 @@ app.use(
   session({
     secret: process.env.SESSION_SECRET,
     resave: false,
+    rolling: true,
     saveUninitialized: false,
     name: process.env.SESSION_NAME,
     store,
@@ -233,14 +235,14 @@ app.use(
 
 // ─── Auth check ───────────────────────────────────────────────────────────────
 
+app.use(BASE_ROUTE, clearExpiredTemporaryAccountForSession);
+
 app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
   if (req.session?.isOnline) {
-
     res.status(200).json({ valid: true });
   } else {
     res.status(200).json({ valid: false });
   }
-
 });
 
 // ─── Sign Up ──────────────────────────────────────────────────────────────────
@@ -251,15 +253,39 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
     const currentUser = await User.findById(req.session.userID);
-    if (!["hr","superadmin"].includes(currentUser.rank)) {
+    if (!["hr", "superadmin"].includes(currentUser.rank)) {
       return res.status(403).json({ message: "Access denied, only HR or Superadmin personnel can create accounts." });
     }
 
-    const data = req.body.formData
-    const { email, password } = data
+    const data = req.body.formData;
+    const { email, password, role } = data;
 
     if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
     if (!password || password.length < 4) throw new Error("Password must be at least 4 characters!");
+    if (!data.phone?.trim()) throw new Error("Phone number is required.");
+
+    if (['intern', 'attachee'].includes(role)) {
+      const normalizedPhone = normalizeKenyaPhone(data.phone, true);
+      if (!normalizedPhone) {
+        throw new Error("Intern/Attaché phone must be in Kenyan mobile format with 254 followed by 9 digits.");
+      }
+      data.phone = normalizedPhone;
+    } else {
+      data.phone = data.phone.trim();
+    }
+
+    if (['intern', 'attachee'].includes(role)) {
+      if (!data.startDate) throw new Error("Start date is required for interns and attaches.");
+      if (!data.endDate) throw new Error("End date is required for interns and attaches.");
+      const startDate = new Date(data.startDate);
+      const endDate = new Date(data.endDate);
+      if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+        throw new Error("Start date and end date must be valid dates.");
+      }
+      if (startDate > endDate) {
+        throw new Error("End date cannot be before start date.");
+      }
+    }
 
     const existingUser = await User.findOne({ email });
     if (existingUser) throw new Error("User already registered!");
@@ -305,7 +331,7 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
 
     //  2. Verify user has HR rank
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || !["hr","superadmin"].includes(currentUser.rank)) {
+    if (!currentUser || !["hr", "superadmin"].includes(currentUser.rank)) {
       return res.status(403).json({ message: "Only HR or Superadmin personnel can perform this operation." });
     }
 
@@ -335,9 +361,44 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           continue;
         }
 
+        if (!user.phone || user.phone.trim().length === 0) {
+          errors.push(`Row ${i + 1}: Phone number is required.`);
+          continue;
+        }
+
+        if (['intern', 'attachee'].includes((user.role || '').toLowerCase())) {
+          const normalizedPhone = normalizeKenyaPhone(user.phone, true);
+          if (!normalizedPhone) {
+            errors.push(`Row ${i + 1}: Intern/Attaché phone must be in Kenyan mobile format with 254 followed by 9 digits.`);
+            continue;
+          }
+          user.phone = normalizedPhone;
+        }
+
         if (!user.employeeId || user.employeeId.toString().trim().length === 0) {
           errors.push(`Row ${i + 1}: Employee ID is required.`);
           continue;
+        }
+
+        if (['intern', 'attachee'].includes((user.role || '').toLowerCase())) {
+          if (!user.startDate) {
+            errors.push(`Row ${i + 1}: Start date is required for interns and attaches.`);
+            continue;
+          }
+          if (!user.endDate) {
+            errors.push(`Row ${i + 1}: End date is required for interns and attaches.`);
+            continue;
+          }
+          const startDate = new Date(user.startDate);
+          const endDate = new Date(user.endDate);
+          if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+            errors.push(`Row ${i + 1}: Start date and end date must be valid dates.`);
+            continue;
+          }
+          if (startDate > endDate) {
+            errors.push(`Row ${i + 1}: End date cannot be before start date.`);
+            continue;
+          }
         }
 
         // Check for duplicate email in batch
@@ -1367,6 +1428,26 @@ const isOutsideClockingAuthorizedNow = (user, now = new Date()) => {
   }
 };
 
+const parseAttendanceTime = (timeString, referenceDate = new Date()) => {
+  if (!timeString || typeof timeString !== 'string') return null;
+  const [hours, minutes] = timeString.split(':').map((value) => Number(value));
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+  return new Date(referenceDate.getFullYear(), referenceDate.getMonth(), referenceDate.getDate(), hours, minutes, 0, 0);
+};
+
+const getAttendancePolicy = async () => {
+  const cfg = await PlatformConfig.getSingleton();
+  return cfg.attendancePolicy || {};
+};
+
+const normalizeKenyaPhone = (phone, allowLocal = false) => {
+  if (!phone) return null;
+  const digits = `${phone}`.replace(/\D/g, '');
+  if (digits.startsWith('254') && digits.length === 12) return digits;
+  if (allowLocal && digits.length === 9) return `254${digits}`;
+  return null;
+};
+
 const clearExpiredOutsideClocking = async (user, now = new Date()) => {
   if (!user?.canClockOutside || !user?.outsideClockingDetails?.endDate) return user;
 
@@ -1384,6 +1465,34 @@ const clearExpiredOutsideClocking = async (user, now = new Date()) => {
 
   await user.save();
   return user;
+};
+
+const clearExpiredTemporaryAccount = async (user, now = new Date()) => {
+  if (!user) return user;
+  if (!['intern', 'attachee'].includes(user.role)) return user;
+  if (!user.endDate) return user;
+
+  const expiry = new Date(user.endDate);
+  expiry.setHours(23, 59, 59, 999);
+  if (now <= expiry) return user;
+
+  user.isAccountActive = false;
+  user.doneBiometric = false;
+  user.authenticator = null;
+  user.authenticators = [];
+
+  await user.save();
+  return user;
+};
+
+async function clearExpiredTemporaryAccountForSession(req, res, next) {
+  if (req.session?.userID) {
+    const user = await User.findById(req.session.userID);
+    if (user) {
+      await clearExpiredTemporaryAccount(user);
+    }
+  }
+  return next();
 };
 
 const getNairobiLocalDate = (date = new Date()) => {
@@ -1535,11 +1644,12 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
         now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
       );
 
-      const hours = eatTime.getHours();
-
-      // Late if after 9:00 AM
-      const isLate = hours > 9 || (hours === 9 && eatTime.getMinutes() > 0);
-      const isEmployee = user.role === "employee"
+      const attendancePolicy = await getAttendancePolicy();
+      const targetClockIn = parseAttendanceTime(attendancePolicy.standardClockIn || '08:00', eatTime) || eatTime;
+      const graceMinutes = Number(attendancePolicy.gracePeriodMinutes ?? 15);
+      const graceDeadline = new Date(targetClockIn.getTime() + graceMinutes * 60 * 1000);
+      const isLate = eatTime > graceDeadline;
+      const isEmployee = user.role === "employee";
 
       const clockingData = {
         name: user.name,
@@ -2482,7 +2592,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     if (!currentSupervisor)
       return res.status(404).json({ message: "User not found" });
 
-    if (!["supervisor","superadmin"].includes(currentSupervisor.rank))
+    if (!["supervisor", "superadmin"].includes(currentSupervisor.rank))
       return res.status(403).json({
         message: "Unauthorized Access",
       });
@@ -3349,8 +3459,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/toggle-active`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    // Only HR can manage users
-    if (currentUser.rank !== "hr")
+    // Only HR can manage users or superadmin
+    if (!["hr", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -4061,7 +4171,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
   }
 });
 
-// ─── Delete User (HR Only) ──────────────────────────────────────────────────
+// ─── Delete User (HR/SUPERADMIN Only) ──────────────────────────────────────────────────
 
 app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
   try {
@@ -4069,8 +4179,8 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
       return res.status(401).json({ message: "Unauthorized" });
 
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || currentUser.rank !== "hr")
-      return res.status(403).json({ message: "Only HR can delete users" });
+    if (!currentUser || !["hr", "superadmin"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Unauthorised Operation" });
 
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
@@ -4078,7 +4188,7 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
 
     // Prevent HR from deleting themselves
     if (targetUser._id.toString() === currentUser._id.toString())
-      return res.status(400).json({ message: "You cannot delete your own account" });
+      return res.status(400).json({ message: "You cannot delete your account" });
 
     // Capture user details for audit log before deletion
     const deletedUserSnapshot = snapshotUser(targetUser);
@@ -4369,6 +4479,7 @@ app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
 // Superadmin endpoints (endpoints protected to superadmin)
 // -----------------------------
 
+
 const ensureSuperadmin = async (req, res, allowBootstrap = false) => {
   if (!req.session?.isOnline || !req.session?.userID) {
     return res.status(401).json({ message: 'Unauthorized' });
@@ -4605,3 +4716,243 @@ app.post(`${BASE_ROUTE}/superadmin/create-superadmin`, async (req, res) => {
     return res.status(400).json({ message: err.message });
   }
 });
+
+
+
+
+// =====================================================
+// SUPERADMIN DASHBOARD (FULL)
+// =====================================================
+
+
+app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
+
+  try {
+
+    const auth = await ensureSuperadmin(req, res, true);
+
+    if (!auth || auth.allowed !== true) return;
+
+    const cfg = await PlatformConfig.getSingleton();
+
+    /* =====================================================
+       USER COUNTS
+    ===================================================== */
+
+    const [
+      totalUsers,
+      totalEmployees,
+      totalSupervisors,
+      totalHR,
+      totalAdmins,
+      totalSuperadmins
+    ] = await Promise.all([
+
+      User.countDocuments(),
+
+      User.countDocuments({
+        role: "employee"
+      }),
+
+      User.countDocuments({
+        rank: "supervisor"
+      }),
+
+      User.countDocuments({
+        rank: "hr"
+      }),
+
+      User.countDocuments({
+        rank: "admin"
+      }),
+
+      User.countDocuments({
+        rank: "superadmin"
+      })
+
+    ]);
+
+    /* =====================================================
+       SYSTEM HEALTH
+    ===================================================== */
+
+    const memory = process.memoryUsage();
+
+    const health = {
+
+      database:
+        mongoose.connection.readyState === 1
+          ? "Healthy"
+          : "Disconnected",
+
+      nodeVersion:
+        process.version,
+
+      environment:
+        process.env.NODE_ENV || "development",
+
+      uptime:
+        Math.floor(process.uptime()),
+
+      hostname:
+        os.hostname(),
+
+      platform:
+        os.platform(),
+
+      architecture:
+        os.arch(),
+
+      cpuCount:
+        os.cpus().length,
+
+      memory: {
+
+        rss:
+          memory.rss,
+
+        heapUsed:
+          memory.heapUsed,
+
+        heapTotal:
+          memory.heapTotal,
+
+        freeMemory:
+          os.freemem(),
+
+        totalMemory:
+          os.totalmem()
+
+      }
+
+    };
+
+    /* =====================================================
+       RESPONSE
+    ===================================================== */
+
+    return res.status(200).json({
+
+      message: "Dashboard loaded successfully.",
+
+      dashboard: {
+
+        organization: {
+
+          organizationName:
+            cfg.branding.organizationName,
+
+          shortName:
+            cfg.branding.shortName,
+
+          activeTheme:
+            cfg.activeThemeName,
+
+          departments:
+            cfg.departments.length,
+
+          stations:
+            cfg.stations.length
+
+        },
+
+        users: {
+
+          total:
+            totalUsers,
+
+          employees:
+            totalEmployees,
+
+          supervisors:
+            totalSupervisors,
+
+          hr:
+            totalHR,
+
+          admins:
+            totalAdmins,
+
+          superadmins:
+            totalSuperadmins
+
+        },
+
+        configuration: {
+
+          themes:
+            cfg.themes.length,
+
+          dropdowns:
+            cfg.dropdowns.size,
+
+          geofenceEnabled:
+            cfg.geofence.enabled,
+
+          geofenceRadius:
+            cfg.geofence.radiusMeters,
+
+          maintenanceMode:
+            cfg.masterSettings.maintenanceMode,
+
+          selfRegistration:
+            cfg.masterSettings.allowEmployeeSelfRegistration
+
+        },
+
+        attendance: {
+
+          standardClockIn:
+            cfg.attendancePolicy.standardClockIn,
+
+          standardClockOut:
+            cfg.attendancePolicy.standardClockOut,
+
+          gracePeriod:
+            cfg.attendancePolicy.gracePeriodMinutes,
+
+          biometric:
+            cfg.attendancePolicy.requireBiometricVerification,
+
+          allowClockOutside:
+            cfg.attendancePolicy.allowClockOutsideStation
+
+        },
+
+        notifications: {
+
+          channels:
+            cfg.notificationReminders.channels,
+
+          clockInReminder:
+            cfg.notificationReminders.clockInReminderMinutes,
+
+          clockOutReminder:
+            cfg.notificationReminders.clockOutReminderMinutes
+
+        },
+
+        health
+
+      }
+
+    });
+
+  }
+
+  catch (err) {
+
+    console.error("Dashboard Full Error:", err);
+
+    return res.status(500).json({
+
+      message:
+        err.message || "Failed to load dashboard."
+
+    });
+
+  }
+
+});
+
+
