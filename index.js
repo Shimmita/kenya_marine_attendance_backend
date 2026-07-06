@@ -4510,31 +4510,228 @@ app.get(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
   }
 });
 
+
 app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
+
   try {
+
     const auth = await ensureSuperadmin(req, res, true);
+
     if (!auth || auth.allowed !== true) return;
 
     const updates = req.body || {};
+
     const cfg = await PlatformConfig.getSingleton();
-    const allowedKeys = ['logoUrl', 'branding', 'activeThemeName', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations'];
-    allowedKeys.forEach((k) => {
-      if (typeof updates[k] !== 'undefined') {
-        cfg[k] = updates[k];
-        cfg.markModified(k);
-      }
-    });
+
+    // =====================================================
+    // LOGO
+    // =====================================================
+
+    if (typeof updates.logoUrl !== "undefined") {
+
+      cfg.logoUrl = updates.logoUrl;
+
+      cfg.markModified("logoUrl");
+
+    }
+
+    // =====================================================
+    // BRANDING
+    // =====================================================
+
+    if (updates.branding) {
+
+      cfg.branding = {
+
+        ...(cfg.branding?.toObject?.() || cfg.branding),
+
+        ...updates.branding,
+
+      };
+
+      cfg.markModified("branding");
+
+    }
+
+    // =====================================================
+    // ACTIVE THEME
+    // =====================================================
+
+    if (typeof updates.activeThemeName !== "undefined") {
+
+      cfg.activeThemeName = updates.activeThemeName;
+
+      cfg.markModified("activeThemeName");
+
+    }
+
+    // =====================================================
+    // THEMES
+    // =====================================================
+
+    if (updates.themes) {
+
+      cfg.themes = updates.themes;
+
+      cfg.markModified("themes");
+
+    }
+
+    // =====================================================
+    // GEOFENCE
+    // =====================================================
+
+    if (updates.geofence) {
+
+      cfg.geofence = {
+
+        ...(cfg.geofence?.toObject?.() || cfg.geofence),
+
+        ...updates.geofence,
+
+      };
+
+      cfg.markModified("geofence");
+
+    }
+
+    // =====================================================
+    // ATTENDANCE POLICY
+    // =====================================================
+
+    if (updates.attendancePolicy) {
+
+      cfg.attendancePolicy = {
+
+        ...(cfg.attendancePolicy?.toObject?.() || cfg.attendancePolicy),
+
+        ...updates.attendancePolicy,
+
+      };
+
+      cfg.markModified("attendancePolicy");
+
+    }
+
+    // =====================================================
+    // MASTER SETTINGS
+    // =====================================================
+
+    if (updates.masterSettings) {
+
+      cfg.masterSettings = {
+
+        ...(cfg.masterSettings?.toObject?.() || cfg.masterSettings),
+
+        ...updates.masterSettings,
+
+      };
+
+      cfg.markModified("masterSettings");
+
+    }
+
+    // =====================================================
+    // NOTIFICATION SETTINGS
+    // =====================================================
+
+    if (updates.notificationReminders) {
+
+      cfg.notificationReminders = {
+
+        ...(cfg.notificationReminders?.toObject?.() || cfg.notificationReminders),
+
+        ...updates.notificationReminders,
+
+      };
+
+      cfg.markModified("notificationReminders");
+
+    }
+
+    // =====================================================
+    // DROPDOWNS
+    // =====================================================
+
+    if (updates.dropdowns) {
+
+      cfg.dropdowns = updates.dropdowns;
+
+      cfg.markModified("dropdowns");
+
+    }
+
+    // =====================================================
+    // DEPARTMENTS
+    // =====================================================
+
+    if (updates.departments) {
+
+      cfg.departments = updates.departments;
+
+      cfg.markModified("departments");
+
+    }
+
+    // =====================================================
+    // STATIONS
+    // =====================================================
+
+    if (updates.stations) {
+
+      cfg.stations = updates.stations;
+
+      cfg.markModified("stations");
+
+    }
 
     await cfg.save();
 
-    await createAuditLog({ req, category: 'superadmin', action: 'superadmin.config.update', description: 'Platform configuration updated', actor: auth.currentUser, metadata: { updates } });
+    await createAuditLog({
 
-    return res.status(200).json(cfg);
-  } catch (err) {
-    console.error('Update config error:', err);
-    return res.status(400).json({ message: err.message || 'Update failed' });
+      req,
+
+      category: "superadmin",
+
+      action: "superadmin.config.update",
+
+      description: "Platform configuration updated",
+
+      actor: auth.currentUser,
+
+      metadata: {
+
+        updatedSections: Object.keys(updates),
+
+      },
+
+    });
+
+    return res.status(200).json({
+
+      message: "Platform configuration updated successfully.",
+
+      config: cfg,
+
+    });
+
   }
+
+  catch (err) {
+
+    console.error("Update config error:", err);
+
+    return res.status(400).json({
+
+      message: err.message || "Configuration update failed."
+
+    });
+
+  }
+
 });
+
+
 
 app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
   try {

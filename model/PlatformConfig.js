@@ -222,10 +222,8 @@ const defaultAttendancePolicy = {
 };
 
 const defaultMasterSettings = {
-    allowEmployeeSelfRegistration: false,
     maintenanceMode: false,
     requirePasswordResetOnFirstLogin: false,
-    maxDevicesPerUser: 2,
 };
 
 const stationSchema = new mongoose.Schema({
