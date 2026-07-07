@@ -34,7 +34,7 @@ const defaultDepartments = [
 
 const defaultStations = [
     { name: 'MOMBASA CENTRE', lat: -4.0546356, lng: 39.6826, radiusMeters: 500, active: true },
-    { name: 'SHIMONI CENTRE', lat: -4.0546356, lng: 39.6826, radiusMeters: 500, active: true },
+    { name: 'SHIMONI CENTRE', lat: -4.644, lng: 39.375, radiusMeters: 500, active: true },
     { name: 'KISUMU CENTRE', lat: -0.059149, lng: 34.8066, radiusMeters: 500, active: true },
     { name: 'KEGATI STATION', lat: -0.644496, lng: 34.7481, radiusMeters: 500, active: true },
     { name: 'TURKANA STATION', lat: 3.08222, lng: 36.0749, radiusMeters: 500, active: true },
@@ -48,7 +48,6 @@ const defaultStations = [
 ];
 
 const defaultDropdowns = {
-    genders: ['Male', 'Female'],
     leaveTypes: ['Adoption Leave', 'Annual Leave', 'Compassionate Leave', 'Paternity Leave', 'Sick Leave', 'Study Leave', 'Terminal Leave'],
     absenceReasons: ['Sickness', 'Fieldwork', 'Workshop', 'Official Assignment', 'Emergency', 'Other'],
     roles: ['employee', 'intern', 'attachee'],

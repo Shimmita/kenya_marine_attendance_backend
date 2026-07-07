@@ -37,12 +37,7 @@ const userSchema = new mongoose.Schema(
     startDate: { type: String, required: false, default: null },
     endDate: { type: String, required: false, default: null },
 
-    gender: {
-      type: String,
-      enum: ["Male", "Female", "Other"],
-      default: "Other",
-      required: true
-    },
+
     employeeId: {
       type: String, default: ""
     },

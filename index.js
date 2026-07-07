@@ -306,7 +306,6 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
           name: createdUser.name,
           department: createdUser.department || "",
           station: createdUser.station || "",
-          gender: createdUser.gender || "",
           email: createdUser.email || "",
           employeeId: createdUser.employeeId || "",
         },
@@ -366,39 +365,15 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           continue;
         }
 
-        if (['intern', 'attachee'].includes((user.role || '').toLowerCase())) {
-          const normalizedPhone = normalizeKenyaPhone(user.phone, true);
-          if (!normalizedPhone) {
-            errors.push(`Row ${i + 1}: Intern/Attaché phone must be in Kenyan mobile format with 254 followed by 9 digits.`);
-            continue;
-          }
-          user.phone = normalizedPhone;
+        const normalizedRole = (user.role || 'employee').toString().trim().toLowerCase();
+        if (!['employee', 'staff'].includes(normalizedRole)) {
+          errors.push(`Row ${i + 1}: Only employee or staff roles are allowed in batch registration.`);
+          continue;
         }
 
         if (!user.employeeId || user.employeeId.toString().trim().length === 0) {
           errors.push(`Row ${i + 1}: Employee ID is required.`);
           continue;
-        }
-
-        if (['intern', 'attachee'].includes((user.role || '').toLowerCase())) {
-          if (!user.startDate) {
-            errors.push(`Row ${i + 1}: Start date is required for interns and attaches.`);
-            continue;
-          }
-          if (!user.endDate) {
-            errors.push(`Row ${i + 1}: End date is required for interns and attaches.`);
-            continue;
-          }
-          const startDate = new Date(user.startDate);
-          const endDate = new Date(user.endDate);
-          if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
-            errors.push(`Row ${i + 1}: Start date and end date must be valid dates.`);
-            continue;
-          }
-          if (startDate > endDate) {
-            errors.push(`Row ${i + 1}: End date cannot be before start date.`);
-            continue;
-          }
         }
 
         // Check for duplicate email in batch
@@ -421,8 +396,7 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           continue;
         }
 
-        // Generate default password, interns and attachee default password
-        const defaultPassword = process.env.DEFAULT_PASSWORD_SUFFIX || existingEmployee.employeeId;
+        const defaultPassword = process.env.DEFAULT_PASSWORD_SUFFIX || user.employeeId?.toString().trim() || '123456';
         const hashedPassword = await bcrypt.hash(defaultPassword, 10);
 
         // Prepare user object
@@ -432,10 +406,9 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           name: user.name.trim(),
           email: user.email.toLowerCase().trim(),
           phone: user.phone || '',
-          role: user.role || 'employee', // employee, attachee, etc.
+          role: 'employee',
           station: user.station || '',
           department: user.department || '',
-          gender: user.gender || '',
           password: hashedPassword,
           isPasswordReset: false,
         });
@@ -464,7 +437,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
       employeeId: u.employeeId || "",
       department: u.department || "",
       station: u.station || "",
-      gender: u.gender || "",
     }));
 
     // Create audit log for batch registration
@@ -1836,7 +1808,7 @@ app.post(`${BASE_ROUTE}/user/profile`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
-    const { name, department, supervisor, phone, startDate, endDate, gender } = req.body;
+    const { name, department, supervisor, phone, startDate, endDate } = req.body;
 
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
@@ -1847,7 +1819,6 @@ app.post(`${BASE_ROUTE}/user/profile`, async (req, res) => {
     user.phone = phone || user.phone;
     user.startDate = startDate || user.startDate;
     user.endDate = endDate || user.endDate;
-    user.gender = gender || user.gender;
 
     await user.save();
     res.json({ message: "Profile updated successfully" });
@@ -4202,7 +4173,6 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
       station: targetUser.station || "",
       employeeId: targetUser.employeeId || "",
       phone: targetUser.phone || "",
-      gender: targetUser.gender || "",
       dateCreated: targetUser.createdAt || null,
     };
 
