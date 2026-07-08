@@ -245,6 +245,8 @@ app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
   }
 });
 
+
+
 // ─── Sign Up ──────────────────────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
@@ -318,6 +320,135 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
     return res.status(400).json({ message: error.message });
   }
 });
+
+
+// single staff registration
+app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const currentUser = await User.findById(req.session.userID);
+
+    if (!currentUser) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    if (!["hr", "superadmin"].includes(currentUser.rank)) {
+      return res.status(403).json({
+        message: "Only HR or Superadmin can register staff."
+      });
+    }
+
+    const {
+      name,
+      email,
+      phone,
+      role,
+      department,
+      station,
+      employeeId,
+      staffNo
+    } = req.body.formData;
+
+    if (!name?.trim())
+      throw new Error("Full name is required.");
+
+    if (!employeeId?.trim())
+      throw new Error("Employee ID is required.");
+
+    if (!staffNo?.trim())
+      throw new Error("Staff number is required.");
+
+    if (!department?.trim())
+      throw new Error("Department is required.");
+
+    if (!station?.trim())
+      throw new Error("Station is required.");
+
+    if (!validator.isEmail(email))
+      throw new Error("Invalid email address.");
+
+    const normalizedPhone = normalizeKenyaPhone(phone, true);
+
+    if (!normalizedPhone) {
+      throw new Error(
+        "Phone number must begin with 254 followed by 9 digits."
+      );
+    }
+
+    const duplicate = await User.findOne({
+      $or: [
+        { email },
+        { phone: normalizedPhone },
+        { employeeId },
+        { staffNo }
+      ]
+    });
+
+    if (duplicate) {
+      if (duplicate.email === email)
+        throw new Error("Email already exists.");
+
+      if (duplicate.phone === normalizedPhone)
+        throw new Error("Phone number already exists.");
+
+      if (duplicate.employeeId === employeeId)
+        throw new Error("Employee ID already exists.");
+
+      if (duplicate.staffNo === staffNo)
+        throw new Error("Staff Number already exists.");
+    }
+
+    const password = await bcrypt.hash(employeeId, 10);
+
+    const createdUser = await User.create({
+      name,
+      email,
+      phone: normalizedPhone,
+      role: role || "employee",
+      department,
+      station,
+      employeeId,
+      staffNo,
+      password
+    });
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user.create",
+      description: `Registered ${createdUser.name}`,
+      actor: currentUser,
+      target: createdUser,
+      metadata: {
+        registeredUser: {
+          name: createdUser.name,
+          department: createdUser.department,
+          station: createdUser.station,
+          email: createdUser.email,
+          employeeId: createdUser.employeeId,
+          staffNo: createdUser.staffNo
+        }
+      }
+    });
+
+    return res.status(201).json({
+      message: "Staff registered successfully.",
+      user: createdUser
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    return res.status(400).json({
+      message: error.message
+    });
+  }
+});
+
+
 
 // ─── Batch User Registration (HR Only) ────────────────────────────────────────
 
@@ -3538,7 +3669,6 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-role`, async (req, res) => {
       "employee",
       "intern",
       "attachee",
-      "employee-contract",
     ];
 
     if (!allowedRoles.includes(role))
