@@ -2640,10 +2640,15 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
 
     const summary = users.map(user => {
 
+      // attendance rate
       const presentDays =
         attendanceMap[user.email]
           ? attendanceMap[user.email].size
           : 0;
+
+
+      
+
 
       return {
 
@@ -2662,8 +2667,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
         daysAbsent: Math.max(
           totalWorkingDays - presentDays,
           0
-        )
-
+        ),
       };
 
     });
