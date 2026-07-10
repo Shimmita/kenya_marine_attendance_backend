@@ -1056,8 +1056,11 @@ app.get(`${BASE_ROUTE}/admin/password-reset/requests`, async (req, res) => {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || currentUser.rank !== "admin")
-      return res.status(403).json({ message: "Only admin can view password reset requests" });
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+    // only admin or superadmin can view
+    if (!["admin", "superadmin"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Access denied, only admin or superadmin can view password reset requests." });
+    }
 
     const requests = await PasswordReset.find().sort({ createdAt: -1 }).lean();
     const enriched = await Promise.all(requests.map(async (request) => {
@@ -1084,7 +1087,8 @@ app.put(`${BASE_ROUTE}/admin/password-reset/approve`, async (req, res) => {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || currentUser.rank !== "admin")
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+    if (!["admin", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Only admin can approve password reset requests" });
 
     const email = String(req.body?.email || "").trim().toLowerCase();
@@ -2384,6 +2388,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       station,
       department,
       role,
+      rank,
       startDate,
       endDate,
     } = req.query;
@@ -2393,14 +2398,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
     //----------------------------------------------------
 
     const attendanceQuery = {};
-
-    if (station && station !== "all") {
-      attendanceQuery.station = station;
-    }
-
-    if (department && department !== "all") {
-      attendanceQuery.department = department;
-    }
 
     const start = startDate
       ? new Date(startDate)
@@ -2431,12 +2428,25 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       userQuery.role = role;
     }
 
+    if (rank && rank !== "all") {
+      userQuery.rank = rank;
+    }
+
+    if (station && station !== "all") {
+      userQuery.station = station;
+    }
+
+    if (department && department !== "all") {
+      userQuery.department = department;
+    }
+
     const users = await User.find(
       userQuery,
       `
       email
       employeeId
       role
+      rank
       name
       department
       station
@@ -2476,6 +2486,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
         employeeId: user.employeeId || "",
 
         role: user.role || "",
+        rank: user.rank || "",
 
         name: user.name || record.name,
 
@@ -2521,6 +2532,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       station,
       department,
       role,
+      rank,
     } = req.query;
 
     //---------------------------------------------------------
@@ -2580,6 +2592,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     if (role && role !== "all")
       userQuery.role = role;
 
+    if (rank && rank !== "all")
+      userQuery.rank = rank;
+
     //---------------------------------------------------------
     // Users
     //---------------------------------------------------------
@@ -2591,6 +2606,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       email
       employeeId
       role
+      rank
       station
       department
       `
@@ -2647,7 +2663,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
           : 0;
 
 
-      
+
 
 
       return {
@@ -2657,6 +2673,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
         name: user.name || "",
 
         role: user.role || "",
+        rank: user.rank || "",
 
         station: user.station || "",
 
@@ -3122,7 +3139,7 @@ app.get(`${BASE_ROUTE}/device/lost/all`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    if (!["admin", "hr", "supervisor", "ceo", "auditor"].includes(user.rank))
+    if (!["admin", "hr", "superadmin"].includes(user.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const requests = await DeviceLost.find()
@@ -3148,7 +3165,7 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     const responder = await User.findById(req.session.userID);
     if (!responder) throw new Error("User not found");
 
-    if (!["admin", "hr", "supervisor"].includes(responder.rank))
+    if (!["admin", "hr", "superadmin"].includes(responder.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const { requestId, action } = req.body;
@@ -3263,7 +3280,6 @@ app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
     const existingDevice = await Devices.findOne({
       device_fingerprint
     });
-
 
 
     if (existingDevice)
@@ -3423,7 +3439,7 @@ app.get(`${BASE_ROUTE}/admin/notification`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    const acceptableRanks = ['admin', 'hr', 'supervisor']
+    const acceptableRanks = ['admin', 'hr', 'supervisor', "superadmin"]
 
     if (!acceptableRanks.includes(user.rank)) {
       throw new Error("unauthorized")
@@ -4238,7 +4254,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
       return res.status(401).json({ message: "Unauthorized" });
 
     const currentUser = await User.findById(req.session.userID);
-    if (!["admin", "hr", "supervisor", "user"].includes(currentUser?.rank))
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser?.rank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -4284,7 +4300,7 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
       return res.status(401).json({ message: "Unauthorized" });
 
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || !["hr", "superadmin"].includes(currentUser.rank))
+    if (!currentUser || !["hr", "superadmin", "admin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Unauthorised Operation" });
 
     const targetUser = await User.findById(req.params.id);
@@ -5255,5 +5271,4 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
   }
 
 });
-
 
