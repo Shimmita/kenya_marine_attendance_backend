@@ -2705,6 +2705,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
 });
 
 
+
 // departmental stats
 app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
   try {
@@ -2720,9 +2721,9 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
         message: "Unauthorized Access",
       });
 
-    // filter details based on the department and station of the supervisor.
-    // supervisors of another station cannot view records of other staions even if
-    // they are of the same department
+    // A supervisor only ever sees the records of their own station, for
+    // their own department. Supervisors of another station cannot view
+    // records of other stations even if they share the same department.
     const department = currentSupervisor.department;
     const station = currentSupervisor.station;
 
@@ -2752,7 +2753,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     };
 
     // -----------------------------------
-    // FETCH STAFF
+    // FETCH STAFF (scoped to supervisor's own department + station)
     // -----------------------------------
     const staff = await User.find(
       { department, station },
@@ -2772,7 +2773,8 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     const todayKey = dateKey(now);
 
     // -----------------------------------
-    // FETCH CLOCKING RECORDS
+    // FETCH CLOCKING RECORDS (already implicitly scoped to this station,
+    // since every email in `emails` belongs to it)
     // -----------------------------------
     const records = await Clocking.find({
       email: { $in: emails },
@@ -2788,7 +2790,6 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
     const metricsMap = {};
     const dailyMap = {};
-    const stationMap = {};
     const employeesWithRecords = new Set();
     let outsideClockingCount = 0;
     let outsideClockingStaff = new Set();
@@ -2818,19 +2819,6 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
         halfDayCount: 0,
         daysPresent: new Set(),
       };
-
-      const station = u.station || "Unassigned";
-      if (!stationMap[station]) {
-        stationMap[station] = {
-          station,
-          staff: 0,
-          hours: 0,
-          lateCount: 0,
-          outsideClockingCount: 0,
-          openSessions: 0,
-        };
-      }
-      stationMap[station].staff++;
     });
 
     // -----------------------------------
@@ -2842,7 +2830,6 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
       let hoursWorked = 0;
       const key = dateKey(rec.clock_in);
-      const station = rec.station || metric.station || "Unassigned";
       employeesWithRecords.add(rec.email);
 
       if (!dailyMap[key]) {
@@ -2854,18 +2841,6 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
           halfDays: 0,
           late: 0,
           outsideClocking: 0,
-          hours: 0,
-        };
-      }
-
-      if (!stationMap[station]) {
-        stationMap[station] = {
-          station,
-          staff: 0,
-          hours: 0,
-          lateCount: 0,
-          outsideClockingCount: 0,
-          openSessions: 0,
         };
       }
 
@@ -2873,22 +2848,16 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       totalClockInHour += hourDecimal(rec.clock_in);
 
       if (rec.clock_out) {
-        hoursWorked =
-          (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
+        hoursWorked = (rec.clock_out - rec.clock_in) / (1000 * 60 * 60);
 
         metric.hours += hoursWorked;
-        stationMap[station].hours += hoursWorked;
-        dailyMap[key].hours += hoursWorked;
         dailyMap[key].clockOuts++;
         completedSessions++;
         totalClockOutHour += hourDecimal(rec.clock_out);
 
-        if (hoursWorked > 9)
-          metric.overtime += hoursWorked - 9;
+        if (hoursWorked > 9) metric.overtime += hoursWorked - 9;
 
-        metric.daysPresent.add(
-          rec.clock_in.toDateString()
-        );
+        metric.daysPresent.add(rec.clock_in.toDateString());
 
         if (rec.isPresent) {
           metric.presentCount++;
@@ -2901,18 +2870,15 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
         }
       } else {
         metric.openSessions++;
-        stationMap[station].openSessions++;
       }
 
       if (rec.isLate) {
         metric.lateCount++;
-        stationMap[station].lateCount++;
         dailyMap[key].late++;
       }
 
       if (rec.clockedOutSide || rec.outsideLocation) {
         metric.outsideClockingCount++;
-        stationMap[station].outsideClockingCount++;
         dailyMap[key].outsideClocking++;
         outsideClockingCount++;
         outsideClockingStaff.add(rec.email);
@@ -2927,13 +2893,10 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       deptStats.totalOvertime += m.overtime;
       deptStats.lateCount += m.lateCount;
 
-      const attendanceRate =
-        (m.daysPresent.size / workingDaysSoFar) * 100;
+      const attendanceRate = (m.daysPresent.size / workingDaysSoFar) * 100;
 
       const productivityScore =
-        m.hours * 0.6 +
-        m.overtime * 0.5 -
-        m.lateCount * 1.5;
+        m.hours * 0.6 + m.overtime * 0.5 - m.lateCount * 1.5;
 
       let burnoutLevel = "Low";
       if (m.overtime > 20) burnoutLevel = "High";
@@ -2963,19 +2926,26 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     });
 
     // -----------------------------------
-    // SORT + TOP 3 PERFORMERS
+    // SORT + TOP PERFORMERS
     // -----------------------------------
     const sortedEmployees = [...deptStats.employeeMetrics].sort(
       (a, b) => b.productivityScore - a.productivityScore
     );
 
-    const top3Performers = sortedEmployees.slice(0, 4);
+    const topPerformers = sortedEmployees.slice(0, 4);
+
+    const burnoutCounts = {
+      Low: deptStats.employeeMetrics.filter((e) => e.burnoutLevel === "Low").length,
+      Moderate: deptStats.employeeMetrics.filter((e) => e.burnoutLevel === "Moderate").length,
+      High: deptStats.employeeMetrics.filter((e) => e.burnoutLevel === "High").length,
+    };
 
     // -----------------------------------
     // RESPONSE
     // -----------------------------------
     res.json({
       department,
+      station, // NEW — lets the UI/PDF confirm this is a single-station view
       totalStaff: staff.length,
       activeStaffThisMonth: employeesWithRecords.size,
       inactiveStaffThisMonth: staff.length - employeesWithRecords.size,
@@ -2989,6 +2959,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       outsideClockingStaffCount: outsideClockingStaff.size,
       presentDays: totalPresentDays,
       halfDays: halfDayCount,
+      burnoutCounts, // NEW — powers the burnout distribution chart
       avgClockIn: hourLabel(records.length ? totalClockInHour / records.length : null),
       avgClockOut: hourLabel(completedSessions ? totalClockOutHour / completedSessions : null),
       today: {
@@ -2998,28 +2969,20 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
         late: dailyMap[todayKey]?.late || 0,
         outsideClocking: dailyMap[todayKey]?.outsideClocking || 0,
       },
-      dailyTrend: Object.values(dailyMap)
-        .sort((a, b) => new Date(a.date) - new Date(b.date))
-        .map((item) => ({
-          ...item,
-          hours: Number(item.hours.toFixed(1)),
-          day: new Date(item.date).toLocaleDateString("en-KE", { day: "2-digit", month: "short" }),
-        })),
-      stationSummary: Object.values(stationMap)
-        .map((item) => ({
-          ...item,
-          hours: Number(item.hours.toFixed(1)),
-        }))
-        .sort((a, b) => b.hours - a.hours),
-      topPerformers: top3Performers,   // 🔥 NEW
+      // NOTE: dailyTrend and per-station breakdowns were removed — a
+      // supervisor only ever sees one station, so grouping by station
+      // was dead weight, and the daily-trend chart was never rendered.
+      topPerformers,
       employeeMetrics: sortedEmployees,
     });
-
   } catch (error) {
     console.error("Department stats error:", error);
     res.status(500).json({ message: "Server error" });
   }
 });
+
+
+
 
 
 
