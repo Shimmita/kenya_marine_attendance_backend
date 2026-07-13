@@ -2124,16 +2124,42 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     if (!req.session.isOnline)
       return res.status(401).json({ message: "Unauthorized" });
 
+    // get the query
+    const {
+      station = "",
+      department = "",
+    } = req.query;
+
+    // get config for stations and depart from platform config
+    const config = await PlatformConfig.getSingleton();
+
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
     const workingDaysSoFar =
       Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
 
-    const [records, allUsers] = await Promise.all([
-      Clocking.find({ clock_in: { $gte: startOfMonth } }),
-      User.find({}, "email name department station isAccountActive role")
-    ]);
+    const userFilter = {};
+
+    if (station) {
+      userFilter.station = station;
+    }
+
+    if (department) {
+      userFilter.department = department;
+    }
+
+    const allUsers = await User.find(
+      userFilter,
+      "email name department station isAccountActive role"
+    );
+
+    const emails = allUsers.map((u) => u.email);
+
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: startOfMonth },
+    });
 
     const totalStaff = allUsers.length;
 
@@ -2362,7 +2388,15 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
         employeeScores
           .sort((a, b) => b.score - a.score)
           .slice(0, 5),
-      stations: stats.stations
+      stations: stats.stations,
+      filters: {
+        stations: config.stations
+          .filter(s => s.active)
+          .map(s => s.name),
+
+        departments: config.departments
+      },
+
     });
 
   } catch (error) {
