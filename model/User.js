@@ -39,7 +39,8 @@ const userSchema = new mongoose.Schema(
 
 
     employeeId: {
-      type: String, default: ""
+      type: String, default: "",
+      unique: true, sparse: true, trim: true
     },
     staffNo: {
       type: String, default: ""
