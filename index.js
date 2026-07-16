@@ -4824,13 +4824,8 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     });
 
-    return res.status(200).json({
+    return res.status(200).json(cfg);
 
-      message: "Platform configuration updated successfully.",
-
-      config: cfg,
-
-    });
 
   }
 
