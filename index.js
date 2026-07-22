@@ -291,7 +291,7 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
     }
 
 
-    const normalizedPhone = normalizeKenyaPhone(phone, true);
+    const normalizedPhone = normalizeKenyaPhone(data.phone, true);
 
     if (!normalizedPhone) {
       throw new Error(
