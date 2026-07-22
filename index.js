@@ -303,8 +303,7 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       $or: [
         { email },
         { phone: normalizedPhone },
-        { employeeId },
-        { staffNo }
+       
       ]
     });
 
@@ -314,12 +313,6 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
 
       if (duplicate.phone === normalizedPhone)
         throw new Error("Phone number already exists.");
-
-      if (duplicate.employeeId === employeeId)
-        throw new Error("Employee ID already exists.");
-
-      if (duplicate.staffNo === staffNo)
-        throw new Error("Staff Number already exists.");
     }
 
 
