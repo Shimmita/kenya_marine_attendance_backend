@@ -49,7 +49,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       lowercase: true,
       enum: ["employee", "intern", "attachee"],
-      default: "employee",
+      default: "attachee",
     },
     rank: {
       type: String,

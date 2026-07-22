@@ -204,8 +204,12 @@ const defaultNotificationReminders = {
     clockOutReminderMinutes: 15,
     clockInMessage: 'Dear {firstName}, please clock in for your scheduled KMFRI workday.',
     clockOutMessage: 'Dear {firstName}, please clock out before leaving your duty station.',
+    internRegMessage: `Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your email ({email}) and the default password ${process.env.DEFAULT_PASSWORD_SUFFIX} to start clocking and recording your attendance. Please change your password after your first login.`,
+    staffRegMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your staff portal credentials to start clocking and recording your attendance.',
     channels: ['in_app'],
 };
+
+
 
 const defaultGeofence = {
     radiusMeters: 500,
@@ -260,6 +264,8 @@ const platformConfigSchema = new mongoose.Schema({
         clockOutReminderMinutes: { type: Number, default: defaultNotificationReminders.clockOutReminderMinutes },
         clockInMessage: { type: String, default: defaultNotificationReminders.clockInMessage },
         clockOutMessage: { type: String, default: defaultNotificationReminders.clockOutMessage },
+        internRegMessage: { type: String, default: defaultNotificationReminders.internRegMessage },
+        staffRegMessage: { type: String, default: defaultNotificationReminders.staffRegMessage },
         channels: { type: [String], default: defaultNotificationReminders.channels },
     },
     geofence: {

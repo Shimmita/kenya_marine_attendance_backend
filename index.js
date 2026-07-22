@@ -35,6 +35,7 @@ import {
   isPublicHoliday,
   isWeekend
 } from "./util/Holiday.js";
+import { SendMessageNow } from "./util/SendSMS.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -289,12 +290,41 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       }
     }
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) throw new Error("User already registered!");
+
+    const normalizedPhone = normalizeKenyaPhone(phone, true);
+
+    if (!normalizedPhone) {
+      throw new Error(
+        "Phone number must begin with 254 followed by 9 digits."
+      );
+    }
+
+    const duplicate = await User.findOne({
+      $or: [
+        { email },
+        { phone: normalizedPhone },
+        { employeeId },
+        { staffNo }
+      ]
+    });
+
+    if (duplicate) {
+      if (duplicate.email === email)
+        throw new Error("User already registered!");
+
+      if (duplicate.phone === normalizedPhone)
+        throw new Error("Phone number already exists.");
+
+      if (duplicate.employeeId === employeeId)
+        throw new Error("Employee ID already exists.");
+
+      if (duplicate.staffNo === staffNo)
+        throw new Error("Staff Number already exists.");
+    }
+
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const createdUser = await User.create({ ...data, password: hashedPassword });
-
     // Create audit log for single user registration by HR
     await createAuditLog({
       req,
@@ -314,6 +344,11 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       },
     });
 
+
+    // send sms to the intern or attache
+    await SendMessageNow(createdUser)
+
+    // return the success response
     return res.status(200).json({ message: "Account created successfully", user: createdUser });
   } catch (error) {
     console.error("Signup error:", error);
@@ -434,6 +469,11 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
       }
     });
 
+
+    // send message to the reg staff
+    await SendMessageNow(createdUser)
+
+    // return response
     return res.status(201).json({
       message: "Staff registered successfully.",
       user: createdUser
@@ -472,102 +512,209 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
     }
 
 
-    //  5. Validate and prepare user data
+    // 5. Validate and prepare user data
     const validatedUsers = [];
     const errors = [];
 
+    // O(1) duplicate detection
+    const emailSet = new Set();
+    const employeeIdSet = new Set();
+    const staffNoSet = new Set();
+    const phoneSet = new Set();
+
+    const emails = [];
+    const employeeIds = [];
+    const staffNos = [];
+    const phones = [];
+
+    // --------------------
+    // First Pass - Validate & Detect Batch Duplicates
+    // --------------------
     for (let i = 0; i < users.length; i++) {
+      const row = i + 1;
       const user = users[i];
 
       try {
-        // Required fields validation
-        if (!user.email || !validator.isEmail(user.email)) {
-          errors.push(`Row ${i + 1}: Invalid or missing email.`);
+        const email = user.email?.trim().toLowerCase();
+        const name = user.name?.trim();
+        const employeeId = user.employeeId?.toString().trim();
+        const staffNo = user.staffNo?.toString().trim() || "";
+        const role = (user.role || "employee").toLowerCase().trim();
+        const phone = normalizeKenyaPhone(user.phone?.trim(), true);
+
+        if (!email || !validator.isEmail(email)) {
+          errors.push(`Row ${row}: Invalid or missing email.`);
           continue;
         }
 
-        if (!user.name || user.name.trim().length === 0) {
-          errors.push(`Row ${i + 1}: Name is required.`);
+        if (!name) {
+          errors.push(`Row ${row}: Name is required.`);
           continue;
         }
 
-        if (!user.phone || user.phone.trim().length === 0) {
-          errors.push(`Row ${i + 1}: Phone number is required.`);
+        if (!phone) {
+          errors.push(`Row ${row}: Invalid phone number.`);
           continue;
         }
 
-        const normalizedRole = (user.role || 'employee').toString().trim().toLowerCase();
-        if (!['employee', 'staff'].includes(normalizedRole)) {
-          errors.push(`Row ${i + 1}: Only employee or staff roles are allowed in batch registration.`);
+        if (!employeeId) {
+          errors.push(`Row ${row}: Employee ID is required.`);
           continue;
         }
 
-        if (!user.employeeId || user.employeeId.toString().trim().length === 0) {
-          errors.push(`Row ${i + 1}: Employee ID is required.`);
+        if (!["employee", "staff"].includes(role)) {
+          errors.push(`Row ${row}: Only employee or staff roles are allowed.`);
           continue;
         }
 
-        // Check for duplicate email in batch
-        if (validatedUsers.some(u => u.email === user.email)) {
-          errors.push(`Row ${i + 1}: Duplicate email in batch.`);
+        // Duplicate checks inside uploaded file
+        if (emailSet.has(email)) {
+          errors.push(`Row ${row}: Duplicate email in uploaded file.`);
           continue;
         }
 
-        // Check if email already exists in database
-        const existingUser = await User.findOne({ email: user.email });
-        if (existingUser) {
-          errors.push(`\nRow ${i + 1}: ${existingUser.email} Email already registered.`);
+        if (employeeIdSet.has(employeeId)) {
+          errors.push(`Row ${row}: Duplicate Employee ID in uploaded file.`);
           continue;
         }
 
-        // Check if employeeId already exists
-        const existingEmployee = await User.findOne({ employeeId: user.employeeId });
-        if (existingEmployee) {
-          errors.push(`\nRow ${i + 1}: ${existingEmployee.employeeId} Employee ID already exists.`);
+        if (staffNo && staffNoSet.has(staffNo)) {
+          errors.push(`Row ${row}: Duplicate Staff No in uploaded file.`);
           continue;
         }
 
-        const defaultPassword = process.env.DEFAULT_PASSWORD_SUFFIX || user.employeeId?.toString().trim() || '123456';
-        const hashedPassword = await bcrypt.hash(defaultPassword, 10);
+        if (phoneSet.has(phone)) {
+          errors.push(`Row ${row}: Duplicate phone number in uploaded file.`);
+          continue;
+        }
 
-        // Prepare user object
+        emailSet.add(email);
+        employeeIdSet.add(employeeId);
+        phoneSet.add(phone);
+
+        if (staffNo) {
+          staffNoSet.add(staffNo);
+          staffNos.push(staffNo);
+        }
+
+        emails.push(email);
+        employeeIds.push(employeeId);
+        phones.push(phone);
+
         validatedUsers.push({
-          employeeId: user.employeeId.toString().trim(),
-          staffNo: user.staffNo || '',
-          name: user.name.trim(),
-          email: user.email.toLowerCase().trim(),
-          phone: user.phone || '',
-          role: 'employee',
-          station: user.station || '',
-          department: user.department || '',
-          password: hashedPassword,
-          isPasswordReset: false,
+          row,
+          employeeId,
+          staffNo,
+          name,
+          email,
+          phone,
+          role: "employee",
+          station: user.station?.trim() || "",
+          department: user.department?.trim() || "",
         });
-      } catch (error) {
-        errors.push(`Row ${i + 1}: ${error.message}`);
+
+      } catch (err) {
+        errors.push(`Row ${row}: ${err.message}`);
       }
     }
 
-    // 6. If there are validation errors, return them
-    if (errors.length > 0) {
+    // Stop immediately if upload itself has errors
+    if (errors.length) {
       return res.status(400).json({
-        message: `Validation failed. ${errors.length} error(s) found.\n ${errors.slice(0, 20).join("\n")}`,
-        errors: errors.slice(0, 20), // Return first 20 errors
+        message: `Validation failed. ${errors.length} error(s) found.`,
+        errors,
         totalErrors: errors.length
       });
     }
 
+    // --------------------
+    // Single Database Query
+    // --------------------
+    const existingUsers = await User.find({
+      $or: [
+        { email: { $in: emails } },
+        { employeeId: { $in: employeeIds } },
+        { staffNo: { $in: staffNos } },
+        { phone: { $in: phones } }
+      ]
+    }).lean();
+
+    const existingEmails = new Set(existingUsers.map(u => u.email));
+    const existingEmployeeIds = new Set(existingUsers.map(u => u.employeeId));
+    const existingStaffNos = new Set(existingUsers.map(u => u.staffNo).filter(Boolean));
+    const existingPhones = new Set(existingUsers.map(u => u.phone));
+
+    // --------------------
+    // Database Duplicate Check
+    // --------------------
+    const finalUsers = [];
+
+    for (const user of validatedUsers) {
+
+      if (existingEmails.has(user.email)) {
+        errors.push(`Row ${user.row}: Email already registered.`);
+        continue;
+      }
+
+      if (existingEmployeeIds.has(user.employeeId)) {
+        errors.push(`Row ${user.row}: Employee ID already exists.`);
+        continue;
+      }
+
+      if (user.staffNo && existingStaffNos.has(user.staffNo)) {
+        errors.push(`Row ${user.row}: Staff No already exists.`);
+        continue;
+      }
+
+      if (existingPhones.has(user.phone)) {
+        errors.push(`Row ${user.row}: Phone number already exists.`);
+        continue;
+      }
+
+      finalUsers.push(user);
+    }
+
+    // Stop if database duplicates exist
+    if (errors.length) {
+      return res.status(400).json({
+        message: `Validation failed. ${errors.length} error(s) found.`,
+        errors,
+        totalErrors: errors.length
+      });
+    }
+
+    // --------------------
+    // Hash Passwords Concurrently
+    // --------------------
+    await Promise.all(
+      finalUsers.map(async user => {
+        const defaultPassword =
+          process.env.DEFAULT_PASSWORD_SUFFIX || user.employeeId;
+
+        user.password = await bcrypt.hash(defaultPassword, 10);
+        user.isPasswordReset = false;
+      })
+    );
+
     // 7. Batch insert all validated users
-    const createdUsers = await User.insertMany(validatedUsers, { ordered: false });
+    const createdUsers = await User.insertMany(finalUsers, {
+      ordered: false
+    });
+
+
+    // send message
+    await Promise.allSettled(
+      createdUsers.map(user => SendMessageNow(user))
+    );
 
     // Build registered users summary for audit metadata
-    const registeredSummary = createdUsers.map((u) => ({
-      id: u._id?.toString?.() || null,
-      name: u.name || "",
-      email: u.email || "",
-      employeeId: u.employeeId || "",
-      department: u.department || "",
-      station: u.station || "",
+    const registeredSummary = createdUsers.map((user) => ({
+      id: user._id?.toString?.() || null,
+      name: user.name || "",
+      email: user.email || "",
+      employeeId: user.employeeId || "",
+      department: user.department || "",
+      station: user.station || "",
     }));
 
     // Create audit log for batch registration
@@ -1547,11 +1694,21 @@ const getAttendancePolicy = async () => {
   return cfg.attendancePolicy || {};
 };
 
-const normalizeKenyaPhone = (phone, allowLocal = false) => {
+const normalizeKenyaPhone = (phone) => {
   if (!phone) return null;
-  const digits = `${phone}`.replace(/\D/g, '');
-  if (digits.startsWith('254') && digits.length === 12) return digits;
-  if (allowLocal && digits.length === 9) return `254${digits}`;
+
+  let digits = String(phone).replace(/\D/g, "");
+
+  if (digits.startsWith("0")) {
+    digits = "254" + digits.slice(1);
+  } else if (digits.length === 9 && /^[71]/.test(digits)) {
+    digits = "254" + digits;
+  }
+
+  if (/^254[71]\d{8}$/.test(digits)) {
+    return digits;
+  }
+
   return null;
 };
 
