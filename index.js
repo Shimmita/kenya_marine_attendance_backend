@@ -303,7 +303,7 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       $or: [
         { email },
         { phone: normalizedPhone },
-       
+
       ]
     });
 
@@ -4741,6 +4741,8 @@ app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
     res.status(500).json({ message: 'Verification failed' });
   }
 });
+
+
 
 // -----------------------------
 // Superadmin endpoints (endpoints protected to superadmin)
