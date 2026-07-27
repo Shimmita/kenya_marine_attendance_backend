@@ -202,13 +202,16 @@ const defaultThemes = [
 const defaultNotificationReminders = {
     clockInReminderMinutes: 15,
     clockOutReminderMinutes: 15,
-    clockInMessage: 'Dear {firstName}, please clock in for your scheduled KMFRI workday.',
-    clockOutMessage: 'Dear {firstName}, please clock out before leaving your duty station.',
+    clockInMessage: 'Dear {firstName}, you did not clock in today and this may negatively impact your attendance and performance record, always remember to clock in and out for your scheduled KMFRI workday.',
+    clockOutMessage: 'Dear {firstName}, please remember to clock out before leaving your assigned station.',
     internRegMessage: `Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your email ({email}) and the default password ${process.env.DEFAULT_PASSWORD_SUFFIX} to start clocking and recording your attendance. Please change your password after your first login.`,
     staffRegMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your staff portal credentials to start clocking and recording your attendance.',
-    channels: ['in_app'],
-};
+    authorisedClockOut: 'Dear {firstName}, you have been authorised to clock out outside of your assigned station premises.',
+    missedClockOutMessage: "Dear {firstName}, KMFRI attendance system records indicate you forgot to clock out yesterday.",
+    absentMessage: "Dear {firstName}, KMFRI attendance system records indicate that you did not report attendance yesterday.",
 
+    channels: ["sms", "in_app"]
+};
 
 
 const defaultGeofence = {
@@ -217,16 +220,34 @@ const defaultGeofence = {
 };
 
 const defaultAttendancePolicy = {
-    standardClockIn: '08:00',
-    standardClockOut: '17:00',
+
+    standardClockIn: "08:00",
+
+    standardClockOut: "17:00",
+
     gracePeriodMinutes: 15,
+
+    // NEW
+    clockInReminderOffsetMinutes: 0,
+
+    // NEW
+    clockOutReminderOffsetMinutes: 30,
+
+    // NEW
+    midnightProcessingTime: "00:00",
+
+    workingDays: [1, 2, 3, 4, 5],
+
     allowClockOutsideStation: false,
-    requireBiometricVerification: true,
+
+    requireBiometricVerification: true
+
 };
 
 const defaultMasterSettings = {
     maintenanceMode: false,
     requirePasswordResetOnFirstLogin: false,
+    
 };
 
 const stationSchema = new mongoose.Schema({
@@ -266,6 +287,9 @@ const platformConfigSchema = new mongoose.Schema({
         clockOutMessage: { type: String, default: defaultNotificationReminders.clockOutMessage },
         internRegMessage: { type: String, default: defaultNotificationReminders.internRegMessage },
         staffRegMessage: { type: String, default: defaultNotificationReminders.staffRegMessage },
+        authorisedClockOut: { type: String, default: defaultNotificationReminders.authorisedClockOut },
+        missedClockOutMessage: { type: String, default: defaultNotificationReminders.missedClockOutMessage },
+        absentMessage: { type: String, default: defaultNotificationReminders.absentMessage },
         channels: { type: [String], default: defaultNotificationReminders.channels },
     },
     geofence: {
@@ -273,11 +297,52 @@ const platformConfigSchema = new mongoose.Schema({
         enabled: { type: Boolean, default: defaultGeofence.enabled },
     },
     attendancePolicy: {
-        standardClockIn: { type: String, default: defaultAttendancePolicy.standardClockIn },
-        standardClockOut: { type: String, default: defaultAttendancePolicy.standardClockOut },
-        gracePeriodMinutes: { type: Number, default: defaultAttendancePolicy.gracePeriodMinutes },
-        allowClockOutsideStation: { type: Boolean, default: defaultAttendancePolicy.allowClockOutsideStation },
-        requireBiometricVerification: { type: Boolean, default: defaultAttendancePolicy.requireBiometricVerification },
+
+        standardClockIn: {
+            type: String,
+            default: defaultAttendancePolicy.standardClockIn
+        },
+
+        standardClockOut: {
+            type: String,
+            default: defaultAttendancePolicy.standardClockOut
+        },
+
+        gracePeriodMinutes: {
+            type: Number,
+            default: defaultAttendancePolicy.gracePeriodMinutes
+        },
+
+        clockInReminderOffsetMinutes: {
+            type: Number,
+            default: 0
+        },
+
+        clockOutReminderOffsetMinutes: {
+            type: Number,
+            default: 15
+        },
+
+        midnightProcessingTime: {
+            type: String,
+            default: "00:00"
+        },
+
+        workingDays: {
+            type: [Number],
+            default: [1, 2, 3, 4, 5]
+        },
+
+        allowClockOutsideStation: {
+            type: Boolean,
+            default: false
+        },
+
+        requireBiometricVerification: {
+            type: Boolean,
+            default: true
+        }
+
     },
     departments: { type: [String], default: defaultDepartments },
     stations: { type: [stationSchema], default: defaultStations },
@@ -293,6 +358,37 @@ const platformConfigSchema = new mongoose.Schema({
         maxDevicesPerUser: { type: Number, default: defaultMasterSettings.maxDevicesPerUser },
     },
 }, { timestamps: true });
+
+
+// holidays schema 
+const holidaySchema = new mongoose.Schema({
+    name: {
+        type: String,
+        required: true
+    },
+
+    date: {
+        type: Date,
+        required: true
+    },
+
+    recurring: {
+        type: Boolean,
+        default: false
+    },
+
+    active: {
+        type: Boolean,
+        default: true
+    },
+
+    description: {
+        type: String,
+        default: ""
+    }
+
+}, { _id: true });
+
 
 const normalizeStation = (station) => {
     if (typeof station === 'string') {
@@ -319,6 +415,66 @@ export const getDefaultPlatformConfig = () => ({
     stations: defaultStations.map((station) => ({ ...station })),
     dropdowns: { ...defaultDropdowns },
     masterSettings: { ...defaultMasterSettings },
+});
+
+
+
+const defaultHolidays = [
+    {
+        name: "New Year's Day",
+        date: new Date("2026-01-01"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Labour Day",
+        date: new Date("2026-05-01"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Madaraka Day",
+        date: new Date("2026-06-01"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Mashujaa Day",
+        date: new Date("2026-10-20"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Jamhuri Day",
+        date: new Date("2026-12-12"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Christmas Day",
+        date: new Date("2026-12-25"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Boxing Day",
+        date: new Date("2026-12-26"),
+        recurring: true,
+        active: true
+    }
+];
+
+
+platformConfigSchema.add({
+
+    holidays: {
+
+        type: [holidaySchema],
+
+        default: defaultHolidays
+
+    }
+
 });
 
 // We only ever expect a single document. Helper static to fetch or create default.

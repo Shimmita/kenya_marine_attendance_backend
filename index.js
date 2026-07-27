@@ -36,6 +36,7 @@ import {
   isWeekend
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
+import startAttendanceScheduler from "./cron/scheduler.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -190,21 +191,59 @@ const ensureSinglePrimaryDevice = async (email) => {
 
   return getActiveUserDevices(email);
 };
-
-// ─── Database ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Database
+// ─────────────────────────────────────────────────────────────
 
 mongoose
   .connect(
-    environment === "SANDBOX"
-      ? process.env.MONGO_CONNECTION_URI
-      : process.env.MONGO_CONNECTION_URI_CLOUD
-  )
-  .then(() =>
-    console.log(`Connected to MongoDB (${environment === "SANDBOX" ? "LOCAL" : "CLOUD"})`)
-  )
-  .catch((err) => console.error("Database connection failed:", err));
 
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+    environment === "SANDBOX"
+
+      ? process.env.MONGO_CONNECTION_URI
+
+      : process.env.MONGO_CONNECTION_URI_CLOUD
+
+  )
+
+  .then(async () => {
+
+    console.log(
+      `Connected to MongoDB (${environment === "SANDBOX" ? "LOCAL" : "CLOUD"})`
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Start Attendance Scheduler
+    |--------------------------------------------------------------------------
+    */
+
+    await startAttendanceScheduler();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Start Express Server
+    |--------------------------------------------------------------------------
+    */
+
+    app.listen(PORT, () => {
+
+      console.log(
+        `Server running on http://localhost:${PORT}`
+      );
+
+    });
+
+  })
+
+  .catch((err) => {
+
+    console.error(
+      "Database connection failed:",
+      err
+    );
+
+  });
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 
@@ -4385,6 +4424,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
       },
     });
 
+    // send SMS notification to the user about the granted permission
+    await SendMessageNow(targetUser, `Dear ${targetUser.name}, you have been granted permission to clock outside of your assigned station  "${targetUser.station}"  from ${startDate} to ${endDate} for the reason "${reason}". Please ensure to adhere to the guidelines provided.`);
+
     res.json({
       message: `Clock outside authorization updated for ${targetUser.name}`,
       user: targetUser,
@@ -4429,6 +4471,10 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
       target: targetUser,
       metadata: { canClockOutside: false },
     });
+
+
+    // send message notification to the user about the revoked permission
+    await SendMessageNow(targetUser, `Dear ${targetUser.name}, your permission to clock outside of you station "${targetUser.station}" has been revoked. Please ensure to adhere to the standard clocking procedures.`);
 
     res.json({
       message: `Clock outside authorization revoked for ${targetUser.name}`,
@@ -4747,7 +4793,6 @@ app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
 // -----------------------------
 // Superadmin endpoints (endpoints protected to superadmin)
 // -----------------------------
-
 
 const ensureSuperadmin = async (req, res, allowBootstrap = false) => {
   if (!req.session?.isOnline || !req.session?.userID) {

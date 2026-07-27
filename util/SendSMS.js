@@ -18,7 +18,7 @@ const formatReminderTemplate = (template, user) => {
 };
 
 
-export const SendMessageNow = async (user) => {
+export const SendMessageNow = async (user,messageParams="") => {
 
     // load platform cong especially for message
     const cfg = await PlatformConfig.getSingleton();
@@ -29,7 +29,7 @@ export const SendMessageNow = async (user) => {
         params: {
             issn: "TNC013",
             msisdn: user?.phone,
-            text: message,
+            text: messageParams || message,
             username: process.env.SMS_USERNAME,
             password: process.env.SMS_PASSWORD
         }
