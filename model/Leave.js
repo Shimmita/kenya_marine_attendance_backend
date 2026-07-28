@@ -22,7 +22,7 @@ const leaveSchema = new mongoose.Schema({
     },
     reliever: { type: String, required: false, default: "" },
     remarks: { type: String, required: true, },
-    attachment: { type: String, required: true },
+    attachment: { type: String, required: false },
 }, { timestamps: true });
 
 export default mongoose.model("leave", leaveSchema);

@@ -16,6 +16,7 @@ import mongoose from "mongoose";
 import os from "os";
 import sharp from "sharp";
 import validator from "validator";
+import startAttendanceScheduler, { refreshAttendanceScheduler } from "./cron/scheduler.js";
 import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
@@ -36,7 +37,6 @@ import {
   isWeekend
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
-import startAttendanceScheduler, { refreshAttendanceScheduler } from "./cron/scheduler.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -4263,10 +4263,12 @@ app.get(`${BASE_ROUTE}/supervisor/leaves`, async (req, res) => {
     if (!currentSupervisor)
       return res.status(404).json({ message: "User not found" });
 
-    if (currentSupervisor.rank !== "supervisor")
+    if (!["supervisor", "superadmin"].includes(currentSupervisor.rank)) {
       return res.status(403).json({
-        message: "Selected user is not eligible to be a supervisor",
+        message: "Unauthorised user",
       });
+
+    }
 
     const department = currentSupervisor.department;
 
@@ -4286,12 +4288,49 @@ app.get(`${BASE_ROUTE}/supervisor/leaves`, async (req, res) => {
 
 // update the leave
 app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
+
+  const currentUser = await User.findById(req.session.userID);
+  if (!currentUser)
+    return res.status(404).json({ message: "Current user not found" });
+
   try {
     const updatedLeave = await Leave.findByIdAndUpdate(
       req.params.id,
       req.body,
       { new: true }
     );
+
+    const email = updatedLeave.email
+
+    // fetch the user account connected to the email
+    const targetUser = await User.findOne({ email })
+
+    // update user on leave status to true
+    targetUser.isOnLeave = true
+
+    // save updated user
+    await targetUser.save()
+
+    // send message to the user that they are on leave
+    await SendMessageNow(targetUser, `Dear ${targetUser.name}, Your leave request has been approved.`)
+
+    // create audit log
+    // metadata
+    const { startDate, endDate, status } = updatedLeave
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.leave_approved",
+      description: "user leave approved",
+      actor: currentUser,
+      target: targetUser,
+      metadata: {
+        startDate,
+        endDate,
+        status,
+      },
+    });
 
     res.status(200).json(updatedLeave);
   } catch (error) {
