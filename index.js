@@ -36,7 +36,7 @@ import {
   isWeekend
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
-import startAttendanceScheduler from "./cron/scheduler.js";
+import startAttendanceScheduler, { refreshAttendanceScheduler } from "./cron/scheduler.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -5000,6 +5000,11 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
     }
 
     await cfg.save();
+
+
+    // refresh scheduler
+    await refreshAttendanceScheduler();
+
 
     await createAuditLog({
 

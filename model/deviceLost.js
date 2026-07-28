@@ -19,7 +19,7 @@ const deviceLost = new mongoose.Schema(
         },
         responded: {
             type: String,
-            enum: ["admin", "hr", "supervisor",""],
+            enum: ["admin", "hr", "supervisor","superadmin"],
             default: "",
         },
         device_fingerprint: { type: String, required: true, unique: true },

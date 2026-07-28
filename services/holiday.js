@@ -1,22 +1,16 @@
-import dayjs from "dayjs";
 import PlatformConfig from "../model/PlatformConfig.js";
-import { now } from "../util/Date.js";
 
-export const isWeekend = async () => {
+export const isWeekend = async (date = now()) => {
 
     const cfg = await PlatformConfig.getSingleton();
 
-    const today = now().day();
-
-    return !cfg.attendancePolicy.workingDays.includes(today);
+    return !cfg.attendancePolicy.workingDays.includes(date.day());
 
 };
 
-export const isHoliday = async () => {
+export const isHoliday = async (date = now()) => {
 
     const cfg = await PlatformConfig.getSingleton();
-
-    const today = now();
 
     const holidays = cfg.holidays.filter(h => h.active);
 
@@ -27,25 +21,21 @@ export const isHoliday = async () => {
         if (holiday.recurring) {
 
             if (
-
-                holidayDate.month() === today.month() &&
-
-                holidayDate.date() === today.date()
-
+                holidayDate.month() === date.month() &&
+                holidayDate.date() === date.date()
             ) {
 
                 return true;
 
             }
 
-        } else {
+        }
+
+        else {
 
             if (
-
                 holidayDate.format("YYYY-MM-DD") ===
-
-                today.format("YYYY-MM-DD")
-
+                date.format("YYYY-MM-DD")
             ) {
 
                 return true;
@@ -60,24 +50,14 @@ export const isHoliday = async () => {
 
 };
 
-export const isWorkingDay = async () => {
+export const isWorkingDay = async (date = now()) => {
 
-    if (await isWeekend())
+    if (await isWeekend(date))
         return false;
 
-    if (await isHoliday())
+    if (await isHoliday(date))
         return false;
 
     return true;
-
-};
-
-export default {
-
-    isWeekend,
-
-    isHoliday,
-
-    isWorkingDay
 
 };

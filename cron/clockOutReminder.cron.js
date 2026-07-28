@@ -85,16 +85,10 @@ const registerClockOutReminder = async () => {
 
             const user = {
 
-                _id: attendance._id,
-
                 name: attendance.name,
-
                 email: attendance.email,
-
                 phone: attendance.phone,
-
                 department: attendance.department,
-
                 station: attendance.station
 
             };
@@ -109,6 +103,10 @@ const registerClockOutReminder = async () => {
                     "CLOCK_OUT_REMINDER"
 
                 );
+
+
+            if (sent)
+                totalSent++
 
         }
 

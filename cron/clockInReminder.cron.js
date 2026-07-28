@@ -121,6 +121,10 @@ const registerClockInReminder = async () => {
                 );
 
 
+                if(sent)
+                    totalSent++
+
+
         }
 
         console.log("---------------------------------------");

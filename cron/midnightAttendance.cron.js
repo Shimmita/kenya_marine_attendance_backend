@@ -50,15 +50,10 @@ const registerMidnightAttendanceJob = async () => {
         |--------------------------------------------------------------------------
         */
 
-        const yesterday =
-            new Date(start);
+        const yesterday = now().subtract(1, "day");
 
         if (!(await isWorkingDay(yesterday))) {
-
-            console.log("Yesterday was not a working day.");
-
             return;
-
         }
 
         /*
