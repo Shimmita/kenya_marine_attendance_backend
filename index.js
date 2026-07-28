@@ -4318,20 +4318,6 @@ app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
     // metadata
     const { startDate, endDate, status } = updatedLeave
 
-    await createAuditLog({
-      req,
-      category: "admin_action",
-      action: "admin.leave_approved",
-      description: "user leave approved",
-      actor: currentUser,
-      target: targetUser,
-      metadata: {
-        startDate,
-        endDate,
-        status,
-      },
-    });
-
     res.status(200).json(updatedLeave);
   } catch (error) {
     res.status(400).send(error.message);
