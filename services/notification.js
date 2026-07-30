@@ -34,13 +34,23 @@ const sendSMS = async (user, message) => {
 
     try {
 
+        if (!user?.phone) {
+            console.warn(`SMS skipped (${user?.email || "unknown"}): missing phone`);
+            return false;
+        }
+
+        if (!message) {
+            console.warn(`SMS skipped (${user?.email || "unknown"}): empty message`);
+            return false;
+        }
+
         await SendMessageNow(user, message);
 
         return true;
 
     } catch (err) {
 
-        console.error(`SMS Error (${user.email})`, err.message);
+        console.error(`SMS Error (${user?.email || "unknown"})`, err.message);
 
         return false;
 
@@ -59,7 +69,7 @@ const sendSMS = async (user, message) => {
 
 const sendInApp = async (user, message, type) => {
 
-    console.log(`IN-APP -> ${user.email} (${type})`);
+    console.log(`IN-APP -> ${user?.email || "unknown"} (${type})`);
 
     return true;
 
@@ -76,7 +86,7 @@ const sendInApp = async (user, message, type) => {
 
 const sendEmail = async (user, message, type) => {
 
-    console.log(`EMAIL -> ${user.email} (${type})`);
+    console.log(`EMAIL -> ${user?.email || "unknown"} (${type})`);
 
     return true;
 
@@ -103,38 +113,40 @@ export const sendNotification = async (
         const config = await PlatformConfig.getSingleton();
 
         const channels =
-            config.notificationReminders.channels || [];
+            config.notificationReminders?.channels || [];
 
         const message =
             formatMessage(template, user);
 
+        let delivered = false;
+
         if (channels.includes("sms")) {
 
-            await sendSMS(user, message);
+            delivered = await sendSMS(user, message) || delivered;
 
         }
 
         if (channels.includes("in_app")) {
 
-            await sendInApp(
+            delivered = await sendInApp(
                 user,
                 message,
                 type
-            );
+            ) || delivered;
 
         }
 
         if (channels.includes("email")) {
 
-            await sendEmail(
+            delivered = await sendEmail(
                 user,
                 message,
                 type
-            );
+            ) || delivered;
 
         }
 
-        return true;
+        return delivered;
 
     }
 

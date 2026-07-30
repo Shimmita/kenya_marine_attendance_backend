@@ -218,7 +218,15 @@ mongoose
     |--------------------------------------------------------------------------
     */
 
-    await startAttendanceScheduler();
+    try {
+
+      await startAttendanceScheduler();
+
+    } catch (err) {
+
+      console.error("Attendance scheduler failed to start:", err);
+
+    }
 
     /*
     |--------------------------------------------------------------------------
@@ -5490,4 +5498,6 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
   }
 
 });
+
+
 

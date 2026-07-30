@@ -1,10 +1,22 @@
 import PlatformConfig from "../model/PlatformConfig.js";
+import dayjs from "dayjs";
+import { now, TIMEZONE } from "../util/Date.js";
+
+const toNairobiDay = (date = now()) =>
+    dayjs.isDayjs(date)
+        ? date.tz(TIMEZONE)
+        : dayjs(date).tz(TIMEZONE);
 
 export const isWeekend = async (date = now()) => {
 
     const cfg = await PlatformConfig.getSingleton();
 
-    return !cfg.attendancePolicy.workingDays.includes(date.day());
+    const targetDate = toNairobiDay(date);
+
+    const workingDays =
+        cfg.attendancePolicy?.workingDays || [1, 2, 3, 4, 5];
+
+    return !workingDays.includes(targetDate.day());
 
 };
 
@@ -12,17 +24,19 @@ export const isHoliday = async (date = now()) => {
 
     const cfg = await PlatformConfig.getSingleton();
 
-    const holidays = cfg.holidays.filter(h => h.active);
+    const targetDate = toNairobiDay(date);
+
+    const holidays = (cfg.holidays || []).filter(h => h.active);
 
     for (const holiday of holidays) {
 
-        const holidayDate = dayjs(holiday.date);
+        const holidayDate = toNairobiDay(holiday.date);
 
         if (holiday.recurring) {
 
             if (
-                holidayDate.month() === date.month() &&
-                holidayDate.date() === date.date()
+                holidayDate.month() === targetDate.month() &&
+                holidayDate.date() === targetDate.date()
             ) {
 
                 return true;
@@ -35,7 +49,7 @@ export const isHoliday = async (date = now()) => {
 
             if (
                 holidayDate.format("YYYY-MM-DD") ===
-                date.format("YYYY-MM-DD")
+                targetDate.format("YYYY-MM-DD")
             ) {
 
                 return true;

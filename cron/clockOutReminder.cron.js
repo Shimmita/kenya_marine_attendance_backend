@@ -1,10 +1,10 @@
 import PlatformConfig from "../model/PlatformConfig.js";
-import Clocking from "../model/Clocking.js";
 
 import { sendNotification } from "../services/notification.js";
 
 import { isWorkingDay } from "../services/holiday.js";
 import { endOfToday, startOfToday } from "../util/Date.js";
+import { getUsersNotClockedOutToday } from "../services/attendance.js";
 
 /*
 |--------------------------------------------------------------------------
@@ -59,19 +59,7 @@ const registerClockOutReminder = async () => {
         */
 
         const attendanceRecords =
-            await Clocking.find({
-
-                clock_in: {
-
-                    $gte: startOfToday(),
-
-                    $lte: endOfToday()
-
-                },
-
-                clock_out: null
-
-            });
+            await getUsersNotClockedOutToday(startOfToday(), endOfToday());
 
         let totalSent = 0;
 
@@ -83,30 +71,38 @@ const registerClockOutReminder = async () => {
 
         for (const attendance of attendanceRecords) {
 
-            const user = {
+            try {
 
-                name: attendance.name,
-                email: attendance.email,
-                phone: attendance.phone,
-                department: attendance.department,
-                station: attendance.station
+                const user = {
 
-            };
+                    name: attendance.name,
+                    email: attendance.email,
+                    phone: attendance.phone,
+                    department: attendance.department,
+                    station: attendance.station
 
-            const sent =
-                await sendNotification(
+                };
 
-                    user,
+                const sent =
+                    await sendNotification(
 
-                    reminderMessage,
+                        user,
 
-                    "CLOCK_OUT_REMINDER"
+                        reminderMessage,
 
-                );
+                        "CLOCK_OUT_REMINDER"
+
+                    );
 
 
-            if (sent)
-                totalSent++
+                if (sent)
+                    totalSent++
+
+            } catch (err) {
+
+                console.error(`Clock Out Reminder User Error (${attendance?.email || "unknown"}):`, err);
+
+            }
 
         }
 

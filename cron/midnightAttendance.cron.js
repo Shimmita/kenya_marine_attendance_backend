@@ -1,6 +1,4 @@
 import PlatformConfig from "../model/PlatformConfig.js";
-import Clocking from "../model/Clocking.js";
-
 import {
     isWorkingDay
 } from "../services/holiday.js";
@@ -9,9 +7,17 @@ import { sendNotification } from "../services/notification.js";
 
 import {
     startOfYesterday,
-    endOfYesterday
+    endOfYesterday,
+    now
 } from "../util/Date.js";
-import { getEligibleUsers, hasClockedYesterday } from "../services/attendance.js";
+import {
+    getAbsentUsersYesterday,
+    getMissedClockOutsYesterday,
+    markMissedClockOut
+} from "../services/attendance.js";
+
+const processedAttendanceDates = new Set();
+const processingAttendanceDates = new Set();
 
 /*
 |--------------------------------------------------------------------------
@@ -25,6 +31,8 @@ import { getEligibleUsers, hasClockedYesterday } from "../services/attendance.js
 */
 
 const registerMidnightAttendanceJob = async () => {
+
+    let yesterdayKey;
 
     try {
 
@@ -51,10 +59,29 @@ const registerMidnightAttendanceJob = async () => {
         */
 
         const yesterday = now().subtract(1, "day");
+        yesterdayKey = yesterday.format("YYYY-MM-DD");
+
+        if (processedAttendanceDates.has(yesterdayKey)) {
+
+            console.log(`Midnight Attendance already processed for ${yesterdayKey}.`);
+
+            return;
+
+        }
+
+        if (processingAttendanceDates.has(yesterdayKey)) {
+
+            console.log(`Midnight Attendance processing already in progress for ${yesterdayKey}.`);
+
+            return;
+
+        }
 
         if (!(await isWorkingDay(yesterday))) {
             return;
         }
+
+        processingAttendanceDates.add(yesterdayKey);
 
         /*
         |--------------------------------------------------------------------------
@@ -79,52 +106,47 @@ const registerMidnightAttendanceJob = async () => {
         */
 
         const records =
-            await Clocking.find({
-
-                clock_in: {
-
-                    $gte: start,
-
-                    $lte: end
-
-                }
-
-            });
+            await getMissedClockOutsYesterday(start, end);
 
         let missedClockOutCount = 0;
 
         for (const attendance of records) {
 
-            if (attendance.clock_out)
-                continue;
+            try {
 
-            attendance.missedClockOut = true;
+                await markMissedClockOut(attendance._id);
 
-            await attendance.save();
+                const sent =
+                    await sendNotification(
 
-            await sendNotification(
+                        {
 
-                {
+                            name: attendance.name,
 
-                    name: attendance.name,
+                            email: attendance.email,
 
-                    email: attendance.email,
+                            phone: attendance.phone,
 
-                    phone: attendance.phone,
+                            department: attendance.department,
 
-                    department: attendance.department,
+                            station: attendance.station
 
-                    station: attendance.station
+                        },
 
-                },
+                        missedClockOutMessage,
 
-                missedClockOutMessage,
+                        "MISSED_CLOCK_OUT"
 
-                "MISSED_CLOCK_OUT"
+                    );
 
-            );
+                if (sent)
+                    missedClockOutCount++;
 
-            missedClockOutCount++;
+            } catch (err) {
+
+                console.error(`Missed Clock Out Error (${attendance?.email || "unknown"}):`, err);
+
+            }
 
         }
 
@@ -136,37 +158,33 @@ const registerMidnightAttendanceJob = async () => {
         */
 
         const users =
-            await getEligibleUsers();
+            await getAbsentUsersYesterday(start, end);
 
         let absentCount = 0;
 
         for (const user of users) {
 
-            const attendance =
-                await hasClockedYesterday(
+            try {
 
-                    user.email,
+                const sent =
+                    await sendNotification(
 
-                    start,
+                        user,
 
-                    end
+                        absentMessage,
 
-                );
+                        "ABSENT"
 
-            if (attendance)
-                continue;
+                    );
 
-            await sendNotification(
+                if (sent)
+                    absentCount++;
 
-                user,
+            } catch (err) {
 
-                absentMessage,
+                console.error(`Absent Reminder Error (${user?.email || "unknown"}):`, err);
 
-                "ABSENT"
-
-            );
-
-            absentCount++;
+            }
 
         }
 
@@ -175,6 +193,9 @@ const registerMidnightAttendanceJob = async () => {
         console.log(`Absent Users      : ${absentCount}`);
         console.log("Midnight Attendance Completed");
         console.log("---------------------------------------");
+
+        processedAttendanceDates.add(yesterdayKey);
+        processingAttendanceDates.delete(yesterdayKey);
 
     }
 
@@ -187,6 +208,9 @@ const registerMidnightAttendanceJob = async () => {
             err
 
         );
+
+        if (typeof yesterdayKey !== "undefined")
+            processingAttendanceDates.delete(yesterdayKey);
 
     }
 

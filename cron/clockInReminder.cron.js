@@ -1,5 +1,5 @@
 import PlatformConfig from "../model/PlatformConfig.js";
-import { getEligibleUsers, hasClockedToday } from "../services/attendance.js";
+import { getAbsentUsersToday } from "../services/attendance.js";
 
 import {
     isWorkingDay
@@ -64,14 +64,14 @@ const registerClockInReminder = async () => {
         |--------------------------------------------------------------------------
         */
 
-        const users =
-            await getEligibleUsers();
-
         const start =
             startOfToday();
 
         const end =
             endOfToday();
+
+        const users =
+            await getAbsentUsersToday(start, end);
 
         let totalSent = 0;
 
@@ -83,47 +83,28 @@ const registerClockInReminder = async () => {
 
         for (const user of users) {
 
-            const attendance =
-                await hasClockedToday(
+            try {
 
-                    user.email,
+                const sent =
+                    await sendNotification(
 
-                    start,
+                        user,
 
-                    end
+                        reminderMessage,
 
-                );
+                        "CLOCK_IN_REMINDER"
 
-            /*
-            |--------------------------------------------------------------------------
-            | Already Clocked
-            |--------------------------------------------------------------------------
-            */
-
-            if (attendance)
-                continue;
-
-            /*
-            |--------------------------------------------------------------------------
-            | Send Reminder
-            |--------------------------------------------------------------------------
-            */
-
-            const sent =
-                await sendNotification(
-
-                    user,
-
-                    reminderMessage,
-
-                    "CLOCK_IN_REMINDER"
-
-                );
+                    );
 
 
                 if(sent)
                     totalSent++
 
+            } catch (err) {
+
+                console.error(`Clock In Reminder User Error (${user?.email || "unknown"}):`, err);
+
+            }
 
         }
 

@@ -23,6 +23,9 @@ let scheduledTasks = [];
 
 const timeToCron = (time) => {
 
+    if (!isValidTime(time))
+        throw new Error(`Invalid scheduler time: ${time}`);
+
     const [hour, minute] = time.split(":").map(Number);
 
     return `${minute} ${hour} * * *`;
@@ -43,12 +46,20 @@ const offsetTime = (
 
 ) => {
 
+    if (!isValidTime(time))
+        throw new Error(`Invalid scheduler time: ${time}`);
+
+    const safeOffsetMinutes = Number(offsetMinutes || 0);
+
+    if (!Number.isFinite(safeOffsetMinutes))
+        throw new Error(`Invalid scheduler offset: ${offsetMinutes}`);
+
     let [hour, minute] = time.split(":").map(Number);
 
     let totalMinutes =
         hour * 60 +
         minute +
-        offsetMinutes;
+        safeOffsetMinutes;
 
     while (totalMinutes < 0)
         totalMinutes += 1440;
@@ -64,6 +75,17 @@ const offsetTime = (
 
 };
 
+const isValidTime = (time) => {
+
+    if (typeof time !== "string")
+        return false;
+
+    const match = time.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+
+    return Boolean(match);
+
+};
+
 /*
 |--------------------------------------------------------------------------
 | Stop Existing Scheduler
@@ -72,7 +94,22 @@ const offsetTime = (
 
 const stopScheduler = () => {
 
-    scheduledTasks.forEach(task => task.stop());
+    scheduledTasks.forEach(task => {
+
+        try {
+
+            task.stop();
+
+            if (typeof task.destroy === "function")
+                task.destroy();
+
+        } catch (err) {
+
+            console.error("Attendance Scheduler Stop Error:", err);
+
+        }
+
+    });
 
     scheduledTasks = [];
 
@@ -92,7 +129,7 @@ export const startAttendanceScheduler = async () => {
         await PlatformConfig.getSingleton();
 
     const policy =
-        config.attendancePolicy;
+        config.attendancePolicy || {};
 
     /*
     |--------------------------------------------------------------------------
@@ -103,7 +140,7 @@ export const startAttendanceScheduler = async () => {
     const clockInReminderTime =
         offsetTime(
 
-            policy.standardClockIn,
+            policy.standardClockIn || "08:00",
 
             policy.clockInReminderOffsetMinutes
 
@@ -112,14 +149,14 @@ export const startAttendanceScheduler = async () => {
     const clockOutReminderTime =
         offsetTime(
 
-            policy.standardClockOut,
+            policy.standardClockOut || "17:00",
 
             -policy.clockOutReminderOffsetMinutes
 
         );
 
     const midnightTime =
-        policy.midnightProcessingTime;
+        policy.midnightProcessingTime || "00:00";
 
     /*
     |--------------------------------------------------------------------------

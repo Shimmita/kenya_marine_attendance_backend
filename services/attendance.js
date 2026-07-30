@@ -14,6 +14,7 @@ export const getEligibleUsers = async () => {
 
     })
         .select("-password")
+        .sort({ name: 1 })
         .lean();
 
 };
@@ -37,7 +38,9 @@ export const getTodayClockings = async (
 
         }
 
-    }).lean();
+    })
+        .select("email")
+        .lean();
 
 };
 
@@ -60,7 +63,9 @@ export const getYesterdayClockings = async (
 
         }
 
-    }).lean();
+    })
+        .select("email")
+        .lean();
 
 };
 
@@ -100,7 +105,7 @@ export const hasClockedYesterday = async (
     end
 ) => {
 
-    return Clocking.findOne({
+    return Clocking.exists({
 
         email,
 
@@ -115,6 +120,9 @@ export const hasClockedYesterday = async (
     });
 
 };
+
+const uniqueEmails = (records) =>
+    new Set(records.map(record => record.email).filter(Boolean));
 
 
 /**
@@ -151,18 +159,12 @@ export const getAbsentUsersToday = async (
     end
 ) => {
 
-    const eligibleUsers = await getEligibleUsers();
+    const [eligibleUsers, attendance] = await Promise.all([
+        getEligibleUsers(),
+        getTodayClockings(start, end)
+    ]);
 
-    const attendance = await getTodayClockings(
-        start,
-        end
-    );
-
-    const attendedEmails = new Set(
-
-        attendance.map(a => a.email)
-
-    );
+    const attendedEmails = uniqueEmails(attendance);
 
     return eligibleUsers.filter(
 
@@ -181,18 +183,12 @@ export const getAbsentUsersYesterday = async (
     end
 ) => {
 
-    const eligibleUsers = await getEligibleUsers();
+    const [eligibleUsers, attendance] = await Promise.all([
+        getEligibleUsers(),
+        getYesterdayClockings(start, end)
+    ]);
 
-    const attendance = await getYesterdayClockings(
-        start,
-        end
-    );
-
-    const attendedEmails = new Set(
-
-        attendance.map(a => a.email)
-
-    );
+    const attendedEmails = uniqueEmails(attendance);
 
     return eligibleUsers.filter(
 
@@ -222,9 +218,11 @@ export const getMissedClockOutsYesterday = async (
 
         },
 
-        clock_out: null
+        clock_out: null,
 
-    });
+        missedClockOut: { $ne: true }
+
+    }).lean();
 
 };
 
@@ -244,7 +242,9 @@ export const markMissedClockOut = async (
 
             missedClockOut: true
 
-        }
+        },
+
+        { new: true }
 
     );
 
