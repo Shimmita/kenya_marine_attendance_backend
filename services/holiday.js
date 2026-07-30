@@ -1,13 +1,21 @@
 import PlatformConfig from "../model/PlatformConfig.js";
 import dayjs from "dayjs";
-import { now, TIMEZONE } from "../util/Date.js";
+import utc from "dayjs/plugin/utc.js";
+import timezone from "dayjs/plugin/timezone.js";
 
-const toNairobiDay = (date = now()) =>
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const TIMEZONE = "Africa/Nairobi";
+
+const toNairobiDay = (date) =>
     dayjs.isDayjs(date)
         ? date.tz(TIMEZONE)
-        : dayjs(date).tz(TIMEZONE);
+        : date
+            ? dayjs(date).tz(TIMEZONE)
+            : dayjs().tz(TIMEZONE);
 
-export const isWeekend = async (date = now()) => {
+export const isWeekend = async (date) => {
 
     const cfg = await PlatformConfig.getSingleton();
 
@@ -20,7 +28,7 @@ export const isWeekend = async (date = now()) => {
 
 };
 
-export const isHoliday = async (date = now()) => {
+export const isHoliday = async (date) => {
 
     const cfg = await PlatformConfig.getSingleton();
 
@@ -64,7 +72,7 @@ export const isHoliday = async (date = now()) => {
 
 };
 
-export const isWorkingDay = async (date = now()) => {
+export const isWorkingDay = async (date) => {
 
     if (await isWeekend(date))
         return false;

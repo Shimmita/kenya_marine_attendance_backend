@@ -16,7 +16,7 @@ import mongoose from "mongoose";
 import os from "os";
 import sharp from "sharp";
 import validator from "validator";
-import startAttendanceScheduler, { refreshAttendanceScheduler } from "./cron/scheduler.js";
+import startAttendanceScheduler, { getAttendanceScheduleTimes, refreshAttendanceScheduler } from "./cron/scheduler.js";
 import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
@@ -4960,6 +4960,12 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     }
 
+    if (updates.attendancePolicy) {
+
+      getAttendanceScheduleTimes(cfg.attendancePolicy);
+
+    }
+
     // =====================================================
     // MASTER SETTINGS
     // =====================================================
@@ -5117,6 +5123,10 @@ app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
     }
 
     await cfg.save();
+
+    if (section === 'all' || section === 'attendancePolicy') {
+      await refreshAttendanceScheduler();
+    }
 
     await createAuditLog({
       req,
@@ -5498,6 +5508,5 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
   }
 
 });
-
 
 

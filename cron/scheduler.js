@@ -92,16 +92,16 @@ const isValidTime = (time) => {
 |--------------------------------------------------------------------------
 */
 
-const stopScheduler = () => {
+const stopTasks = async (tasks) => {
 
-    scheduledTasks.forEach(task => {
+    for (const task of tasks) {
 
         try {
 
-            task.stop();
+            await Promise.resolve(task.stop());
 
             if (typeof task.destroy === "function")
-                task.destroy();
+                await Promise.resolve(task.destroy());
 
         } catch (err) {
 
@@ -109,33 +109,19 @@ const stopScheduler = () => {
 
         }
 
-    });
+    }
+
+};
+
+const stopScheduler = async () => {
+
+    await stopTasks(scheduledTasks);
 
     scheduledTasks = [];
 
 };
 
-/*
-|--------------------------------------------------------------------------
-| Register Scheduler
-|--------------------------------------------------------------------------
-*/
-
-export const startAttendanceScheduler = async () => {
-
-    stopScheduler();
-
-    const config =
-        await PlatformConfig.getSingleton();
-
-    const policy =
-        config.attendancePolicy || {};
-
-    /*
-    |--------------------------------------------------------------------------
-    | Calculate Schedule Times
-    |--------------------------------------------------------------------------
-    */
+export const getAttendanceScheduleTimes = (policy = {}) => {
 
     const clockInReminderTime =
         offsetTime(
@@ -158,15 +144,55 @@ export const startAttendanceScheduler = async () => {
     const midnightTime =
         policy.midnightProcessingTime || "00:00";
 
+    timeToCron(clockInReminderTime);
+    timeToCron(clockOutReminderTime);
+    timeToCron(midnightTime);
+
+    return {
+        clockInReminderTime,
+        clockOutReminderTime,
+        midnightTime
+    };
+
+};
+
+/*
+|--------------------------------------------------------------------------
+| Register Scheduler
+|--------------------------------------------------------------------------
+*/
+
+export const startAttendanceScheduler = async () => {
+
+    const config =
+        await PlatformConfig.getSingleton();
+
+    const policy =
+        config.attendancePolicy || {};
+
+    /*
+    |--------------------------------------------------------------------------
+    | Calculate Schedule Times
+    |--------------------------------------------------------------------------
+    */
+
+    const {
+        clockInReminderTime,
+        clockOutReminderTime,
+        midnightTime
+    } = getAttendanceScheduleTimes(policy);
+
+    const newScheduledTasks = [];
+
     /*
     |--------------------------------------------------------------------------
     | Register Clock In Reminder
     |--------------------------------------------------------------------------
     */
 
-    scheduledTasks.push(
+    newScheduledTasks.push(
 
-        cron.schedule(
+        cron.createTask(
 
             timeToCron(clockInReminderTime),
 
@@ -188,9 +214,9 @@ export const startAttendanceScheduler = async () => {
     |--------------------------------------------------------------------------
     */
 
-    scheduledTasks.push(
+    newScheduledTasks.push(
 
-        cron.schedule(
+        cron.createTask(
 
             timeToCron(clockOutReminderTime),
 
@@ -212,9 +238,9 @@ export const startAttendanceScheduler = async () => {
     |--------------------------------------------------------------------------
     */
 
-    scheduledTasks.push(
+    newScheduledTasks.push(
 
-        cron.schedule(
+        cron.createTask(
 
             timeToCron(midnightTime),
 
@@ -229,6 +255,29 @@ export const startAttendanceScheduler = async () => {
         )
 
     );
+
+    const startedTasks = [];
+
+    try {
+
+        for (const task of newScheduledTasks) {
+
+            await Promise.resolve(task.start());
+            startedTasks.push(task);
+
+        }
+
+    } catch (err) {
+
+        await stopTasks(startedTasks);
+
+        throw err;
+
+    }
+
+    await stopScheduler();
+
+    scheduledTasks = newScheduledTasks;
 
     console.log("========================================");
     console.log("Attendance Scheduler Started");
