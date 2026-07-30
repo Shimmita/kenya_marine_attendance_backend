@@ -2050,7 +2050,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
       await user.save();
 
-      // send message clock in
+      // send message clock
       await SendMessageNow(
         user,
         `Dear ${user.name}, you have successfully checked in at ${user.station} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}.We wish you a productive day.`
