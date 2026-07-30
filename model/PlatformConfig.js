@@ -207,6 +207,14 @@ const defaultNotificationReminders = {
     internRegMessage: `Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your email ({email}) and the default password ${process.env.DEFAULT_PASSWORD_SUFFIX} to start clocking and recording your attendance. Please change your password after your first login.`,
     staffRegMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your staff portal credentials to start clocking and recording your attendance.',
     authorisedClockOut: 'Dear {firstName}, you have been authorised to clock out outside of your assigned station premises.',
+    clockOutsideGrantedMessage: 'Dear {firstName}, you have been granted permission to clock outside of your assigned station "{station}" from {startDate} to {endDate} for the reason "{reason}".',
+    clockOutsideRevokedMessage: 'Dear {firstName}, your permission to clock outside of your assigned station "{station}" has been revoked. Please follow the standard clocking procedures.',
+    accountActivatedMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been activated. You can now access attendance services.',
+    accountDeactivatedMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been deactivated. Please contact HR for assistance.',
+    leaveSubmittedMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been submitted successfully and is awaiting review.',
+    leaveApprovedMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been approved.',
+    leaveRejectedMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been rejected. Please contact your supervisor or HR for clarification.',
+    leaveCancelledMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been cancelled successfully.',
     missedClockOutMessage: "Dear {firstName}, KMFRI attendance system records indicate you forgot to clock out yesterday.",
     absentMessage: "Dear {firstName}, KMFRI attendance system records indicate that you did not report attendance yesterday.",
 
@@ -288,6 +296,14 @@ const platformConfigSchema = new mongoose.Schema({
         internRegMessage: { type: String, default: defaultNotificationReminders.internRegMessage },
         staffRegMessage: { type: String, default: defaultNotificationReminders.staffRegMessage },
         authorisedClockOut: { type: String, default: defaultNotificationReminders.authorisedClockOut },
+        clockOutsideGrantedMessage: { type: String, default: defaultNotificationReminders.clockOutsideGrantedMessage },
+        clockOutsideRevokedMessage: { type: String, default: defaultNotificationReminders.clockOutsideRevokedMessage },
+        accountActivatedMessage: { type: String, default: defaultNotificationReminders.accountActivatedMessage },
+        accountDeactivatedMessage: { type: String, default: defaultNotificationReminders.accountDeactivatedMessage },
+        leaveSubmittedMessage: { type: String, default: defaultNotificationReminders.leaveSubmittedMessage },
+        leaveApprovedMessage: { type: String, default: defaultNotificationReminders.leaveApprovedMessage },
+        leaveRejectedMessage: { type: String, default: defaultNotificationReminders.leaveRejectedMessage },
+        leaveCancelledMessage: { type: String, default: defaultNotificationReminders.leaveCancelledMessage },
         missedClockOutMessage: { type: String, default: defaultNotificationReminders.missedClockOutMessage },
         absentMessage: { type: String, default: defaultNotificationReminders.absentMessage },
         channels: { type: [String], default: defaultNotificationReminders.channels },
@@ -502,6 +518,12 @@ platformConfigSchema.statics.getSingleton = async function () {
         if (!Array.isArray(cfg.themes) || cfg.themes.length === 0) {
             cfg.themes = defaultThemes;
             changed = true;
+        }
+        for (const [key, value] of Object.entries(defaultNotificationReminders)) {
+            if (typeof cfg.notificationReminders?.[key] === 'undefined') {
+                cfg.notificationReminders[key] = value;
+                changed = true;
+            }
         }
         if (!cfg.activeThemeName) {
             cfg.activeThemeName = defaultThemes[0].name;

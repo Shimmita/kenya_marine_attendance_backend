@@ -144,6 +144,57 @@ const createAuditLog = async ({
   }
 };
 
+const formatLeaveDate = (date) => {
+  if (!date) return "";
+  return new Date(date).toLocaleDateString("en-KE", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    timeZone: "Africa/Nairobi",
+  });
+};
+
+const sendLeaveSms = async (user, message) => {
+  try {
+    if (!user?.phone) {
+      console.warn(`Leave SMS skipped (${user?.email || "unknown"}): missing phone`);
+      return false;
+    }
+
+    await SendMessageNow(user, message);
+    return true;
+  } catch (error) {
+    console.error(`Leave SMS failed (${user?.email || "unknown"}):`, error?.message || error);
+    return false;
+  }
+};
+
+const buildLeaveSmsMessage = (user, leave, event) => {
+  const firstName = user?.name?.split(" ")?.[0] || "User";
+  const leaveType = leave?.type || "leave";
+  const start = formatLeaveDate(leave?.startDate);
+  const end = formatLeaveDate(leave?.endDate);
+  const range = start && end ? ` from ${start} to ${end}` : "";
+
+  if (event === "submitted") {
+    return `Dear ${firstName}, your ${leaveType} request${range} has been submitted successfully and is awaiting review.`;
+  }
+
+  if (event === "approved") {
+    return `Dear ${firstName}, your ${leaveType} request${range} has been approved.`;
+  }
+
+  if (event === "rejected") {
+    return `Dear ${firstName}, your ${leaveType} request${range} has been rejected. Please contact your supervisor or HR for clarification.`;
+  }
+
+  if (event === "cancelled") {
+    return `Dear ${firstName}, your ${leaveType} request${range} has been cancelled successfully.`;
+  }
+
+  return `Dear ${firstName}, your leave request has been updated.`;
+};
+
 
 const getUserAuthenticators = (user) => {
   const authenticators = Array.isArray(user?.authenticators) ? [...user.authenticators] : [];
@@ -1908,7 +1959,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       expectedChallenge,
       expectedOrigin: getExpectedOrigin(),
       expectedRPID: getRpID(),
-      // ✅ v10+ shape: `credential` not `authenticator`, `id` not `credentialID`,
+      //  v10+ shape: `credential` not `authenticator`, `id` not `credentialID`,
       //    `publicKey` (Uint8Array) not `credentialPublicKey` (Buffer)
       credential: {
         id: matchedAuthenticator.credentialID,                                         // base64url string
@@ -1999,6 +2050,12 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
       await user.save();
 
+      // send message clock in
+      await SendMessageNow(
+        user,
+        `Dear ${user.name}, you have successfully checked in at ${user.station} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}.We wish you a productive day.`
+      );
+
       await createAuditLog({
         req,
         category: "attendance",
@@ -2054,6 +2111,12 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       user.isToClockOut = false;
 
       await user.save();
+
+      // send message clock out
+      await SendMessageNow(
+        user,
+        `Dear ${user.name}, you have successfully checked out from ${user.station} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}. Thank you for your service today.`
+      );
 
       await createAuditLog({
         req,
@@ -4196,7 +4259,16 @@ app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
       return res.status(400).json("end date should be higher than start date");
     }
 
-    const leave = await Leave.create(req.body);
+    const leave = await Leave.create({
+      ...req.body,
+      email: currentUser.email,
+      status: "pending",
+    });
+
+    await sendLeaveSms(
+      currentUser,
+      buildLeaveSmsMessage(currentUser, leave, "submitted")
+    );
 
     await createAuditLog({
       req,
@@ -4297,34 +4369,83 @@ app.get(`${BASE_ROUTE}/supervisor/leaves`, async (req, res) => {
 // update the leave
 app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
 
-  const currentUser = await User.findById(req.session.userID);
-  if (!currentUser)
-    return res.status(404).json({ message: "Current user not found" });
-
   try {
+
+    if (!req.session?.isOnline) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank)) {
+      return res.status(403).json({ message: "Unauthorised user" });
+    }
+
+    const existingLeave = await Leave.findById(req.params.id);
+    if (!existingLeave) {
+      return res.status(404).json({ message: "Leave request not found" });
+    }
+
+    const allowedUpdates = {};
+    if (typeof req.body.status !== "undefined") {
+      allowedUpdates.status = req.body.status;
+    }
+
     const updatedLeave = await Leave.findByIdAndUpdate(
       req.params.id,
-      req.body,
-      { new: true }
+      allowedUpdates,
+      { new: true, runValidators: true }
     );
 
-    const email = updatedLeave.email
+    const targetUser = await User.findOne({ email: updatedLeave.email });
+    if (!targetUser) {
+      return res.status(404).json({ message: "Leave owner not found" });
+    }
 
-    // fetch the user account connected to the email
-    const targetUser = await User.findOne({ email })
+    if (updatedLeave.status === "approved") {
+      targetUser.isOnLeave = true;
+      await targetUser.save();
+    }
 
-    // update user on leave status to true
-    targetUser.isOnLeave = true
+    if (updatedLeave.status === "rejected" && existingLeave.status === "approved") {
+      const otherApprovedLeave = await Leave.exists({
+        _id: { $ne: updatedLeave._id },
+        email: updatedLeave.email,
+        status: "approved",
+        endDate: { $gte: new Date() },
+      });
 
-    // save updated user
-    await targetUser.save()
+      if (!otherApprovedLeave) {
+        targetUser.isOnLeave = false;
+        await targetUser.save();
+      }
+    }
 
-    // send message to the user that they are on leave
-    await SendMessageNow(targetUser, `Dear ${targetUser.name}, Your leave request has been approved.`)
+    if (
+      ["approved", "rejected"].includes(updatedLeave.status) &&
+      existingLeave.status !== updatedLeave.status
+    ) {
+      await sendLeaveSms(
+        targetUser,
+        buildLeaveSmsMessage(targetUser, updatedLeave, updatedLeave.status)
+      );
+    }
 
-    // create audit log
-    // metadata
-    const { startDate, endDate, status } = updatedLeave
+    await createAuditLog({
+      req,
+      category: "leave",
+      action: `leave.request_${updatedLeave.status}`,
+      description: `Leave request ${updatedLeave.status}`,
+      actor: currentUser,
+      target: targetUser,
+      metadata: {
+        leaveId: updatedLeave._id.toString(),
+        previousStatus: existingLeave.status,
+        status: updatedLeave.status,
+      },
+    });
 
     res.status(200).json(updatedLeave);
   } catch (error) {
@@ -4336,7 +4457,68 @@ app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
 // delete leave
 app.delete(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
   try {
+    if (!req.session?.isOnline) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser) {
+      return res.status(404).json({ message: "Current user not found" });
+    }
+
+    const leave = await Leave.findById(req.params.id);
+    if (!leave) {
+      return res.status(404).json({ message: "Leave request not found" });
+    }
+
+    const canDelete =
+      leave.email === currentUser.email ||
+      ["admin", "hr", "superadmin"].includes(currentUser.rank);
+
+    if (!canDelete) {
+      return res.status(403).json({ message: "You cannot delete this leave request" });
+    }
+
+    const targetUser =
+      leave.email === currentUser.email
+        ? currentUser
+        : await User.findOne({ email: leave.email });
+
     await Leave.findByIdAndDelete(req.params.id);
+
+    if (targetUser) {
+      if (leave.status === "approved") {
+        const otherApprovedLeave = await Leave.exists({
+          email: leave.email,
+          status: "approved",
+          endDate: { $gte: new Date() },
+        });
+
+        if (!otherApprovedLeave) {
+          targetUser.isOnLeave = false;
+          await targetUser.save();
+        }
+      }
+
+      await sendLeaveSms(
+        targetUser,
+        buildLeaveSmsMessage(targetUser, leave, "cancelled")
+      );
+    }
+
+    await createAuditLog({
+      req,
+      category: "leave",
+      action: "leave.request_cancelled",
+      description: "Leave request cancelled",
+      actor: currentUser,
+      target: targetUser || null,
+      metadata: {
+        leaveId: leave._id.toString(),
+        status: leave.status,
+      },
+    });
+
     res.status(200).json({ message: "Leave deleted successfully" });
   } catch (error) {
     res.status(400).send(error.message);
@@ -5508,5 +5690,3 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
   }
 
 });
-
-
