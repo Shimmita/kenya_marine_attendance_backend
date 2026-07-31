@@ -37,6 +37,7 @@ import {
   isWeekend
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
+import { formatTime } from "./util/Date.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -107,6 +108,24 @@ const sanitizeUserResponse = (user) => {
   delete safeUser.authenticators;
   return safeUser;
 };
+
+const nowTime = new Date();
+
+const formattedDate = nowTime.toLocaleDateString("en-KE", {
+  weekday: "long",
+  year: "numeric",
+  month: "long",
+  day: "numeric",
+  timeZone: "Africa/Nairobi",
+});
+
+const formattedTime = nowTime.toLocaleTimeString("en-KE", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false, 
+  timeZone: "Africa/Nairobi",
+});
 
 const buildAuditRequestContext = (req) => ({
   ipAddress:
@@ -2053,7 +2072,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // send message clock
       await SendMessageNow(
         user,
-        `Dear ${user.name}, you have successfully checked in at ${user.station} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}.We wish you a productive day.`
+        `Dear ${user.name}, you have successfully checked in at ${user.station} on ${formattedDate} at ${formattedTime}.We wish you a productive day.`
       );
 
       await createAuditLog({
@@ -2115,7 +2134,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // send message clock out
       await SendMessageNow(
         user,
-        `Dear ${user.name}, you have successfully checked out from ${user.station} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}. Thank you for your service today.`
+        `Dear ${user.name}, you have successfully checked out from ${user.station} on ${formattedDate} at ${formattedTime}. Thank you for your service today.`
       );
 
       await createAuditLog({
