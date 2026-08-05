@@ -17,6 +17,8 @@ import os from "os";
 import sharp from "sharp";
 import validator from "validator";
 import startAttendanceScheduler, { getAttendanceScheduleTimes, refreshAttendanceScheduler } from "./cron/scheduler.js";
+import registerClockInReminder from "./cron/clockInReminder.cron.js";
+import registerClockOutReminder from "./cron/clockOutReminder.cron.js";
 import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
@@ -65,6 +67,7 @@ const PORT = process.env.PORT || 5000;
 const BASE_ROUTE = process.env.BASE_ROUTE;
 const environment = process.env.ENVIRONMENT_MODE;
 const PRIVILEGED_AUDIT_RANKS = ["admin", "hr", "superadmin"];
+const REMINDER_TRIGGER_SECRET = process.env.REMINDER_TRIGGER_SECRET || (environment !== "production" ? "kmfri-reminder-trigger-dev" : "");
 const MAX_USER_DEVICES = 2;
 const CLIENT_AUDIT_ACTIONS = {
   "attendance.history_exported": {
@@ -77,6 +80,319 @@ const hashResetCode = (code) =>
   crypto.createHash("sha256").update(String(code)).digest("hex");
 const generateResetCode = () =>
   String(Math.floor(100000 + Math.random() * 900000));
+
+const ANALYTICS_ACCESSIBLE_RANKS = ["admin", "hr", "ceo", "superadmin", "supervisor"];
+const ANALYTICS_FULL_ACCESS_RANKS = ["admin", "hr", "ceo", "superadmin"];
+
+const getRequestedDateRange = (query = {}) => {
+  const startDate = query.startDate
+    ? new Date(query.startDate)
+    : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+
+  const endDate = query.endDate ? new Date(query.endDate) : new Date();
+  endDate.setHours(23, 59, 59, 999);
+
+  return { startDate, endDate };
+};
+
+const isReminderTriggerAuthorized = (req) => {
+  if (!REMINDER_TRIGGER_SECRET) {
+    return false;
+  }
+
+  const provided = String(req.get("x-reminder-trigger-secret") || req.query.secret || "");
+  if (!provided) {
+    return false;
+  }
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(REMINDER_TRIGGER_SECRET), Buffer.from(provided));
+  } catch {
+    return false;
+  }
+};
+
+const getAnalyticsContext = async (req) => {
+  if (!req.session?.isOnline) {
+    const error = new Error("Unauthorized Access");
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const user = await User.findById(req.session.userID).lean();
+  if (!user) {
+    const error = new Error("User not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const rank = String(user.rank || "").toLowerCase();
+  const role = String(user.role || "").toLowerCase();
+
+  if (!ANALYTICS_ACCESSIBLE_RANKS.includes(rank)) {
+    const error = new Error("Unauthorized Access");
+    error.statusCode = 403;
+    throw error;
+  }
+
+  return {
+    user,
+    rank,
+    role,
+    isSupervisor: rank === "supervisor",
+    canAccessAll: ANALYTICS_FULL_ACCESS_RANKS.includes(rank),
+    department: user.department || "",
+    station: user.station || "",
+  };
+};
+
+const buildAnalyticsUserFilter = (context, query = {}) => {
+  const userFilter = {};
+
+  if (context.isSupervisor) {
+    if (context.department) userFilter.department = context.department;
+    if (context.station) userFilter.station = context.station;
+  } else {
+    if (query.department && query.department !== "all" && query.department !== "") {
+      userFilter.department = query.department;
+    }
+    if (query.station && query.station !== "all" && query.station !== "") {
+      userFilter.station = query.station;
+    }
+  }
+
+  if (query.role && query.role !== "all" && query.role !== "") {
+    userFilter.role = query.role;
+  }
+
+  if (query.rank && query.rank !== "all" && query.rank !== "") {
+    userFilter.rank = query.rank;
+  }
+
+  return userFilter;
+};
+
+const buildAnalyticsDataset = async (context, query = {}) => {
+  const { startDate, endDate } = getRequestedDateRange(query);
+  const userFilter = buildAnalyticsUserFilter(context, query);
+
+  const users = await User.find(
+    userFilter,
+    "email name department station role rank employeeId isAccountActive isOnLeave hasClockedIn isToClockOut canClockOutside outsideClockingDetails"
+  )
+    .lean();
+
+  const emails = users.map((entry) => entry.email).filter(Boolean);
+
+  const [records, leaveRecords] = await Promise.all([
+    Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: startDate, $lte: endDate },
+    }).lean(),
+    Leave.find({
+      email: { $in: emails },
+      startDate: { $lte: endDate },
+      endDate: { $gte: startDate },
+    }).lean(),
+  ]);
+
+  return {
+    users,
+    records,
+    leaveRecords,
+    startDate,
+    endDate,
+    userFilter,
+    context,
+  };
+};
+
+const buildAnalyticsView = async (view, context, query = {}) => {
+  const { users, records, leaveRecords, startDate, endDate } = await buildAnalyticsDataset(context, query);
+  const totalStaff = users.length;
+  const today = new Date();
+  const todayKey = formatDateKey(today);
+
+  const employeeByEmail = new Map(users.map((user) => [user.email, user]));
+
+  const recordGroups = records.reduce((acc, record) => {
+    const key = record.email || "unknown";
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(record);
+    return acc;
+  }, {});
+
+  const todayRecords = records.filter((record) => record?.clock_in && formatDateKey(record.clock_in) === todayKey);
+  const todayPresent = new Set(todayRecords.map((record) => record.email).filter(Boolean));
+
+  const approvedLeaveToday = leaveRecords.filter((leave) => {
+    const status = String(leave.status || "").toLowerCase();
+    const todayValue = new Date(today);
+    todayValue.setHours(0, 0, 0, 0);
+    const start = new Date(leave.startDate);
+    const end = new Date(leave.endDate);
+    end.setHours(23, 59, 59, 999);
+    return status === "approved" && todayValue >= start && todayValue <= end;
+  });
+
+  const onLeaveCount = new Set(approvedLeaveToday.map((leave) => leave.email)).size;
+  const presentCount = todayPresent.size;
+  const absentCount = Math.max(totalStaff - presentCount - onLeaveCount, 0);
+
+  const lateRecords = records.filter((record) => record?.isLate);
+  const earlyDepartureRecords = records.filter((record) => record?.clock_out && record?.clock_in && (new Date(record.clock_out) - new Date(record.clock_in)) / (1000 * 60 * 60) < 8);
+  const outsideClockingRecords = records.filter((record) => record?.clockedOutSide || record?.outsideLocation);
+  const missingClockOut = records.filter((record) => !record.clock_out);
+  const missingClockIn = records.filter((record) => !record.clock_in);
+
+  const departmentBreakdown = users.reduce((acc, user) => {
+    const key = user.department || "Unassigned";
+    if (!acc[key]) {
+      acc[key] = { department: key, totalStaff: 0, present: 0, late: 0, hours: 0, overtime: 0 };
+    }
+    acc[key].totalStaff += 1;
+    const userRecords = recordGroups[user.email] || [];
+    const uniqueDays = new Set(userRecords.map((entry) => formatDateKey(entry.clock_in)).filter(Boolean));
+    acc[key].present += uniqueDays.size;
+    acc[key].late += userRecords.filter((entry) => entry.isLate).length;
+    acc[key].hours += userRecords.reduce((sum, entry) => {
+      if (!entry.clock_out) return sum;
+      return sum + (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60);
+    }, 0);
+    acc[key].overtime += userRecords.reduce((sum, entry) => {
+      if (!entry.clock_out) return sum;
+      const hours = (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60);
+      return sum + Math.max(hours - 8, 0);
+    }, 0);
+    return acc;
+  }, {});
+
+  const rows = Object.values(departmentBreakdown).map((entry) => ({
+    ...entry,
+    attendanceRate: entry.totalStaff ? Number((entry.present / Math.max(entry.totalStaff, 1)) * 100).toFixed(1) : 0,
+    overtimeHours: Number(entry.overtime).toFixed(1),
+  }));
+
+  const deptPerformance = rows.sort((a, b) => b.attendanceRate - a.attendanceRate);
+
+  const topPerformers = users
+    .map((user) => {
+      const userRecords = recordGroups[user.email] || [];
+      const hours = userRecords.reduce((sum, entry) => {
+        if (!entry.clock_out) return sum;
+        return sum + (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60);
+      }, 0);
+      const lateCount = userRecords.filter((entry) => entry.isLate).length;
+      return {
+        name: user.name,
+        email: user.email,
+        department: user.department || "Unassigned",
+        station: user.station || "Unassigned",
+        hours: Number(hours).toFixed(1),
+        lateCount,
+        score: Number(hours - lateCount * 1.5).toFixed(1),
+      };
+    })
+    .sort((a, b) => Number(b.score) - Number(a.score))
+    .slice(0, 8);
+
+  const frequentAbsentees = users
+    .map((user) => {
+      const userRecords = recordGroups[user.email] || [];
+      const presentDays = new Set(userRecords.map((entry) => formatDateKey(entry.clock_in)).filter(Boolean)).size;
+      const expectedDays = Math.max(1, Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1);
+      const absentDays = Math.max(expectedDays - presentDays, 0);
+      return { name: user.name, email: user.email, department: user.department || "Unassigned", absentDays };
+    })
+    .filter((entry) => entry.absentDays > 0)
+    .sort((a, b) => b.absentDays - a.absentDays)
+    .slice(0, 8);
+
+  const summary = {
+    scope: context.isSupervisor ? "supervisor" : "organization",
+    department: context.department || null,
+    station: context.station || null,
+    dateRange: {
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+    },
+    overview: {
+      totalStaff,
+      presentToday: presentCount,
+      absentToday: absentCount,
+      onLeave: onLeaveCount,
+      attendanceRate: totalStaff ? Number((presentCount / totalStaff) * 100).toFixed(1) : 0,
+      punctualityRate: totalStaff ? Number(((presentCount - lateRecords.length) / Math.max(presentCount, 1)) * 100).toFixed(1) : 0,
+      averageWorkingHours: records.length ? Number(records.reduce((sum, entry) => sum + (entry.clock_out ? (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60) : 0), 0) / records.length).toFixed(1) : 0,
+      totalOvertime: Number(records.reduce((sum, entry) => {
+        if (!entry.clock_out) return sum;
+        const hours = (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60);
+        return sum + Math.max(hours - 8, 0);
+      }, 0)).toFixed(1),
+    },
+    departmentPerformance: deptPerformance,
+    workforceBehaviour: {
+      lateArrivals: lateRecords.slice(0, 8).map((entry) => ({
+        name: employeeByEmail.get(entry.email)?.name || entry.name || entry.email,
+        email: entry.email,
+        department: employeeByEmail.get(entry.email)?.department || entry.department || "Unassigned",
+        station: employeeByEmail.get(entry.email)?.station || entry.station || "Unassigned",
+        clockIn: entry.clock_in,
+      })),
+      earlyDepartures: earlyDepartureRecords.slice(0, 8).map((entry) => ({
+        name: employeeByEmail.get(entry.email)?.name || entry.name || entry.email,
+        email: entry.email,
+        department: employeeByEmail.get(entry.email)?.department || entry.department || "Unassigned",
+        station: employeeByEmail.get(entry.email)?.station || entry.station || "Unassigned",
+        clockOut: entry.clock_out,
+      })),
+      absenteeism: frequentAbsentees,
+      outsideClocking: outsideClockingRecords.slice(0, 8).map((entry) => ({
+        name: employeeByEmail.get(entry.email)?.name || entry.name || entry.email,
+        email: entry.email,
+        department: employeeByEmail.get(entry.email)?.department || entry.department || "Unassigned",
+        station: employeeByEmail.get(entry.email)?.station || entry.station || "Unassigned",
+        clockIn: entry.clock_in,
+      })),
+    },
+    compliance: {
+      missingClockIns: missingClockIn.slice(0, 8),
+      missingClockOuts: missingClockOut.slice(0, 8),
+      missingBiometrics: users.filter((user) => !user.doneBiometric).slice(0, 8),
+      openSessions: records.filter((record) => !record.clock_out).slice(0, 8),
+      outsideClockingAuthorization: users.filter((user) => user.canClockOutside).slice(0, 8),
+    },
+    employeeRankings: {
+      topPerformers,
+      mostImproved: topPerformers.slice(0, 4),
+      repeatLateEmployees: lateRecords.reduce((acc, record) => {
+        const existing = acc.find((entry) => entry.email === record.email);
+        if (existing) existing.count += 1; else acc.push({ email: record.email, name: employeeByEmail.get(record.email)?.name || record.name || record.email, count: 1 });
+        return acc;
+      }, []).sort((a, b) => b.count - a.count).slice(0, 8),
+      frequentAbsentees,
+    },
+    reports: {
+      availableFormats: ["PDF", "Excel", "CSV", "Print"],
+      scopeLabel: context.isSupervisor ? `${context.department} / ${context.station}` : "Entire organization",
+    },
+  };
+
+  if (view === "kpis") return summary.overview;
+  if (view === "trends") return { data: summary.departmentPerformance };
+  if (view === "departments") return summary.departmentPerformance;
+  if (view === "stations") return { stations: summary.departmentPerformance };
+  if (view === "late-arrivals") return summary.workforceBehaviour.lateArrivals;
+  if (view === "early-departures") return summary.workforceBehaviour.earlyDepartures;
+  if (view === "absenteeism") return summary.workforceBehaviour.absenteeism;
+  if (view === "compliance") return summary.compliance;
+  if (view === "outside-clocking") return summary.workforceBehaviour.outsideClocking;
+  if (view === "workforce") return summary.workforceBehaviour;
+  if (view === "productivity") return summary.employeeRankings.topPerformers;
+  if (view === "executive") return summary;
+
+  return summary;
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -344,7 +660,7 @@ app.use(
     name: process.env.SESSION_NAME,
     store,
     cookie: {
-      maxAge: 60 * 20 * 1000,
+      maxAge: 24 * 60 * 60 * 1000,
       secure: environment !== "SANDBOX",
       sameSite: environment === "SANDBOX" ? "lax" : "none",
     },
@@ -354,6 +670,35 @@ app.use(
 // ─── Auth check ───────────────────────────────────────────────────────────────
 
 app.use(BASE_ROUTE, clearExpiredTemporaryAccountForSession);
+
+app.post(`${BASE_ROUTE}/notifications/trigger-reminders`, async (req, res) => {
+  if (!isReminderTriggerAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized reminder trigger" });
+  }
+
+  try {
+    const results = await Promise.allSettled([
+      registerClockInReminder(),
+      registerClockOutReminder(),
+    ]);
+
+    const failures = results.filter((result) => result.status === "rejected");
+
+    return res.json({
+      success: true,
+      triggered: true,
+      results: results.map((result, index) => ({
+        job: index === 0 ? "clock_in_reminder" : "clock_out_reminder",
+        status: result.status,
+        reason: result.status === "rejected" ? result.reason?.message || "Unknown error" : null,
+      })),
+      failures: failures.length,
+    });
+  } catch (error) {
+    console.error("Reminder trigger failed:", error);
+    return res.status(500).json({ success: false, message: "Reminder trigger failed" });
+  }
+});
 
 app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
   if (req.session?.isOnline) {
@@ -2395,13 +2740,133 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
 
 
 
+// ANALYTICS
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("kpis", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("trends", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("departments", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("stations", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("late-arrivals", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("early-departures", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("absenteeism", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("compliance", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/outside-clocking`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("outside-clocking", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/workforce`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("workforce", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/productivity`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("productivity", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/executive`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const payload = await buildAnalyticsView("executive", context, req.query);
+    res.status(200).json(payload);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+  }
+});
+
 // ADMIN, SUPERVISOR,CEO,HR LEVEL overall org stats
 
 // Admin Overall Stats
 app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
   try {
-    if (!req.session.isOnline)
-      return res.status(401).json({ message: "Unauthorized" });
+    const context = await getAnalyticsContext(req);
 
     // get the query
     const {
@@ -2418,15 +2883,10 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     const workingDaysSoFar =
       Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
 
-    const userFilter = {};
-
-    if (station) {
-      userFilter.station = station;
-    }
-
-    if (department) {
-      userFilter.department = department;
-    }
+    const userFilter = buildAnalyticsUserFilter(context, {
+      station,
+      department,
+    });
 
     const allUsers = await User.find(
       userFilter,
@@ -2690,12 +3150,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
 app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
   try {
-
-    if (!req.session.isOnline) {
-      return res.status(401).json({
-        message: "Unauthorized Access"
-      });
-    }
+    const context = await getAnalyticsContext(req);
 
     const {
       station,
@@ -2735,23 +3190,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
     // User Query
     //----------------------------------------------------
 
-    const userQuery = {};
-
-    if (role && role !== "all") {
-      userQuery.role = role;
-    }
-
-    if (rank && rank !== "all") {
-      userQuery.rank = rank;
-    }
-
-    if (station && station !== "all") {
-      userQuery.station = station;
-    }
-
-    if (department && department !== "all") {
-      userQuery.department = department;
-    }
+    const userQuery = buildAnalyticsUserFilter(context, {
+      role,
+      rank,
+      station,
+      department,
+    });
 
     const users = await User.find(
       userQuery,
@@ -2833,11 +3277,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 
 app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
   try {
-    if (!req.session.isOnline) {
-      return res.status(401).json({
-        message: "Unauthorized Access",
-      });
-    }
+    const context = await getAnalyticsContext(req);
 
     const {
       startDate,
@@ -2894,19 +3334,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     // User Filters
     //---------------------------------------------------------
 
-    const userQuery = {};
-
-    if (station && station !== "all")
-      userQuery.station = station;
-
-    if (department && department !== "all")
-      userQuery.department = department;
-
-    if (role && role !== "all")
-      userQuery.role = role;
-
-    if (rank && rank !== "all")
-      userQuery.rank = rank;
+    const userQuery = buildAnalyticsUserFilter(context, {
+      station,
+      department,
+      role,
+      rank,
+    });
 
     //---------------------------------------------------------
     // Users
