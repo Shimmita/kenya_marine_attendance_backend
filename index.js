@@ -16,9 +16,9 @@ import mongoose from "mongoose";
 import os from "os";
 import sharp from "sharp";
 import validator from "validator";
-import startAttendanceScheduler, { getAttendanceScheduleTimes, refreshAttendanceScheduler } from "./cron/scheduler.js";
 import registerClockInReminder from "./cron/clockInReminder.cron.js";
 import registerClockOutReminder from "./cron/clockOutReminder.cron.js";
+import startAttendanceScheduler, { getAttendanceScheduleTimes, refreshAttendanceScheduler } from "./cron/scheduler.js";
 import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
@@ -39,7 +39,6 @@ import {
   isWeekend
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
-import { formatTime } from "./util/Date.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -78,8 +77,30 @@ const CLIENT_AUDIT_ACTIONS = {
 const PASSWORD_RESET_CODE_TTL_MS = 1000 * 60 * 20;
 const hashResetCode = (code) =>
   crypto.createHash("sha256").update(String(code)).digest("hex");
-const generateResetCode = () =>
-  String(Math.floor(100000 + Math.random() * 900000));
+
+const generateResetCode = (length = 8) => {
+  const chars =
+    "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789@#$%";
+  const bytes = crypto.randomBytes(length);
+
+  return Array.from(bytes)
+    .map(b => chars[b % chars.length])
+    .join("");
+};
+
+const maskPhone = (phone) => {
+  if (!phone) return "";
+
+  const digits = String(phone).replace(/\D/g, "");
+
+  if (digits.length < 8) return phone;
+
+  return (
+    digits.substring(0, 8) +
+    "****" +
+    digits.substring(digits.length - 2)
+  );
+};
 
 const ANALYTICS_ACCESSIBLE_RANKS = ["admin", "hr", "ceo", "superadmin", "supervisor"];
 const ANALYTICS_FULL_ACCESS_RANKS = ["admin", "hr", "ceo", "superadmin"];
@@ -439,7 +460,7 @@ const formattedTime = nowTime.toLocaleTimeString("en-KE", {
   hour: "2-digit",
   minute: "2-digit",
   second: "2-digit",
-  hour12: false, 
+  hour12: false,
   timeZone: "Africa/Nairobi",
 });
 
@@ -1302,7 +1323,6 @@ const authenticateWithLDAP = async (userId, password) => {
             process.env.LDAP_BIND_PASSWORD,
             (err) => {
               if (err) {
-                console.log("Service bind failed:", err.message);
                 return reject(new Error("Invalid credentials!"));
               }
 
@@ -1331,7 +1351,6 @@ const authenticateWithLDAP = async (userId, password) => {
                     await tryBind(userDN);
                     resolve({ success: true, method: "SEARCH" });
                   } catch (err) {
-                    console.log("Final bind failed:", err.message);
                     reject(new Error("Invalid credentials!"));
                   }
                 });
@@ -1444,331 +1463,128 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
 });
 
 
-
-// ─── Password Reset ───────────────────────────────────────────────────────────
-
 app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
   try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
+    const email = String(req.body?.email || "")
+      .trim()
+      .toLowerCase();
 
-    if (!email) throw new Error("Email is required");
-    if (!validator.isEmail(email)) throw new Error("Invalid email");
+    if (!email)
+      throw new Error("Email is required");
+
+    if (!validator.isEmail(email))
+      throw new Error("Invalid email address.");
 
     const user = await User.findOne({ email });
+
     if (!user) {
       await createAuditLog({
         req,
         category: "password_reset",
         action: "password_reset.request_rejected",
-        description: "Password reset requested for unknown email",
-        actor: { email, name: email },
-        metadata: { reason: "user_not_found" },
+        description: "Password reset requested for unknown email.",
+        actor: {
+          email,
+          name: email,
+        },
+        metadata: {
+          reason: "user_not_found",
+        },
         status: "failed",
       });
-      throw new Error("No account was found for that email address");
+
+      throw new Error("No account was found for that email address.");
     }
 
-    // Only interns and attachees may use this password reset flow; staff/employees use AD
+    // AD users cannot self-reset
     if (user.role === "employee") {
       await createAuditLog({
         req,
         category: "password_reset",
         action: "password_reset.request_rejected",
-        description: "Password reset requested for AD-managed account",
+        description: "Password reset requested for AD-managed account.",
         actor: user,
         target: user,
-        metadata: { reason: "ad_managed_account" },
-        status: "failed",
-      });
-      return res.status(403).json({ message: "This account is managed by Active Directory. Contact ICT support to reset your password." });
-    }
-
-    const resetCode = generateResetCode();
-    const expiresAt = new Date(Date.now() + PASSWORD_RESET_CODE_TTL_MS);
-    const existing = await PasswordReset.findOne({ email });
-
-    // If there's an active (non-expired) reset request, notify the requester
-    if (existing && existing.expiresAt && existing.expiresAt.getTime() > Date.now()) {
-      await createAuditLog({
-        req,
-        category: "password_reset",
-        action: "password_reset.request_duplicate",
-        description: "Duplicate password reset request while a pending request exists",
-        actor: { email, name: email },
-        target: user,
-        metadata: { email, existingExpiresAt: existing.expiresAt.toISOString() },
+        metadata: {
+          reason: "ad_managed_account",
+        },
         status: "failed",
       });
 
-      return res.status(409).json({
+      return res.status(403).json({
         message:
-          "You have a previous password reset request pending. Contact System administrator at ICT department.",
-        email,
+          "This account is managed by Active Directory. Please contact ICT support.",
       });
     }
 
-    // Either create a new reset entry or overwrite an expired/old one
-    if (existing) {
-      existing.codeHash = hashResetCode(resetCode);
-      existing.expiresAt = expiresAt;
-      existing.lastSentAt = new Date();
-      existing.attempts = 0;
-      await existing.save();
-    } else {
-      await PasswordReset.create({
-        email,
-        codeHash: hashResetCode(resetCode),
-        expiresAt,
-        lastSentAt: new Date(),
-      });
-    }
 
-    /* await transporter.sendMail({
-      from: `"KMFRI ICT Support" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: "KMFRI Password Reset Code",
-      html: `
-        <div style="font-family:Arial,Helvetica,sans-serif;max-width:580px;margin:0 auto;padding:24px;background:#f8fbfd;border-radius:16px;border:1px solid #d8e6ef;">
-          <div style="background:linear-gradient(135deg,#0a3560 0%,#0a5b8c 100%);padding:20px;border-radius:14px;color:#fff;">
-            <h2 style="margin:0 0 8px;">Password Reset Request</h2>
-            <p style="margin:0;opacity:0.9;">Use the code below to reset your KMFRI attendance account password.</p>
-          </div>
-          <div style="padding:24px 8px 8px;">
-            <p style="font-size:15px;color:#12344d;">Hi ${user.name || "there"},</p>
-            <p style="font-size:15px;color:#12344d;line-height:1.6;">Enter this verification code on the password reset page to continue:</p>
-            <div style="margin:22px 0;padding:18px 20px;background:#ffffff;border:1px dashed #0a5b8c;border-radius:14px;text-align:center;">
-              <span style="font-size:32px;letter-spacing:10px;font-weight:800;color:#0a3560;">${resetCode}</span>
-            </div>
-            <p style="font-size:14px;color:#486581;line-height:1.6;">This code expires in 15 minutes. If you did not request a password reset, you can ignore this email.</p>
-            <p style="font-size:14px;color:#486581;line-height:1.6;">Reset page: <a href="${process.env.FRONTEND_URL || ""}/reset-password" style="color:#0a5b8c;font-weight:700;">Open password reset</a></p>
-          </div>
-        </div>
-      `,
-    }); */
-
-    await createAuditLog({
-      req,
-      category: "password_reset",
-      action: "password_reset.code_sent",
-      description: "Password reset code sent by email",
-      actor: user,
-      target: user,
-      metadata: { email, expiresAt: expiresAt.toISOString() },
-    });
-
-    res.json({
-      status: "code_sent",
-      message: "A password reset request has been initiated. Contact System administrator at ICT department.",
-      email,
-    });
-  } catch (err) {
-    console.error("Request password reset error:", err);
-    res.status(400).json({ message: err.message });
-  }
-});
-
-app.post(`${BASE_ROUTE}/auth/reset-password`, async (req, res) => {
-  try {
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const code = String(req.body?.code || "").trim();
-    const newPassword = String(req.body?.newPassword || "");
-
-    if (!email) throw new Error("Email is required");
-    if (!validator.isEmail(email)) throw new Error("Invalid email format");
-    if (!code) throw new Error("Reset code is required");
-    if (!newPassword || newPassword.length < 6) {
-      throw new Error("Password must be at least 6 characters");
-    }
-
-    const user = await User.findOne({ email });
-    if (!user) throw new Error("User not found");
-
-    const resetRequest = await PasswordReset.findOne({ email });
-    if (!resetRequest) {
+    // if user profile ispassword reset flag is true, then they cannot request another password reset
+    if (user.isPasswordReset) {
       await createAuditLog({
         req,
         category: "password_reset",
-        action: "password_reset.verification_failed",
-        description: "Password reset attempted without active request",
-        actor: { email, name: email },
+        action: "password_reset.request_rejected",
+        description: "Password reset requested while a temporary password is still active.",
+        actor: user,
         target: user,
-        metadata: { reason: "missing_request" },
+        metadata: {
+          reason: "temporary_password_active",
+        },
         status: "failed",
       });
-      throw new Error("No active password reset request was found for this email");
-    }
 
-    if (resetRequest.expiresAt && resetRequest.expiresAt.getTime() < Date.now()) {
-      await PasswordReset.deleteOne({ email });
-      await createAuditLog({
-        req,
-        category: "password_reset",
-        action: "password_reset.verification_failed",
-        description: "Expired password reset code used",
-        actor: { email, name: email },
-        target: user,
-        metadata: { reason: "expired_code" },
-        status: "failed",
+      return res.status(403).json({
+        message:
+          "A temporary password has already been issued for this account. Please check your messages or contact ICT support.",
       });
-      throw new Error("This reset code has expired. Please request a new one");
     }
 
-    const matches = resetRequest.codeHash === hashResetCode(code);
-    if (!matches) {
-      resetRequest.attempts = (resetRequest.attempts || 0) + 1;
-      await resetRequest.save();
+    // Generate temporary password
+    const temporaryPassword = generateResetCode();
 
-      await createAuditLog({
-        req,
-        category: "password_reset",
-        action: "password_reset.verification_failed",
-        description: "Invalid password reset code submitted",
-        actor: { email, name: email },
-        target: user,
-        metadata: { reason: "invalid_code", attempts: resetRequest.attempts },
-        status: "failed",
-      });
-      throw new Error("The reset code you entered is invalid");
-    }
+    // Save new password
+    user.password = await bcrypt.hash(temporaryPassword, 10);
 
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.isPasswordReset = false;
-    await user.save();
-    await PasswordReset.deleteOne({ email });
-
-    await createAuditLog({
-      req,
-      category: "password_reset",
-      action: "password_reset.completed",
-      description: "Password reset completed using emailed code",
-      actor: user,
-      target: user,
-      metadata: { email },
-    });
-
-    res.json({ message: "Password reset successful" });
-  } catch (error) {
-    console.error("Reset password error:", error);
-    res.status(400).json({ message: error.message });
-  }
-});
-
-app.get(`${BASE_ROUTE}/admin/password-reset/requests`, async (req, res) => {
-  try {
-    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
-
-    const currentUser = await User.findById(req.session.userID);
-    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
-    // only admin or superadmin can view
-    if (!["admin", "superadmin"].includes(currentUser.rank)) {
-      return res.status(403).json({ message: "Access denied, only admin or superadmin can view password reset requests." });
-    }
-
-    const requests = await PasswordReset.find().sort({ createdAt: -1 }).lean();
-    const enriched = await Promise.all(requests.map(async (request) => {
-      const user = await User.findOne({ email: request.email }).lean();
-      return {
-        ...request,
-        userName: user?.name || "Unknown User",
-        role: user?.role || "Unknown",
-        department: user?.department || "",
-        station: user?.station || "",
-        userIsPasswordReset: Boolean(user?.isPasswordReset),
-      };
-    }));
-
-    res.json(enriched);
-  } catch (error) {
-    console.error("Fetch password reset requests error:", error);
-    res.status(500).json({ message: "Failed to load password reset requests" });
-  }
-});
-
-app.put(`${BASE_ROUTE}/admin/password-reset/approve`, async (req, res) => {
-  try {
-    if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
-
-    const currentUser = await User.findById(req.session.userID);
-    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
-    if (!["admin", "superadmin"].includes(currentUser.rank))
-      return res.status(403).json({ message: "Only admin can approve password reset requests" });
-
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    if (!email) return res.status(400).json({ message: "Email is required" });
-
-    const user = await User.findOne({ email });
-    const resetRequest = await PasswordReset.findOne({ email });
-    if (!user) return res.status(404).json({ message: "User not found" });
-    if (!resetRequest) return res.status(404).json({ message: "Password reset request not found" });
-
-    const newPassword = String(req.body?.newPassword || "");
-
-    // If admin provided a new password, perform the reset immediately
-    if (newPassword) {
-      if (newPassword.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters" });
-
-      user.password = await bcrypt.hash(newPassword, 10);
-      user.isPasswordReset = false;
-      await user.save();
-
-      // Remove the reset request after successful admin reset
-      await PasswordReset.deleteOne({ email });
-
-      // Send email notification to user
-      /* await transporter.sendMail({
-        from: `"KMFRI ICT Support" <${process.env.EMAIL_USER}>`,
-        to: email,
-        subject: "Your Password Has Been Reset",
-        html: `
-          <div style="font-family:Arial,Helvetica,sans-serif;max-width:580px;margin:0 auto;padding:24px;background:#f8fbfd;border-radius:16px;border:1px solid #d8e6ef;">
-            <div style="background:linear-gradient(135deg,#0a3560 0%,#0a5b8c 100%);padding:20px;border-radius:14px;color:#fff;">
-              <h2 style="margin:0 0 8px;">Password Reset Complete</h2>
-              <p style="margin:0;opacity:0.9;">Your KMFRI attendance account password has been reset by the administrator.</p>
-            </div>
-            <div style="padding:24px 8px 8px;">
-              <p style="font-size:15px;color:#12344d;">Hi ${user.name || "there"},</p>
-              <p style="font-size:15px;color:#12344d;line-height:1.6;">Your password has been reset by the ICT administrator. You can now sign in with your new password.</p>
-              <p style="font-size:15px;color:#12344d;line-height:1.6;"><strong>New password:</strong> ${newPassword}</p>
-              <p style="font-size:14px;color:#d97706;line-height:1.6;"><strong>⚠️ Important:</strong> Please change this password immediately after logging in for security reasons.</p>
-              <p style="font-size:14px;color:#486581;line-height:1.6;">If you did not request a password reset, please contact ICT support immediately.</p>
-            </div>
-          </div>
-        `,
-      }); */
-
-      await createAuditLog({
-        req,
-        category: "password_reset",
-        action: "password_reset.admin_reset",
-        description: "Admin performed password reset and set a new password",
-        actor: currentUser,
-        target: user,
-        metadata: { email, approvedBy: currentUser.email, method: "admin_set_password" },
-      });
-
-      return res.json({ message: `Password for ${email} has been reset by admin`, email, reset: true });
-    }
-
-    // Backwards compatible behavior: mark user as awaiting reset (legacy flow)
+    // Force change on login
     user.isPasswordReset = true;
+
     await user.save();
+
+    // SMS
+    const sms = `Dear ${user.name}, Your temporary Password is ${temporaryPassword} use this password to sign in.You are required to change your password immediately after login.`;
+
+    await SendMessageNow(user, sms);
 
     await createAuditLog({
       req,
       category: "password_reset",
-      action: "password_reset.admin_approved",
-      description: "Admin approved password reset request (awaiting admin-provided password)",
-      actor: currentUser,
+      action: "password_reset.temp_password_generated",
+      description:
+        "Temporary password generated by the system and sent via SMS.",
+      actor: user,
       target: user,
-      metadata: { email, approvedBy: currentUser.email },
+      metadata: {
+        email,
+        phone: maskPhone(user.phone),
+      },
+      status: "success",
     });
 
-    res.json({ message: `Password reset request for ${email} has been approved`, email, approved: true });
+    const maskedphone = maskPhone(user.phone);
+
+    res.status(200).json({
+      message: `A temporary password has been sent to your registered phone number (${maskedphone}). Please check your messages.`,
+    });
+
   } catch (error) {
-    console.error("Approve password reset request error:", error);
-    res.status(500).json({ message: error.message || "Failed to approve password reset request" });
+    console.error("Password reset error:", error);
+
+    return res.status(400).json({
+      message: error.message || "Password reset failed.",
+    });
   }
 });
+
 
 
 // UPDATE USER PROFILE
@@ -4622,6 +4438,58 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
 });
 
 
+// admin reset password of user
+app.put(`${BASE_ROUTE}/admin/user/:id/reset-password`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "superadmin"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    // generate and hash a new password for the user, then save it to the database and send sms after
+    const resetpassword = generateResetCode();
+    const hashedPassword = await bcrypt.hash(resetpassword, 10);
+    targetUser.password = hashedPassword;
+
+    // reset the password reset flag to false since the admin has reset it  
+    targetUser.isPasswordReset = false;
+
+    // save user
+    await targetUser.save();
+
+    // create audit log for the password reset action
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_password_reset",
+      description: "User password reset",
+      actor: currentUser,
+      target: targetUser,
+    });
+
+    // send sms to the user with the new password
+    await SendMessageNow(targetUser, `Hello ${targetUser.name}, your password has been reset by the admin. Your new password is: ${resetpassword}. Please change it after logging in.`);
+
+    res.json({
+      message: `User password reset successfully to ${resetpassword} Ask them to check their sms for the new password.`,
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
 
 
 // get all supervisors
@@ -5152,8 +5020,54 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
   }
 });
 
-// ─── Delete User (HR/SUPERADMIN Only) ──────────────────────────────────────────────────
 
+
+// leave update by supervisor and hr and superadmin
+app.put(`${BASE_ROUTE}/admin/user/:id/revoke-on-leave`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser?.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    // Reset fields to default values
+    targetUser.isOnLeave = false;
+    // save changes
+    await targetUser.save();
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.on_leave_revoked",
+      description: "On-leave status revoked",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { isOnLeave: false },
+    });
+
+
+    // send message notification to the user about the revoked permission
+    await SendMessageNow(targetUser, `Dear ${targetUser.name}, your permission to clock outside of you station "${targetUser.station}" has been revoked. Please ensure to adhere to the standard clocking procedures.`);
+
+    res.json({
+      message: `Clock outside authorization revoked for ${targetUser.name}`,
+      user: targetUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+
+
+// ─── Delete User (HR/SUPERADMIN Only) ──────────────────────────────────────────────────
 app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
   try {
     if (!req.session.isOnline)
