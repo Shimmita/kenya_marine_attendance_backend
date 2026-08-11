@@ -39,6 +39,7 @@ import {
   isWeekend
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
+import { countWeekdays } from "./util/WorkingDay.js";
 const allowedOrigins = [
   process.env.CROSS_ORIGIN_ALLOWED,
   process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
@@ -132,6 +133,8 @@ const isReminderTriggerAuthorized = (req) => {
     return false;
   }
 };
+
+
 
 const getAnalyticsContext = async (req) => {
   if (!req.session?.isOnline) {
@@ -2557,85 +2560,938 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
 
 
 // ANALYTICS
+// GET /overall/attendance/analytics/kpis
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("kpis", context, req.query);
-    res.status(200).json(payload);
+    const { startDate, endDate, department, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const users = await User.find(userFilter, 'email isAccountActive isOnLeave');
+    const emails = users.map(u => u.email);
+
+    const start = startDate ? new Date(startDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    // Today's date for present/absent counts
+    const today = new Date();
+    const todayStart = new Date(today);
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date(today);
+    todayEnd.setHours(23, 59, 59, 999);
+
+    // Fetch all clockings in range
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end }
+    });
+
+    // Today's clockings
+    const todayRecords = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: todayStart, $lte: todayEnd }
+    });
+
+    const totalEmployees = users.length;
+    const activeEmployeesToday = new Set(todayRecords.map(r => r.email)).size;
+    const onLeaveToday = users.filter(u => u.isOnLeave).length;
+    const presentToday = activeEmployeesToday - onLeaveToday; // simplified; adjust if needed
+    const absentToday = totalEmployees - activeEmployeesToday;
+
+    // Attendance rate: present days / total working days in period
+    const workingDays = countWeekdays(start, end); // helper to count weekdays
+    const presentDaysMap = {};
+    records.forEach(r => {
+      if (!presentDaysMap[r.email]) presentDaysMap[r.email] = new Set();
+      presentDaysMap[r.email].add(r.clock_in.toDateString());
+    });
+    const totalPresentDays = Object.values(presentDaysMap).reduce((sum, set) => sum + set.size, 0);
+    const attendanceRate = totalEmployees > 0 ? (totalPresentDays / (totalEmployees * workingDays)) * 100 : 0;
+
+    // Punctuality: early vs late (based on isLate flag)
+    let earlyCount = 0, lateCount = 0;
+    records.forEach(r => {
+      if (r.isLate) lateCount++;
+      else earlyCount++;
+    });
+    const punctualityRate = (earlyCount + lateCount) > 0 ? (earlyCount / (earlyCount + lateCount)) * 100 : 0;
+
+    // Productivity index: average hours per employee (capped at 8h/day)
+    let totalHours = 0;
+    records.forEach(r => {
+      if (r.clock_out) {
+        let hours = (r.clock_out - r.clock_in) / (1000 * 60 * 60);
+        hours = Math.min(hours, 8); // cap at 8h
+        totalHours += hours;
+      }
+    });
+    const avgHours = totalEmployees > 0 ? totalHours / totalEmployees : 0;
+    const productivityIndex = (avgHours / 8) * 100;
+
+    // Absenteeism rate = 1 - attendance rate
+    const absenteeismRate = 100 - attendanceRate;
+
+    // Average working hours (for CEO)
+    const totalClockedHours = records.reduce((sum, r) => sum + (r.clock_out ? (r.clock_out - r.clock_in) / (1000 * 60 * 60) : 0), 0);
+    const averageWorkingHours = records.length > 0 ? totalClockedHours / records.length : 0;
+
+    // For filters dropdown
+    const config = await PlatformConfig.getSingleton();
+    const allDepartments = config.departments || [];
+    const allStations = config.stations.filter(s => s.active).map(s => s.name);
+
+    res.json({
+      totalEmployees,
+      presentToday,
+      absentToday,
+      onLeaveToday,
+      attendanceRate: parseFloat(attendanceRate.toFixed(1)),
+      punctualityRate: parseFloat(punctualityRate.toFixed(1)),
+      productivityIndex: parseFloat(productivityIndex.toFixed(1)),
+      averageWorkingHours: parseFloat(averageWorkingHours.toFixed(1)),
+      activeEmployeesToday,
+      employeesOnLeave: onLeaveToday,
+      workforceSize: totalEmployees,
+      absenteeismRate: parseFloat(absenteeismRate.toFixed(1)),
+      departments: allDepartments,
+      stations: allStations
+    });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+    res.status(500).json({ message: error.message });
   }
 });
 
+
+
+
+// GET /overall/attendance/analytics/trends
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("trends", context, req.query);
-    res.status(200).json(payload);
+    const { startDate, endDate, department, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const users = await User.find(userFilter, 'email');
+    const emails = users.map(u => u.email);
+
+    const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth() - 6, 1);
+    const end = endDate ? new Date(endDate) : new Date();
+
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end }
+    });
+
+    // Group by date
+    const dailyMap = {};
+    records.forEach(r => {
+      const key = r.clock_in.toISOString().split('T')[0];
+      if (!dailyMap[key]) dailyMap[key] = { total: 0, present: 0 };
+      dailyMap[key].total++;
+      if (r.clock_out) dailyMap[key].present++;
+    });
+
+    // Compute daily attendance rate
+    const daily = Object.keys(dailyMap).map(date => ({
+      date,
+      attendance: (dailyMap[date].present / dailyMap[date].total) * 100
+    })).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Weekly aggregation
+    const weeklyMap = {};
+    daily.forEach(d => {
+      const week = getWeekNumber(new Date(d.date));
+      const key = `${d.date.substring(0, 4)}-W${String(week).padStart(2, '0')}`;
+      if (!weeklyMap[key]) weeklyMap[key] = { total: 0, sum: 0 };
+      weeklyMap[key].total++;
+      weeklyMap[key].sum += d.attendance;
+    });
+    const weekly = Object.keys(weeklyMap).map(week => ({
+      week,
+      attendance: weeklyMap[week].sum / weeklyMap[week].total
+    })).sort((a, b) => a.week.localeCompare(b.week));
+
+    // Monthly
+    const monthlyMap = {};
+    daily.forEach(d => {
+      const month = d.date.substring(0, 7);
+      if (!monthlyMap[month]) monthlyMap[month] = { total: 0, sum: 0 };
+      monthlyMap[month].total++;
+      monthlyMap[month].sum += d.attendance;
+    });
+    const monthly = Object.keys(monthlyMap).map(month => ({
+      month,
+      attendance: monthlyMap[month].sum / monthlyMap[month].total
+    })).sort((a, b) => a.month.localeCompare(b.month));
+
+    // Yearly
+    const yearlyMap = {};
+    daily.forEach(d => {
+      const year = d.date.substring(0, 4);
+      if (!yearlyMap[year]) yearlyMap[year] = { total: 0, sum: 0 };
+      yearlyMap[year].total++;
+      yearlyMap[year].sum += d.attendance;
+    });
+    const yearly = Object.keys(yearlyMap).map(year => ({
+      year,
+      attendance: yearlyMap[year].sum / yearlyMap[year].total
+    })).sort((a, b) => a.year.localeCompare(b.year));
+
+    res.json({ daily, weekly, monthly, yearly });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+    res.status(500).json({ message: error.message });
   }
 });
 
-app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, res) => {
-  try {
-    const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("departments", context, req.query);
-    res.status(200).json(payload);
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
-  }
-});
+// Helper: get ISO week number
+function getWeekNumber(d) {
+  const date = new Date(d);
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() + 3 - (date.getDay() + 6) % 7);
+  const week1 = new Date(date.getFullYear(), 0, 4);
+  return 1 + Math.round(((date - week1) / 86400000 - 3 + (week1.getDay() + 6) % 7) / 7);
+}
 
-app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) => {
-  try {
-    const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("stations", context, req.query);
-    res.status(200).json(payload);
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
-  }
-});
 
+
+// late arrivals analytics
+// GET /overall/attendance/analytics/late-arrivals
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("late-arrivals", context, req.query);
-    res.status(200).json(payload);
+    const { startDate, endDate, department, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const users = await User.find(userFilter, 'email department');
+    const emails = users.map(u => u.email);
+    const userDeptMap = {};
+    users.forEach(u => userDeptMap[u.email] = u.department);
+
+    const start = startDate ? new Date(startDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end }
+    });
+
+    // Employees late today
+    const today = new Date();
+    const todayStart = new Date(today);
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date(today);
+    todayEnd.setHours(23, 59, 59, 999);
+    const lateToday = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: todayStart, $lte: todayEnd },
+      isLate: true
+    });
+    const employeesLateToday = new Set(lateToday.map(r => r.email)).size;
+
+    // Average lateness (minutes) – assume late means clock_in > 8:00 AM
+    let totalLateMinutes = 0, lateCount = 0;
+    records.forEach(r => {
+      if (r.isLate) {
+        const hours = r.clock_in.getHours() + r.clock_in.getMinutes() / 60;
+        const lateMins = Math.max(0, (hours - 8) * 60);
+        totalLateMinutes += lateMins;
+        lateCount++;
+      }
+    });
+    const averageLatenessMinutes = lateCount > 0 ? totalLateMinutes / lateCount : 0;
+
+    // Most punctual departments (avg lateness)
+    const deptLateMap = {};
+    records.forEach(r => {
+      const dept = userDeptMap[r.email] || 'Unknown';
+      if (!deptLateMap[dept]) deptLateMap[dept] = { total: 0, count: 0 };
+      if (r.isLate) {
+        const hours = r.clock_in.getHours() + r.clock_in.getMinutes() / 60;
+        const mins = Math.max(0, (hours - 8) * 60);
+        deptLateMap[dept].total += mins;
+        deptLateMap[dept].count++;
+      }
+    });
+    const deptAvg = Object.keys(deptLateMap).map(dept => ({
+      department: dept,
+      avgLateness: deptLateMap[dept].count > 0 ? deptLateMap[dept].total / deptLateMap[dept].count : 0
+    }));
+    const mostPunctual = [...deptAvg].sort((a, b) => a.avgLateness - b.avgLateness).slice(0, 5);
+    const highestLateness = [...deptAvg].sort((a, b) => b.avgLateness - a.avgLateness).slice(0, 5);
+
+    // Late by weekday
+    const weekdayMap = { Mon: 0, Tue: 0, Wed: 0, Thu: 0, Fri: 0 };
+    records.forEach(r => {
+      if (r.isLate) {
+        const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][r.clock_in.getDay()];
+        if (weekdayMap[day] !== undefined) weekdayMap[day]++;
+      }
+    });
+    const lateByWeekday = Object.keys(weekdayMap).map(day => ({ weekday: day, count: weekdayMap[day] }));
+
+    // Late by department
+    const deptLateCount = {};
+    records.forEach(r => {
+      if (r.isLate) {
+        const dept = userDeptMap[r.email] || 'Unknown';
+        deptLateCount[dept] = (deptLateCount[dept] || 0) + 1;
+      }
+    });
+    const lateByDepartment = Object.keys(deptLateCount).map(dept => ({ department: dept, count: deptLateCount[dept] }));
+
+    // Heatmap – arrival times (hour vs day)
+    const heatmapData = [];
+    records.forEach(r => {
+      const hour = r.clock_in.getHours();
+      const day = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][r.clock_in.getDay()];
+      if (hour >= 6 && hour <= 12) {
+        heatmapData.push({ hour, day, value: 1 });
+      }
+    });
+
+    res.json({
+      employeesLateToday,
+      averageLatenessMinutes: parseFloat(averageLatenessMinutes.toFixed(1)),
+      mostPunctualDepartments: mostPunctual,
+      highestLatenessDepartments: highestLateness,
+      lateByWeekday,
+      lateByDepartment,
+      heatmapData
+    });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+    res.status(500).json({ message: error.message });
   }
 });
 
+
+// early departures analytics
+// GET /overall/attendance/analytics/early-departures
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("early-departures", context, req.query);
-    res.status(200).json(payload);
+    const { startDate, endDate, department, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const users = await User.find(userFilter, 'email department');
+    const emails = users.map(u => u.email);
+    const userDeptMap = {};
+    users.forEach(u => userDeptMap[u.email] = u.department);
+
+    const start = startDate ? new Date(startDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end },
+      clock_out: { $ne: null }
+    });
+
+    // Count early departures (clock_out < 17:00)
+    let earlyCount = 0;
+    let totalEarlyMins = 0;
+    const userEarlyMap = {};
+    const deptEarlyMap = {};
+
+    records.forEach(r => {
+      const hours = r.clock_out.getHours() + r.clock_out.getMinutes() / 60;
+      if (hours < 17) {
+        earlyCount++;
+        const earlyMins = (17 - hours) * 60;
+        totalEarlyMins += earlyMins;
+        const email = r.email;
+        userEarlyMap[email] = (userEarlyMap[email] || 0) + 1;
+        const dept = userDeptMap[email] || 'Unknown';
+        deptEarlyMap[dept] = (deptEarlyMap[dept] || 0) + 1;
+      }
+    });
+
+    const averageEarlyDepartureMinutes = earlyCount > 0 ? totalEarlyMins / earlyCount : 0;
+
+    const frequentEarlyDepartures = Object.keys(userEarlyMap)
+      .map(email => ({ email, count: userEarlyMap[email] }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    const earlyByDepartment = Object.keys(deptEarlyMap).map(dept => ({
+      department: dept,
+      count: deptEarlyMap[dept]
+    }));
+
+    res.json({
+      employeesLeavingEarly: earlyCount,
+      averageEarlyDepartureMinutes: parseFloat(averageEarlyDepartureMinutes.toFixed(1)),
+      frequentEarlyDepartures,
+      earlyByDepartment
+    });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+    res.status(500).json({ message: error.message });
   }
 });
 
+
+
+// absenteeism analytics
+// GET /overall/attendance/analytics/absenteeism
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("absenteeism", context, req.query);
-    res.status(200).json(payload);
+    const { startDate, endDate, department, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, {
+      department,
+      station
+    });
+
+    const users = await User.find(
+      userFilter,
+      'email department'
+    );
+
+    const emails = users.map(u => u.email);
+
+    const userDeptMap = {};
+    users.forEach(u => {
+      userDeptMap[u.email] = u.department;
+    });
+
+    const start = startDate
+      ? new Date(startDate)
+      : new Date(
+        new Date().getFullYear(),
+        new Date().getMonth() - 6,
+        1
+      );
+
+    const end = endDate
+      ? new Date(endDate)
+      : new Date();
+
+    // Make sure the end date includes the entire day
+    if (endDate) {
+      end.setHours(23, 59, 59, 999);
+    }
+
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: {
+        $gte: start,
+        $lte: end
+      }
+    });
+
+    // ---------------------------------------------------------
+    // TOTAL WORKING DAYS
+    // ---------------------------------------------------------
+    const workingDays = countWeekdays(start, end);
+
+    // ---------------------------------------------------------
+    // PER-MONTH / DEPARTMENT DATA
+    // ---------------------------------------------------------
+    const deptAbsenteeism = {};
+
+    // ---------------------------------------------------------
+    // PRESENT DAYS PER USER
+    // ---------------------------------------------------------
+    const userPresent = {};
+
+    records.forEach(r => {
+      if (!r.clock_in) return;
+
+      const email = r.email;
+
+      if (!userPresent[email]) {
+        userPresent[email] = new Set();
+      }
+
+      userPresent[email].add(
+        r.clock_in.toDateString()
+      );
+    });
+
+    // ---------------------------------------------------------
+    // OVERALL ABSENTEEISM
+    // ---------------------------------------------------------
+    let totalAbsenteeism = 0;
+
+    users.forEach(u => {
+      const present = userPresent[u.email]
+        ? userPresent[u.email].size
+        : 0;
+
+      const rate = workingDays > 0
+        ? 1 - (present / workingDays)
+        : 0;
+
+      totalAbsenteeism += rate;
+
+      // Department aggregation
+      const dept = u.department || 'Unknown';
+
+      if (!deptAbsenteeism[dept]) {
+        deptAbsenteeism[dept] = {
+          total: 0,
+          count: 0
+        };
+      }
+
+      deptAbsenteeism[dept].total += rate;
+      deptAbsenteeism[dept].count += 1;
+    });
+
+    const avgAbsenteeism =
+      users.length > 0
+        ? (totalAbsenteeism / users.length) * 100
+        : 0;
+
+    // ---------------------------------------------------------
+    // MONTHLY ABSENTEEISM
+    // ---------------------------------------------------------
+    const monthPresent = {};
+
+    records.forEach(r => {
+      if (!r.clock_in) return;
+
+      const monthKey = r.clock_in
+        .toISOString()
+        .slice(0, 7); // YYYY-MM
+
+      if (!monthPresent[monthKey]) {
+        monthPresent[monthKey] = {};
+      }
+
+      const email = r.email;
+
+      if (!monthPresent[monthKey][email]) {
+        monthPresent[monthKey][email] = new Set();
+      }
+
+      monthPresent[monthKey][email].add(
+        r.clock_in.toDateString()
+      );
+    });
+
+    const monthlyAbsData = Object.keys(monthPresent)
+      .map(monthKey => {
+        /*
+         * monthKey is a STRING:
+         * "2026-08"
+         *
+         * Convert it into an actual Date first.
+         */
+        const monthStart = new Date(
+          `${monthKey}-01T00:00:00`
+        );
+
+        /*
+         * First day of the NEXT month.
+         *
+         * IMPORTANT:
+         * Do not use monthKey.getMonth()
+         * because monthKey is a string.
+         */
+        const nextMonthStart = new Date(
+          monthStart.getFullYear(),
+          monthStart.getMonth() + 1,
+          1
+        );
+
+        /*
+         * Last day of the current month.
+         */
+        const monthEnd = new Date(
+          nextMonthStart.getTime() - 1
+        );
+
+        /*
+         * Respect the selected analytics date range.
+         *
+         * Example:
+         * If the user selects Aug 10 - Aug 20,
+         * don't calculate August using Aug 1 - Aug 31.
+         */
+        const effectiveStart =
+          monthStart < start
+            ? start
+            : monthStart;
+
+        const effectiveEnd =
+          monthEnd > end
+            ? end
+            : monthEnd;
+
+        const workingDaysMonth =
+          effectiveStart <= effectiveEnd
+            ? countWeekdays(
+              effectiveStart,
+              effectiveEnd
+            )
+            : 0;
+
+        const emailsInMonth =
+          Object.keys(monthPresent[monthKey]);
+
+        let sum = 0;
+
+        emailsInMonth.forEach(email => {
+          const presentDays =
+            monthPresent[monthKey][email].size;
+
+          const rate =
+            workingDaysMonth > 0
+              ? 1 - (
+                presentDays /
+                workingDaysMonth
+              )
+              : 0;
+
+          sum += rate;
+        });
+
+        const rate =
+          emailsInMonth.length > 0
+            ? (sum / emailsInMonth.length) * 100
+            : 0;
+
+        return {
+          month: monthKey,
+          rate: parseFloat(rate.toFixed(1))
+        };
+      })
+      .sort((a, b) =>
+        a.month.localeCompare(b.month)
+      );
+
+    // ---------------------------------------------------------
+    // DEPARTMENT ABSENTEEISM
+    // ---------------------------------------------------------
+    const deptAbs = Object.keys(deptAbsenteeism)
+      .map(dept => ({
+        department: dept,
+        rate: parseFloat(
+          (
+            (
+              deptAbsenteeism[dept].total /
+              deptAbsenteeism[dept].count
+            ) * 100
+          ).toFixed(1)
+        )
+      }));
+
+    // ---------------------------------------------------------
+    // RESPONSE
+    // ---------------------------------------------------------
+    res.json({
+      averageAbsenteeismRate: parseFloat(
+        avgAbsenteeism.toFixed(1)
+      ),
+      monthlyAbsenteeism: monthlyAbsData,
+      departmentAbsenteeism: deptAbs
+    });
+
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+    console.error(
+      'Absenteeism analytics error:',
+      error
+    );
+
+    res.status(500).json({
+      message: error.message
+    });
   }
 });
 
+
+// department-level analytics
+// GET /overall/attendance/analytics/departments
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const { startDate, endDate, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, { station });
+    const users = await User.find(userFilter, 'email department');
+    const emails = users.map(u => u.email);
+    const deptMap = {};
+    users.forEach(u => deptMap[u.email] = u.department);
+
+    const start = startDate ? new Date(startDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end }
+    });
+
+    const workingDays = countWeekdays(start, end);
+    const deptStats = {};
+
+    // Initialize departments from all users
+    const allDepts = new Set(users.map(u => u.department || 'Unknown'));
+    allDepts.forEach(d => {
+      deptStats[d] = { staffCount: 0, presentDays: 0, totalLate: 0, totalAbsent: 0 };
+    });
+
+    // Count staff per department
+    users.forEach(u => {
+      const dept = u.department || 'Unknown';
+      deptStats[dept].staffCount++;
+    });
+
+    // Process records
+    const deptPresent = {};
+    records.forEach(r => {
+      const dept = deptMap[r.email] || 'Unknown';
+      if (!deptPresent[dept]) deptPresent[dept] = new Set();
+      deptPresent[dept].add(r.clock_in.toDateString());
+      if (r.isLate) deptStats[dept].totalLate++;
+    });
+
+    // Compute rates
+    const result = Object.keys(deptStats).map(dept => {
+      const staff = deptStats[dept].staffCount;
+      const presentDays = deptPresent[dept] ? deptPresent[dept].size : 0;
+      const attendanceRate = (staff * workingDays) > 0 ? (presentDays / (staff * workingDays)) * 100 : 0;
+      const latenessRate = staff > 0 ? (deptStats[dept].totalLate / staff) : 0; // average late per staff
+      const absenteeismRate = 100 - attendanceRate;
+      return {
+        department: dept,
+        attendanceRate: parseFloat(attendanceRate.toFixed(1)),
+        latenessRate: parseFloat(latenessRate.toFixed(1)),
+        absenteeismRate: parseFloat(absenteeismRate.toFixed(1))
+      };
+    });
+
+    res.json({ departments: result });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// station-level analytics
+// GET /overall/attendance/analytics/stations
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) => {
+  try {
+    const context = await getAnalyticsContext(req);
+    const { startDate, endDate, department, station } = req.query;
+
+    // Build user filter – includes department if provided
+    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const users = await User.find(userFilter, 'email station department');
+
+    // Group users by station
+    const stationMap = {};
+    users.forEach(u => {
+      const st = u.station || 'Unassigned';
+      if (!stationMap[st]) stationMap[st] = {
+        staff: [],
+        departments: new Set(),
+        emails: []
+      };
+      stationMap[st].staff.push(u);
+      stationMap[st].emails.push(u.email);
+      if (u.department) stationMap[st].departments.add(u.department);
+    });
+
+    const stationsList = Object.keys(stationMap);
+    if (stationsList.length === 0) {
+      return res.json({ stations: [] });
+    }
+
+    // Get all emails
+    const allEmails = users.map(u => u.email);
+
+    // Date range
+    const start = startDate ? new Date(startDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    // Fetch all clockings in range for these users
+    const records = await Clocking.find({
+      email: { $in: allEmails },
+      clock_in: { $gte: start, $lte: end }
+    });
+
+    // Compute working days
+    const workingDays = countWeekdays(start, end);
+
+    // Per‑station aggregation
+    const stationStats = {};
+
+    stationsList.forEach(st => {
+      stationStats[st] = {
+        staffCount: stationMap[st].staff.length,
+        departments: Array.from(stationMap[st].departments),
+        totalHours: 0,
+        totalOvertime: 0,
+        lateCount: 0,
+        presentDays: new Set(),
+        employeeMetrics: {},
+      };
+      // Initialize per‑employee present days sets
+      stationMap[st].emails.forEach(email => {
+        stationStats[st].employeeMetrics[email] = new Set();
+      });
+    });
+
+    // Process records
+    records.forEach(r => {
+      const st = r.station || 'Unassigned';
+      if (!stationStats[st]) return; // should not happen, but guard
+
+      const metric = stationStats[st];
+      const email = r.email;
+
+      // Add present day
+      const dateKey = r.clock_in.toDateString();
+      if (metric.employeeMetrics[email]) {
+        metric.employeeMetrics[email].add(dateKey);
+      }
+
+      // Total hours
+      if (r.clock_out) {
+        const hours = (r.clock_out - r.clock_in) / (1000 * 60 * 60);
+        metric.totalHours += hours;
+        if (hours > 9) metric.totalOvertime += (hours - 9);
+      }
+
+      // Late count
+      if (r.isLate) metric.lateCount++;
+    });
+
+    // Compute station-level rates
+    const result = stationsList.map(st => {
+      const stats = stationStats[st];
+      const staffCount = stats.staffCount;
+      const totalPresentDays = Object.values(stats.employeeMetrics).reduce((sum, set) => sum + set.size, 0);
+      const maxPossibleDays = staffCount * workingDays;
+      const attendanceRate = maxPossibleDays > 0 ? (totalPresentDays / maxPossibleDays) * 100 : 0;
+
+      // Average hours per employee
+      const avgHours = staffCount > 0 ? stats.totalHours / staffCount : 0;
+
+      // Overtime per employee
+      const avgOvertime = staffCount > 0 ? stats.totalOvertime / staffCount : 0;
+
+      // Lateness rate: average late per employee
+      const latenessRate = staffCount > 0 ? (stats.lateCount / staffCount) : 0;
+
+      // Absenteeism rate = 1 - attendance rate
+      const absenteeismRate = 100 - attendanceRate;
+
+      // Top performers (simplified: by total hours)
+      const employeeHours = {};
+      records.forEach(r => {
+        if (r.station === st && r.clock_out) {
+          const email = r.email;
+          const hours = (r.clock_out - r.clock_in) / (1000 * 60 * 60);
+          employeeHours[email] = (employeeHours[email] || 0) + hours;
+        }
+      });
+      const topPerformers = Object.keys(employeeHours)
+        .map(email => ({ email, hours: employeeHours[email] }))
+        .sort((a, b) => b.hours - a.hours)
+        .slice(0, 5);
+
+      return {
+        station: st,
+        staffCount,
+        departments: stats.departments,
+        attendanceRate: parseFloat(attendanceRate.toFixed(1)),
+        latenessRate: parseFloat(latenessRate.toFixed(1)),
+        absenteeismRate: parseFloat(absenteeismRate.toFixed(1)),
+        averageWorkingHours: parseFloat(avgHours.toFixed(1)),
+        averageOvertime: parseFloat(avgOvertime.toFixed(1)),
+        totalHours: parseFloat(stats.totalHours.toFixed(1)),
+        totalOvertime: parseFloat(stats.totalOvertime.toFixed(1)),
+        totalLateCount: stats.lateCount,
+        topPerformers
+      };
+    });
+
+    res.json({ stations: result });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// compliance analytics
+// GET /overall/attendance/analytics/compliance
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("compliance", context, req.query);
-    res.status(200).json(payload);
+    const { startDate, endDate, department, station } = req.query;
+
+    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const users = await User.find(userFilter, 'email');
+    const emails = users.map(u => u.email);
+
+    const start = startDate ? new Date(startDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    // Find all clockings in range
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end }
+    });
+
+    // For each day, check if user clocked in and out
+    const missingClockIns = [];
+    const missingClockOuts = [];
+
+    // Group by day and email
+    const dailyMap = {};
+    records.forEach(r => {
+      const dateKey = r.clock_in.toISOString().split('T')[0];
+      const email = r.email;
+      const key = `${dateKey}|${email}`;
+      if (!dailyMap[key]) dailyMap[key] = { clockIn: false, clockOut: false };
+      dailyMap[key].clockIn = true;
+      if (r.clock_out) dailyMap[key].clockOut = true;
+    });
+
+    // For each working day in range, check all employees
+    let current = new Date(start);
+    while (current <= end) {
+      if (current.getDay() !== 0 && current.getDay() !== 6) {
+        const dateKey = current.toISOString().split('T')[0];
+        emails.forEach(email => {
+          const key = `${dateKey}|${email}`;
+          if (!dailyMap[key]) {
+            missingClockIns.push({ email, date: dateKey });
+          } else if (!dailyMap[key].clockOut) {
+            missingClockOuts.push({ email, date: dateKey });
+          }
+        });
+      }
+      current.setDate(current.getDate() + 1);
+    }
+
+    res.json({
+      missingClockIns: missingClockIns.slice(0, 50),
+      missingClockOuts: missingClockOuts.slice(0, 50),
+      totalMissingClockIns: missingClockIns.length,
+      totalMissingClockOuts: missingClockOuts.length
+    });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
+    res.status(500).json({ message: error.message });
   }
 });
+
+
+
 
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/outside-clocking`, async (req, res) => {
   try {
@@ -2676,6 +3532,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/executive`, async (req, res)
     res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
   }
 });
+
+
 
 // ADMIN, SUPERVISOR,CEO,HR LEVEL overall org stats
 
@@ -2958,6 +3816,147 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 });
+
+
+
+// biometric analytics
+// GET /overall/attendance/analytics/biometric
+app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res) => {
+  try {
+    // --- 1. Admin-only access ---
+    const context = await getAnalyticsContext(req);
+    if (!['admin', 'superadmin'].includes(context.user?.rank)) {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+
+    // --- 2. Date range (optional) – filters users & devices by creation ---
+    const { startDate, endDate } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(0); // beginning of time
+    const end = endDate ? new Date(endDate) : new Date();
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    // --- 3. Biometric enrollment stats from User ---
+    const usersWithBiometric = await User.countDocuments({
+      doneBiometric: true,
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    // --- 4. Authenticators & successful verifications ---
+    // Unwind the authenticators array to count credentials and sum counters
+    const [authAgg] = await User.aggregate([
+      { $match: { createdAt: { $gte: start, $lte: end } } },
+      { $project: { authenticators: 1 } },
+      { $unwind: { path: '$authenticators', preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+          _id: null,
+          totalAuthenticators: { $sum: 1 },
+          totalSuccessfulVerifications: { $sum: '$authenticators.counter' }
+        }
+      }
+    ]);
+
+    const totalAuthenticators = authAgg?.totalAuthenticators || 0;
+    const totalSuccessfulVerifications = authAgg?.totalSuccessfulVerifications || 0;
+
+    // --- 5. Device stats ---
+    const totalDevices = await Devices.countDocuments({
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    // Active = updated in the last 7 days
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const activeDevices = await Device.countDocuments({
+      updatedAt: { $gte: sevenDaysAgo },
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    const inactiveDevices = totalDevices - activeDevices;
+
+    // Average offline minutes for inactive devices
+    let avgOfflineMinutes = 0;
+    if (inactiveDevices > 0) {
+      const inactiveDocs = await Devices.find(
+        {
+          updatedAt: { $lt: sevenDaysAgo },
+          createdAt: { $gte: start, $lte: end }
+        },
+        'updatedAt'
+      );
+      const totalOfflineMs = inactiveDocs.reduce((sum, d) => sum + (Date.now() - d.updatedAt.getTime()), 0);
+      avgOfflineMinutes = totalOfflineMs / inactiveDocs.length / (1000 * 60);
+    }
+
+    const uptime = totalDevices > 0 ? (activeDevices / totalDevices) * 100 : 0;
+
+    // --- 6. Lost devices (from Device collection) ---
+    const lostDevices = await Devices.countDocuments({
+      device_lost: true,
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    // --- 7. Users who reported a lost device ---
+    const usersWithLostDevice = await User.countDocuments({
+      deviceLost: true,
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    // --- 8. Primary devices ---
+    const primaryDevices = await Devices.countDocuments({
+      device_primary: true,
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    // --- 9. OS & Browser distribution (for extra insight) ---
+    const osDistribution = await Devices.aggregate([
+      { $match: { createdAt: { $gte: start, $lte: end } } },
+      { $group: { _id: '$device_os', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+
+    const browserDistribution = await Devices.aggregate([
+      { $match: { createdAt: { $gte: start, $lte: end } } },
+      { $group: { _id: '$device_browser', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ]);
+
+    // --- 10. Enrollment rate (users with biometric / total users) ---
+    const totalUsers = await User.countDocuments({
+      createdAt: { $gte: start, $lte: end }
+    });
+    const enrollmentRate = totalUsers > 0 ? (usersWithBiometric / totalUsers) * 100 : 0;
+
+    // --- 11. Response ---
+    res.json({
+      // Biometric enrollment
+      usersWithBiometric,
+      totalAuthenticators,
+      totalSuccessfulVerifications,
+      enrollmentRate: parseFloat(enrollmentRate.toFixed(1)),
+
+      // Device uptime / activity
+      totalDevices,
+      activeDevices,
+      inactiveDevices,
+      deviceUptime: parseFloat(uptime.toFixed(1)),
+      deviceOfflineDuration: Math.round(avgOfflineMinutes), // minutes
+
+      // Lost / primary devices
+      lostDevices,
+      usersWithLostDevice,
+      primaryDevices,
+
+      // Distributions
+      osDistribution,
+      browserDistribution,
+    });
+  } catch (error) {
+    console.error('Biometric analytics error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 
 
 // ============================================================================
