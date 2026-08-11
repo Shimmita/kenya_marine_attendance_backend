@@ -11,7 +11,6 @@ import crypto from "crypto";
 import "dotenv/config";
 import express from "express";
 import session from "express-session";
-import ldapjs from "ldapjs";
 import mongoose from "mongoose";
 import os from "os";
 import sharp from "sharp";
@@ -1268,11 +1267,80 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
 
 
 // ─── LDAP Authentication Helper ───────────────────────────────────────────────
+// TEMPORARY:
+// Active Directory / LDAP communication is currently bypassed.
+// authenticateWithLDAP() is still used by the signin route so that
+// when AD is available, only this function needs to be switched back.
+//
+// CURRENT AUTHENTICATION:
+// User.employeeId + User.password
+//
+// FUTURE AUTHENTICATION:
+// Active Directory / LDAP
+// ──────────────────────────────────────────────────────────────────────────────
 
 const LDAP_TIMEOUT_MS = 5000; // 5 second timeout for LDAP connection
 const LDAP_REQUEST_TIMEOUT_MS = 10000; // 10 second timeout for entire LDAP auth process
 
 const authenticateWithLDAP = async (userId, password) => {
+
+  // ===========================================================================
+  // TEMPORARY LOCAL AUTHENTICATION
+  // ===========================================================================
+  // Using the User model while Active Directory is unavailable.
+  //
+  // When AD is active:
+  // 1. Comment out this entire LOCAL AUTHENTICATION section.
+  // 2. Uncomment the REAL LDAP section below.
+  // 3. No changes will be required in the signin-staff route.
+  // ===========================================================================
+
+  try {
+    const user = await User.findOne({
+      employeeId: userId.trim(),
+    }).select("+password");
+
+    if (!user) {
+      throw new Error("Invalid credentials!");
+    }
+
+    const isPasswordValid = await bcrypt.compare(
+      password,
+      user.password
+    );
+
+    if (!isPasswordValid) {
+      throw new Error("Invalid credentials!");
+    }
+
+    return {
+      success: true,
+      method: "LOCAL",
+    };
+
+  } catch (error) {
+    console.error(
+      "Local staff authentication failed:",
+      error.message
+    );
+
+    throw new Error("Invalid credentials!");
+  }
+
+
+  // ===========================================================================
+  // REAL ACTIVE DIRECTORY / LDAP AUTHENTICATION
+  // ===========================================================================
+  // DO NOT DELETE THIS CODE.
+  //
+  // When Active Directory is available:
+  //
+  // 1. Comment out the LOCAL AUTHENTICATION section above.
+  // 2. Remove the comment block around this section.
+  // 3. The signin-staff route will automatically authenticate through AD.
+  // ===========================================================================
+
+  /*
   const url = process.env.LDAP_URL;
   const baseDN = process.env.LDAP_BASE_DN;
 
@@ -1284,8 +1352,12 @@ const authenticateWithLDAP = async (userId, password) => {
   });
 
   // Handle connection errors at the client level
-  client.on('error', (err) => {
-    console.error('LDAP client error:', err.code, err.message);
+  client.on("error", (err) => {
+    console.error(
+      "LDAP client error:",
+      err.code,
+      err.message
+    );
   });
 
   const tryBind = (dn) =>
@@ -1296,138 +1368,282 @@ const authenticateWithLDAP = async (userId, password) => {
       });
     });
 
-  // Wrap entire LDAP process in a timeout promise  
+  // Wrap entire LDAP process in a timeout promise
   return Promise.race([
+
+    // -------------------------------------------------------------------------
     // Main LDAP authentication logic
+    // -------------------------------------------------------------------------
     (async () => {
       try {
-        //  1. UPN
+
+        // =====================================================================
+        // 1. UPN
+        // =====================================================================
+
         try {
           const upn = `${userId}${process.env.UPN_METHOD_URL}`;
+
           await tryBind(upn);
-          return { success: true, method: "UPN" };
+
+          return {
+            success: true,
+            method: "UPN",
+          };
+
         } catch (err) {
-          console.log("UPN failed:", err.message);
+          console.log(
+            "UPN failed:",
+            err.message
+          );
         }
 
-        //  2. DOMAIN
+
+        // =====================================================================
+        // 2. DOMAIN
+        // =====================================================================
+
         try {
-          const domainUser = `${process.env.LDAP_DOMAIN}\\${userId}`;
+          const domainUser =
+            `${process.env.LDAP_DOMAIN}\\${userId}`;
+
           await tryBind(domainUser);
-          return { success: true, method: "DOMAIN" };
+
+          return {
+            success: true,
+            method: "DOMAIN",
+          };
+
         } catch (err) {
-          console.log("DOMAIN failed:", err.message);
+          console.log(
+            "DOMAIN failed:",
+            err.message
+          );
         }
 
-        //  3. SEARCH + BIND
+
+        // =====================================================================
+        // 3. SEARCH + BIND
+        // =====================================================================
+
         return new Promise((resolve, reject) => {
+
           client.bind(
             process.env.LDAP_BIND_DN,
             process.env.LDAP_BIND_PASSWORD,
             (err) => {
+
               if (err) {
-                return reject(new Error("Invalid credentials!"));
+                return reject(
+                  new Error("Invalid credentials!")
+                );
               }
 
               const opts = {
                 scope: "sub",
-                filter: `(|(sAMAccountName=${userId})(employeeID=${userId})(cn=${userId}))`,
+
+                filter:
+                  `(|` +
+                  `(sAMAccountName=${userId})` +
+                  `(employeeID=${userId})` +
+                  `(cn=${userId})` +
+                  `)`,
+
                 attributes: ["dn"],
               };
 
-              client.search(baseDN, opts, (err, res) => {
-                if (err) return reject(err);
 
-                let userDN = null;
+              client.search(
+                baseDN,
+                opts,
+                (err, res) => {
 
-                res.on("searchEntry", (entry) => {
-                  userDN = entry.objectName;
-                  console.log("Found user DN:", userDN);
-                });
-
-                res.on("end", async () => {
-                  if (!userDN) {
-                    return reject(new Error("User not found!"));
+                  if (err) {
+                    return reject(err);
                   }
 
-                  try {
-                    await tryBind(userDN);
-                    resolve({ success: true, method: "SEARCH" });
-                  } catch (err) {
-                    reject(new Error("Invalid credentials!"));
-                  }
-                });
-              });
+                  let userDN = null;
+
+
+                  res.on(
+                    "searchEntry",
+                    (entry) => {
+
+                      userDN =
+                        entry.objectName;
+
+                      console.log(
+                        "Found user DN:",
+                        userDN
+                      );
+                    }
+                  );
+
+
+                  res.on(
+                    "end",
+                    async () => {
+
+                      if (!userDN) {
+                        return reject(
+                          new Error(
+                            "User not found!"
+                          )
+                        );
+                      }
+
+                      try {
+
+                        await tryBind(userDN);
+
+                        resolve({
+                          success: true,
+                          method: "SEARCH",
+                        });
+
+                      } catch (err) {
+
+                        reject(
+                          new Error(
+                            "Invalid credentials!"
+                          )
+                        );
+                      }
+                    }
+                  );
+                }
+              );
             }
           );
         });
+
       } catch (err) {
         throw err;
+
       } finally {
-        client.unbind();
+
+        try {
+          client.unbind();
+        } catch (e) {
+          // Ignore unbind errors
+        }
       }
     })(),
-    // Timeout promise - rejects after LDAP_REQUEST_TIMEOUT_MS
+
+    // -------------------------------------------------------------------------
+    // Timeout promise
+    // -------------------------------------------------------------------------
+
     new Promise((_, reject) =>
       setTimeout(
-        () => reject(new Error("ETIMEDOUT")),
+        () =>
+          reject(
+            new Error("ETIMEDOUT")
+          ),
         LDAP_REQUEST_TIMEOUT_MS
       )
     ),
+
   ]).catch((err) => {
+
     // Ensure cleanup on any error
     try {
       client.unbind();
     } catch (e) {
-      // ignore unbind errors
+      // Ignore unbind errors
     }
+
     throw err;
   });
+  */
 };
 
 
-
-// ─── Sign In (Staff - LDAP) ──────────────────────────────────────────────────
+// ─── Sign In (Staff - LDAP / Temporary Local) ─────────────────────────────────
+// The route continues calling authenticateWithLDAP().
+// Currently that function uses local User authentication.
+// When AD is enabled, the same route automatically uses LDAP.
+// ──────────────────────────────────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
   const { userId, password } = req.body;
 
   try {
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. Validate input
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (!userId || !userId.trim()) {
       throw new Error("User ID is required");
     }
+
     if (!password || !password.trim()) {
       throw new Error("Password is required");
     }
 
-    //  1. Authenticate with LDAP
-    const isValidStaff = await authenticateWithLDAP(userId, password);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. Authenticate staff
+    //
+    // CURRENT:
+    // authenticateWithLDAP() → User model + bcrypt
+    //
+    // FUTURE:
+    // authenticateWithLDAP() → Active Directory / LDAP
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const isValidStaff = await authenticateWithLDAP(
+      userId,
+      password
+    );
 
     if (!isValidStaff.success) {
       throw new Error("Invalid credentials!");
     }
 
-    //  2. Find user in DB (employeeId match)
-    const user = await User.findOne({ employeeId: userId });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. Find user in DB
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const user = await User.findOne({
+      employeeId: userId.trim(),
+    });
 
     if (!user) {
-      throw new Error("You don't have access contact HR !");
+      throw new Error(
+        "You don't have access contact HR !"
+      );
     }
 
 
-    //  3. Hash password
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. Create session for currently logged-in user
+    // ─────────────────────────────────────────────────────────────────────────
 
-    //  4. Update password
-    user.password = hashedPassword;
-    user.isPasswordReset = true;
-
-    await user.save();
-
-    // create session for the currenly logged in user
     req.session.isOnline = true;
     req.session.userID = user._id.toString();
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. Save session
+    // ─────────────────────────────────────────────────────────────────────────
+
+    await new Promise((resolve, reject) => {
+      req.session.save((err) => {
+        if (err) {
+          return reject(err);
+        }
+
+        resolve();
+      });
+    });
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6. Audit login
+    // ─────────────────────────────────────────────────────────────────────────
 
     await createAuditLog({
       req,
@@ -1435,37 +1651,101 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
       action: "auth.signin",
       description: "User signed in",
       actor: user,
-      metadata: { signInMethod: "ldap" },
+      metadata: {
+        signInMethod: isValidStaff.method,
+      },
     });
 
-    return res.status(200).json(sanitizeUserResponse(user));
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 7. Return sanitized user
+    // ─────────────────────────────────────────────────────────────────────────
+
+    return res
+      .status(200)
+      .json(sanitizeUserResponse(user));
 
   } catch (error) {
-    console.error("Staff signin error:", error);
 
-    let message = error.message;
+    console.error(
+      "Staff signin error:",
+      error
+    );
+
+    let message =
+      error.message || "Authentication failed";
+
     let statusCode = 400;
 
-    // Handle various LDAP connection errors gracefully
-    if (error.code === "ETIMEDOUT" || message?.includes("ETIMEDOUT") || message?.includes("timeout")) {
-      message = "Active Directory server is currently unavailable. Please try again later or contact your administrator.";
-      statusCode = 503; // Service Unavailable
-    } else if (error.code === "ECONNREFUSED" || message?.includes("ECONNREFUSED")) {
-      message = "Active Directory server is unreachable. Please try again later or contact your administrator.";
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LDAP / Active Directory errors
+    //
+    // These are kept because they will be used automatically
+    // once the LDAP section is enabled.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    if (
+      error.code === "ETIMEDOUT" ||
+      message?.includes("ETIMEDOUT") ||
+      message?.includes("timeout")
+    ) {
+
+      message =
+        "Active Directory server is currently unavailable. Please try again later or contact your administrator.";
+
       statusCode = 503;
-    } else if (error.code === "ENOTFOUND" || message?.includes("ENOTFOUND")) {
-      message = "Active Directory server address not found. Please contact your administrator.";
+
+    } else if (
+      error.code === "ECONNREFUSED" ||
+      message?.includes("ECONNREFUSED")
+    ) {
+
+      message =
+        "Active Directory server is unreachable. Please try again later or contact your administrator.";
+
       statusCode = 503;
-    } else if (message?.includes("Invalid credentials") || message?.includes("User not found")) {
-      message = "Invalid credentials. Please check your user ID and password.";
-      statusCode = 401; // Unauthorized
+
+    } else if (
+      error.code === "ENOTFOUND" ||
+      message?.includes("ENOTFOUND")
+    ) {
+
+      message =
+        "Active Directory server address not found. Please contact your administrator.";
+
+      statusCode = 503;
+
+    } else if (
+      message?.includes("Invalid credentials") ||
+      message?.includes("User not found")
+    ) {
+
+      message =
+        "Invalid credentials. Please check your Staff Number and Password.";
+
+      statusCode = 401;
+
+    } else if (
+      message?.includes("don't have access")
+    ) {
+
+      statusCode = 403;
     }
 
-    return res.status(statusCode).json({ message });
+
+    return res
+      .status(statusCode)
+      .json({
+        message,
+      });
   }
 });
 
 
+
+
+// PASSWORD RESET REQUEST
 app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
   try {
     const email = String(req.body?.email || "")
@@ -1499,8 +1779,11 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
       throw new Error("No account was found for that email address.");
     }
 
+
+
+
     // AD users cannot self-reset
-    if (user.role === "employee") {
+   /*  if (user.role === "employee") {
       await createAuditLog({
         req,
         category: "password_reset",
@@ -1518,7 +1801,9 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
         message:
           "This account is managed by Active Directory. Please contact ICT support.",
       });
-    }
+    } */
+
+
 
 
     // if user profile ispassword reset flag is true, then they cannot request another password reset
@@ -1542,6 +1827,7 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
       });
     }
 
+    
     // Generate temporary password
     const temporaryPassword = generateResetCode();
 
@@ -1587,6 +1873,8 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
     });
   }
 });
+
+
 
 
 
