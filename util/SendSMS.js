@@ -3,18 +3,22 @@ import axios from 'axios';
 import "dotenv/config";
 import PlatformConfig from "../model/PlatformConfig.js";
 
-const formatReminderTemplate = (template, user) => {
-    const firstName = user?.name?.split(' ')[0] || 'User';
-    const fullName = user?.name || firstName;
-    let message = String(template || '').trim();
-    if (!message) return '';
-    return message
-        .replace(/\{firstName\}/gi, firstName)
-        .replace(/\{email\}/gi, user?.email)
-        .replace(/\{phone\}/gi, user?.phone)
-        .replace(/\{station\}/gi, user?.station)
-        .replace(/\{department\}/gi, user?.department)
-        .replace(/\{name\}/gi, fullName);
+const formatReminderTemplate = (template, user, password = '') => {
+  const firstName = user?.name?.split(' ')[0] || 'User';
+  const fullName = user?.name || firstName;
+
+  let message = String(template || '').trim();
+  if (!message) return '';
+
+  return message
+    .replace(/{firstName}/gi, firstName)
+    .replace(/{fullName}/gi, fullName)
+    .replace(/{email}/gi, user?.email || '')
+    .replace(/{phone}/gi, user?.phone || '')
+    .replace(/{employeeId}/gi, user?.employeeId || '')
+    .replace(/{station}/gi, user?.station || '')
+    .replace(/{department}/gi, user?.department || '')
+    .replace(/{password}/gi, password);
 };
 
 
@@ -37,25 +41,34 @@ const normalizeKenyaPhone = (phone) => {
   return null;
 };
 
+export const SendMessageNow = async (
+  user,
+  messageParams = "",
+  plainPassword = ""
+) => {
+  const cfg = await PlatformConfig.getSingleton();
 
-export const SendMessageNow = async (user,messageParams="") => {
+  const templateMessage =
+    user?.role === "employee"
+      ? cfg.notificationReminders.staffRegMessage
+      : cfg.notificationReminders.internRegMessage;
 
-    // load platform cong especially for message
-    const cfg = await PlatformConfig.getSingleton();
-    // staff and intern/attachee will receive appropriate message
-    const templateMessage = user?.role === "employee" ? cfg.notificationReminders.staffRegMessage : cfg.notificationReminders.internRegMessage;
-    const message = formatReminderTemplate(templateMessage, user)
-    // force format the phone number to kenyan standard
-    const validPhone=normalizeKenyaPhone(user.phone)
-    
-    return axios.get("https://client.airtouch.co.ke:9012/sms/api/", {
-        params: {
-            issn: "TNC013",
-            msisdn: validPhone,
-            text: messageParams || message,
-            username: process.env.SMS_USERNAME,
-            password: process.env.SMS_PASSWORD
-        }
-    });
+  const message = formatReminderTemplate(
+    templateMessage,
+    user,
+    plainPassword
+  );
+
+  const validPhone = normalizeKenyaPhone(user.phone);
+
+  return axios.get("https://client.airtouch.co.ke:9012/sms/api/", {
+    params: {
+      issn: "TNC013",
+      msisdn: validPhone,
+      text: messageParams || message,
+      username: process.env.SMS_USERNAME,
+      password: process.env.SMS_PASSWORD
+    }
+  });
 };
 

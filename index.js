@@ -746,10 +746,14 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
     }
 
     const data = req.body.formData;
-    const { email, password, role } = data;
+    const { email, role } = data;
+    // password randomly generated for new users, they can reset it later
+    const randomPassword = generateResetCode();
+    data.password = randomPassword;
+
+    const { password } = data;
 
     if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
-    if (!password || password.length < 4) throw new Error("Password must be at least 4 characters!");
     if (!data.phone?.trim()) throw new Error("Phone number is required.");
 
     if (['intern', 'attachee'].includes(role)) {
@@ -799,8 +803,6 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
       if (duplicate.phone === normalizedPhone)
         throw new Error("Phone number already exists.");
     }
-
-
     const hashedPassword = await bcrypt.hash(password, 10);
     const createdUser = await User.create({ ...data, password: hashedPassword });
     // Create audit log for single user registration by HR
@@ -824,7 +826,7 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
 
 
     // send sms to the intern or attache
-    await SendMessageNow(createdUser)
+    await SendMessageNow(createdUser, "", password)
 
     // return the success response
     return res.status(200).json({ message: "Account created successfully", user: createdUser });
@@ -862,17 +864,13 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
       department,
       station,
       employeeId,
-      staffNo
     } = req.body.formData;
 
     if (!name?.trim())
       throw new Error("Full name is required.");
 
     if (!employeeId?.trim())
-      throw new Error("Employee ID is required.");
-
-    if (!staffNo?.trim())
-      throw new Error("Staff number is required.");
+      throw new Error("Employee Staff Number is required.");
 
     if (!department?.trim())
       throw new Error("Department is required.");
@@ -896,7 +894,6 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
         { email },
         { phone: normalizedPhone },
         { employeeId },
-        { staffNo }
       ]
     });
 
@@ -908,13 +905,14 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
         throw new Error("Phone number already exists.");
 
       if (duplicate.employeeId === employeeId)
-        throw new Error("Employee ID already exists.");
-
-      if (duplicate.staffNo === staffNo)
-        throw new Error("Staff Number already exists.");
+        throw new Error("Employee Staff Number already exists.");
     }
 
-    const password = await bcrypt.hash(employeeId, 10);
+
+    // randomly generate a password for the new staff member
+    const randomPassword = generateResetCode();
+
+    const hashedPassword = await bcrypt.hash(randomPassword, 10);
 
     const createdUser = await User.create({
       name,
@@ -924,8 +922,7 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
       department,
       station,
       employeeId,
-      staffNo,
-      password
+      password: hashedPassword
     });
 
     await createAuditLog({
@@ -942,14 +939,13 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
           station: createdUser.station,
           email: createdUser.email,
           employeeId: createdUser.employeeId,
-          staffNo: createdUser.staffNo
         }
       }
     });
 
 
     // send message to the reg staff
-    await SendMessageNow(createdUser)
+    await SendMessageNow(createdUser, "", randomPassword);
 
     // return response
     return res.status(201).json({
@@ -997,12 +993,10 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
     // O(1) duplicate detection
     const emailSet = new Set();
     const employeeIdSet = new Set();
-    const staffNoSet = new Set();
     const phoneSet = new Set();
 
     const emails = [];
     const employeeIds = [];
-    const staffNos = [];
     const phones = [];
 
     // --------------------
@@ -1016,7 +1010,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
         const email = user.email?.trim().toLowerCase();
         const name = user.name?.trim();
         const employeeId = user.employeeId?.toString().trim();
-        const staffNo = user.staffNo?.toString().trim() || "";
         const role = (user.role || "employee").toLowerCase().trim();
         const phone = normalizeKenyaPhone(user.phone?.trim(), true);
 
@@ -1056,10 +1049,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           continue;
         }
 
-        if (staffNo && staffNoSet.has(staffNo)) {
-          errors.push(`Row ${row}: Duplicate Staff No in uploaded file.`);
-          continue;
-        }
 
         if (phoneSet.has(phone)) {
           errors.push(`Row ${row}: Duplicate phone number in uploaded file.`);
@@ -1070,11 +1059,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
         employeeIdSet.add(employeeId);
         phoneSet.add(phone);
 
-        if (staffNo) {
-          staffNoSet.add(staffNo);
-          staffNos.push(staffNo);
-        }
-
         emails.push(email);
         employeeIds.push(employeeId);
         phones.push(phone);
@@ -1082,7 +1066,6 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
         validatedUsers.push({
           row,
           employeeId,
-          staffNo,
           name,
           email,
           phone,
@@ -1112,14 +1095,12 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
       $or: [
         { email: { $in: emails } },
         { employeeId: { $in: employeeIds } },
-        { staffNo: { $in: staffNos } },
         { phone: { $in: phones } }
       ]
     }).lean();
 
     const existingEmails = new Set(existingUsers.map(u => u.email));
     const existingEmployeeIds = new Set(existingUsers.map(u => u.employeeId));
-    const existingStaffNos = new Set(existingUsers.map(u => u.staffNo).filter(Boolean));
     const existingPhones = new Set(existingUsers.map(u => u.phone));
 
     // --------------------
@@ -1135,14 +1116,10 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
       }
 
       if (existingEmployeeIds.has(user.employeeId)) {
-        errors.push(`Row ${user.row}: Employee ID already exists.`);
+        errors.push(`Row ${user.row}: Employee Staff Number already exists.`);
         continue;
       }
 
-      if (user.staffNo && existingStaffNos.has(user.staffNo)) {
-        errors.push(`Row ${user.row}: Staff No already exists.`);
-        continue;
-      }
 
       if (existingPhones.has(user.phone)) {
         errors.push(`Row ${user.row}: Phone number already exists.`);
@@ -1164,12 +1141,15 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
     // --------------------
     // Hash Passwords Concurrently
     // --------------------
-    await Promise.all(
-      finalUsers.map(async user => {
-        const defaultPassword =
-          process.env.DEFAULT_PASSWORD_SUFFIX || user.employeeId;
+    // 6. Generate unique random passwords and hash them
+    const usersWithPasswords = finalUsers.map(user => ({
+      user,
+      plainPassword: generateResetCode()
+    }));
 
-        user.password = await bcrypt.hash(defaultPassword, 10);
+    await Promise.all(
+      usersWithPasswords.map(async ({ user, plainPassword }) => {
+        user.password = await bcrypt.hash(plainPassword, 10);
         user.isPasswordReset = false;
       })
     );
@@ -1179,10 +1159,15 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
       ordered: false
     });
 
-
-    // send message
+    // 8. Send each user their actual generated password
     await Promise.allSettled(
-      createdUsers.map(user => SendMessageNow(user))
+      createdUsers.map((user, index) =>
+        SendMessageNow(
+          user,
+          "",
+          usersWithPasswords[index].plainPassword
+        )
+      )
     );
 
     // Build registered users summary for audit metadata
@@ -1783,25 +1768,25 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
 
 
     // AD users cannot self-reset
-   /*  if (user.role === "employee") {
-      await createAuditLog({
-        req,
-        category: "password_reset",
-        action: "password_reset.request_rejected",
-        description: "Password reset requested for AD-managed account.",
-        actor: user,
-        target: user,
-        metadata: {
-          reason: "ad_managed_account",
-        },
-        status: "failed",
-      });
-
-      return res.status(403).json({
-        message:
-          "This account is managed by Active Directory. Please contact ICT support.",
-      });
-    } */
+    /*  if (user.role === "employee") {
+       await createAuditLog({
+         req,
+         category: "password_reset",
+         action: "password_reset.request_rejected",
+         description: "Password reset requested for AD-managed account.",
+         actor: user,
+         target: user,
+         metadata: {
+           reason: "ad_managed_account",
+         },
+         status: "failed",
+       });
+ 
+       return res.status(403).json({
+         message:
+           "This account is managed by Active Directory. Please contact ICT support.",
+       });
+     } */
 
 
 
@@ -1827,7 +1812,7 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
       });
     }
 
-    
+
     // Generate temporary password
     const temporaryPassword = generateResetCode();
 

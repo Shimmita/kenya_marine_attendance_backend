@@ -202,21 +202,35 @@ const defaultThemes = [
 const defaultNotificationReminders = {
     clockInReminderMinutes: 15,
     clockOutReminderMinutes: 15,
-    clockInMessage: 'Dear {firstName}, you did not clock in today and this may negatively impact your attendance and performance record, always remember to clock in and out for your scheduled KMFRI workday.',
-    clockOutMessage: 'Dear {firstName}, please remember to clock out before leaving your assigned station.',
-    internRegMessage: `Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your email ({email}) and the default password ${process.env.DEFAULT_PASSWORD_SUFFIX} to start clocking and recording your attendance. Please change your password after your first login.`,
-    staffRegMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been created successfully. Log in using your staff portal credentials to start clocking and recording your attendance.',
-    authorisedClockOut: 'Dear {firstName}, you have been authorised to clock out outside of your assigned station premises.',
-    clockOutsideGrantedMessage: 'Dear {firstName}, you have been granted permission to clock outside of your assigned station "{station}" from {startDate} to {endDate} for the reason "{reason}".',
-    clockOutsideRevokedMessage: 'Dear {firstName}, your permission to clock outside of your assigned station "{station}" has been revoked. Please follow the standard clocking procedures.',
-    accountActivatedMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been activated. You can now access attendance services.',
-    accountDeactivatedMessage: 'Dear {firstName}, your KMFRI Attendance Management System account has been deactivated. Please contact HR for assistance.',
-    leaveSubmittedMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been submitted successfully and is awaiting review.',
-    leaveApprovedMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been approved.',
-    leaveRejectedMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been rejected. Please contact your supervisor or HR for clarification.',
-    leaveCancelledMessage: 'Dear {firstName}, your {type} request from {startDate} to {endDate} has been cancelled successfully.',
-    missedClockOutMessage: "Dear {firstName}, KMFRI attendance system records indicate you forgot to clock out yesterday.",
-    absentMessage: "Dear {firstName}, KMFRI attendance system records indicate that you did not report attendance yesterday.",
+    clockInMessage: 'Dear {firstName}, you did not clock in today. Please remember to clock in and out for your scheduled workday.',
+
+    clockOutMessage: 'Dear {firstName}, please remember to clock out before leaving your station.',
+
+    internRegMessage: `Dear {firstName}, your KMFRI Attendance account is ready. Login: {email} | Password: {password}. Please change your password after login.`,
+
+    staffRegMessage: `Dear {firstName}, your KMFRI Attendance account is ready. Login: {employeeId} | Password: {password}. Please change your password after login.`,
+
+    authorisedClockOut: 'Dear {firstName}, you are authorised to clock out outside your assigned station.',
+
+    clockOutsideGrantedMessage: 'Dear {firstName}, permission to clock outside "{station}" is granted from {startDate} to {endDate}. Reason: {reason}.',
+
+    clockOutsideRevokedMessage: 'Dear {firstName}, permission to clock outside "{station}" has been revoked. Please follow standard clocking procedures.',
+
+    accountActivatedMessage: 'Dear {firstName}, your KMFRI Attendance account has been activated. You may now access attendance services.',
+
+    accountDeactivatedMessage: 'Dear {firstName}, your KMFRI Attendance account has been deactivated. Please contact HR for assistance.',
+
+    leaveSubmittedMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) has been submitted for review.',
+
+    leaveApprovedMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) has been approved.',
+
+    leaveRejectedMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) was rejected. Please contact your supervisor or HR.',
+
+    leaveCancelledMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) has been cancelled.',
+
+    missedClockOutMessage: 'Dear {firstName}, you did not clock out yesterday. Please ensure you complete your attendance records.',
+
+    absentMessage: 'Dear {firstName}, no attendance was recorded for you yesterday. Please contact HR if this is incorrect.',
 
     channels: ["sms", "in_app"]
 };
@@ -255,7 +269,7 @@ const defaultAttendancePolicy = {
 const defaultMasterSettings = {
     maintenanceMode: false,
     requirePasswordResetOnFirstLogin: false,
-    
+
 };
 
 const stationSchema = new mongoose.Schema({

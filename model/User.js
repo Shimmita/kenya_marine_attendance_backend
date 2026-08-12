@@ -42,9 +42,7 @@ const userSchema = new mongoose.Schema(
       type: String, default: "",
       unique: true, sparse: true, trim: true
     },
-    staffNo: {
-      type: String, default: ""
-    },
+  
     role: {
       type: String,
       lowercase: true,
