@@ -44,7 +44,7 @@ const sendSMS = async (user, message) => {
             return false;
         }
 
-        await SendMessageNow(user, message);
+        await SendMessageNow(user, message, "");
 
         return true;
 
@@ -70,6 +70,9 @@ const sendSMS = async (user, message) => {
 const sendInApp = async (user, message, type) => {
 
     console.log(`IN-APP -> ${user?.email || "unknown"} (${type})`);
+
+    // send SMS for now 
+    await sendSMS(user, message);
 
     return true;
 
