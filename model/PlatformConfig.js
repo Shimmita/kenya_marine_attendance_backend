@@ -249,11 +249,11 @@ const defaultAttendancePolicy = {
 
     gracePeriodMinutes: 15,
 
-    // NEW
+    // NEW patch later
     clockInReminderOffsetMinutes: 0,
 
     // NEW
-    clockOutReminderOffsetMinutes: 30,
+    clockOutReminderOffsetMinutes: 0,
 
     // NEW
     midnightProcessingTime: "00:00",
@@ -345,12 +345,12 @@ const platformConfigSchema = new mongoose.Schema({
 
         clockInReminderOffsetMinutes: {
             type: Number,
-            default: 0
+            default: defaultAttendancePolicy.clockInReminderOffsetMinutes
         },
 
         clockOutReminderOffsetMinutes: {
             type: Number,
-            default: 15
+            default: defaultAttendancePolicy.clockOutReminderOffsetMinutes
         },
 
         midnightProcessingTime: {
@@ -365,12 +365,12 @@ const platformConfigSchema = new mongoose.Schema({
 
         allowClockOutsideStation: {
             type: Boolean,
-            default: false
+            default: defaultAttendancePolicy.allowClockOutsideStation
         },
 
         requireBiometricVerification: {
             type: Boolean,
-            default: true
+            default: defaultAttendancePolicy.requireBiometricVerification
         }
 
     },
