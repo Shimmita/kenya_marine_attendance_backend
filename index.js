@@ -135,6 +135,113 @@ const isReminderTriggerAuthorized = (req) => {
 
 
 
+// PARSE DATES
+const parseSafeDate = (value, fieldName = "date") => {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error(`Invalid ${fieldName}`);
+    }
+
+    return new Date(value.getTime());
+  }
+
+  const valueString = String(value).trim();
+
+  // Only accept ISO date format: YYYY-MM-DD
+  const dateOnlyMatch = valueString.match(
+    /^(\d{4})-(\d{2})-(\d{2})$/
+  );
+
+  if (dateOnlyMatch) {
+    const year = Number(dateOnlyMatch[1]);
+    const month = Number(dateOnlyMatch[2]);
+    const day = Number(dateOnlyMatch[3]);
+
+    // Explicit construction avoids Windows/Linux parsing differences.
+    const date = new Date(year, month - 1, day);
+
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== month - 1 ||
+      date.getDate() !== day
+    ) {
+      throw new Error(`Invalid ${fieldName}: ${valueString}`);
+    }
+
+    return date;
+  }
+
+  // Full ISO timestamp
+  if (valueString.includes("T")) {
+    const date = new Date(valueString);
+
+    if (Number.isNaN(date.getTime())) {
+      throw new Error(`Invalid ${fieldName}: ${valueString}`);
+    }
+
+    return date;
+  }
+
+  throw new Error(
+    `Invalid ${fieldName} format. Expected YYYY-MM-DD. Received: ${valueString}`
+  );
+};
+
+
+const getSafeDateRange = (startDate, endDate) => {
+  const now = new Date();
+
+  let start;
+
+  if (startDate) {
+    start = parseSafeDate(startDate, "startDate");
+  } else {
+    start = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      1
+    );
+  }
+
+  let end;
+
+  if (endDate) {
+    end = parseSafeDate(endDate, "endDate");
+  } else {
+    end = new Date(now);
+  }
+
+  if (!start || Number.isNaN(start.getTime())) {
+    throw new Error("Invalid startDate");
+  }
+
+  if (!end || Number.isNaN(end.getTime())) {
+    throw new Error("Invalid endDate");
+  }
+
+  // Full date range
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+
+  if (start > end) {
+    throw new Error("startDate cannot be after endDate");
+  }
+
+  return {
+    start,
+    end,
+  };
+};
+
+
+// 
+
+
+
 const getAnalyticsContext = async (req) => {
   if (!req.session?.isOnline) {
     const error = new Error("Unauthorized Access");
@@ -448,23 +555,7 @@ const sanitizeUserResponse = (user) => {
   return safeUser;
 };
 
-const nowTime = new Date();
 
-const formattedDate = nowTime.toLocaleDateString("en-KE", {
-  weekday: "long",
-  year: "numeric",
-  month: "long",
-  day: "numeric",
-  timeZone: "Africa/Nairobi",
-});
-
-const formattedTime = nowTime.toLocaleTimeString("en-KE", {
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: false,
-  timeZone: "Africa/Nairobi",
-});
 
 const buildAuditRequestContext = (req) => ({
   ipAddress:
@@ -600,6 +691,40 @@ const ensureSinglePrimaryDevice = async (email) => {
 
   return getActiveUserDevices(email);
 };
+
+
+
+const EAT_TIMEZONE = "Africa/Nairobi";
+
+const getCurrentTime = () => new Date();
+
+const formatEATDateTime = (date = new Date()) => {
+  const formattedDate = date.toLocaleDateString("en-KE", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: EAT_TIMEZONE,
+  });
+
+  const formattedTime = date.toLocaleTimeString("en-KE", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZone: EAT_TIMEZONE,
+  });
+
+  return {
+    formattedDate,
+    formattedTime,
+  };
+};
+
+
+
+
+
 // ─────────────────────────────────────────────────────────────
 // Database
 // ─────────────────────────────────────────────────────────────
@@ -2356,22 +2481,59 @@ const finalizeStaleClocking = async (user, now = new Date()) => {
  *        counter:   number
  *      }
  */
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BIOMETRIC AUTHENTICATION + CLOCK IN / CLOCK OUT
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
   try {
-    // metadata returned to client for debugging/confirmation
-    let verifyResultMeta = { clockedOutside: false, outsideLocation: null };
+    // ───────────────────────────────────────────────────────────────────────
+    // 1. SESSION AUTHORIZATION
+    // ───────────────────────────────────────────────────────────────────────
+
     if (!req.session.isOnline) {
-      return res.status(401).json({ verified: false, message: "Unauthorized" });
+      return res.status(401).json({
+        verified: false,
+        message: "Unauthorized",
+      });
     }
 
-    let user = await clearExpiredOutsideClocking(await User.findById(req.session.userID));
-    user = await finalizeStaleClocking(user);
-    const authenticators = getUserAuthenticators(user);
-    if (!user || authenticators.length === 0) {
-      return res.status(400).json({ verified: false, message: "Fingerprint not registered" });
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 2. LOAD USER
+    // ───────────────────────────────────────────────────────────────────────
+
+    let user = await User.findById(req.session.userID);
+
+    if (!user) {
+      return res.status(404).json({
+        verified: false,
+        message: "User not found",
+      });
     }
+
+    user = await clearExpiredOutsideClocking(user);
+    user = await finalizeStaleClocking(user);
+
+    const authenticators = getUserAuthenticators(user);
+
+    if (!authenticators || authenticators.length === 0) {
+      return res.status(400).json({
+        verified: false,
+        message: "Fingerprint not registered",
+      });
+    }
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 3. AUTHENTICATION CHALLENGE
+    // ───────────────────────────────────────────────────────────────────────
 
     const expectedChallenge = req.session.authChallenge;
+
     if (!expectedChallenge) {
       return res.status(400).json({
         verified: false,
@@ -2379,8 +2541,24 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       });
     }
 
-    // extract selected station, optional outsideLocation and auth response from request body
-    const { selectedStation, userCoords, device_fingerprint, outsideLocation, ...authResponse } = req.body;
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 4. REQUEST DATA
+    // ───────────────────────────────────────────────────────────────────────
+
+    const {
+      selectedStation,
+      userCoords,
+      device_fingerprint,
+      outsideLocation,
+      ...authResponse
+    } = req.body;
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 5. FIND MATCHING AUTHENTICATOR
+    // ───────────────────────────────────────────────────────────────────────
+
     const matchedAuthenticator =
       authenticators.find(
         (authenticator) =>
@@ -2393,214 +2571,726 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           !authenticator.deviceFingerprint
       ) ||
       authenticators.find(
-        (authenticator) => authenticator.credentialID === authResponse.id
+        (authenticator) =>
+          authenticator.credentialID === authResponse.id
       );
 
     if (!matchedAuthenticator) {
-      return res.status(401).json({ verified: false, message: "This device is not enrolled for clocking." });
+      return res.status(401).json({
+        verified: false,
+        message:
+          "This device is not enrolled for clocking.",
+      });
     }
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 6. VERIFY DEVICE APPROVAL
+    // ───────────────────────────────────────────────────────────────────────
 
     const matchedDevice = await Devices.findOne({
       user_email: user.email,
-      device_fingerprint: matchedAuthenticator.deviceFingerprint || device_fingerprint,
-      device_lost: { $ne: true },
+
+      device_fingerprint:
+        matchedAuthenticator.deviceFingerprint ||
+        device_fingerprint,
+
+      device_lost: {
+        $ne: true,
+      },
     });
 
     if (!matchedDevice) {
-      return res.status(403).json({ verified: false, message: "This device has not been approved for clocking." });
+      return res.status(403).json({
+        verified: false,
+        message:
+          "This device has not been approved for clocking.",
+      });
     }
 
-    const verification = await verifyAuthenticationResponse({
-      response: authResponse,
-      expectedChallenge,
-      expectedOrigin: getExpectedOrigin(),
-      expectedRPID: getRpID(),
-      //  v10+ shape: `credential` not `authenticator`, `id` not `credentialID`,
-      //    `publicKey` (Uint8Array) not `credentialPublicKey` (Buffer)
-      credential: {
-        id: matchedAuthenticator.credentialID,                                         // base64url string
-        publicKey: new Uint8Array(
-          Buffer.from(matchedAuthenticator.credentialPublicKey, "base64url")           // base64url → Uint8Array
-        ),
-        counter: matchedAuthenticator.counter,
-      },
-      requireUserVerification: true,
-    });
 
-    if (!verification.verified) return res.status(401).json({ verified: false });
+    // ───────────────────────────────────────────────────────────────────────
+    // 7. VERIFY WEBAUTHN RESPONSE
+    // ───────────────────────────────────────────────────────────────────────
 
-    // Update counter to prevent replay attacks
-    user.authenticators = authenticators.map((authenticator) =>
-      authenticator.credentialID === matchedAuthenticator.credentialID &&
-        (authenticator.deviceFingerprint || "") === (matchedAuthenticator.deviceFingerprint || "")
-        ? {
-          ...(authenticator.toObject?.() || authenticator),
-          counter: verification.authenticationInfo.newCounter,
-          lastUsedAt: new Date(),
+    const verification =
+      await verifyAuthenticationResponse({
+        response: authResponse,
+
+        expectedChallenge,
+
+        expectedOrigin:
+          getExpectedOrigin(),
+
+        expectedRPID:
+          getRpID(),
+
+        credential: {
+          id: matchedAuthenticator.credentialID,
+
+          publicKey: new Uint8Array(
+            Buffer.from(
+              matchedAuthenticator.credentialPublicKey,
+              "base64url"
+            )
+          ),
+
+          counter:
+            matchedAuthenticator.counter,
+        },
+
+        requireUserVerification: true,
+      });
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 8. BIOMETRIC VERIFICATION FAILED
+    // ───────────────────────────────────────────────────────────────────────
+
+    if (!verification.verified) {
+      return res.status(401).json({
+        verified: false,
+        message: "Biometric verification failed.",
+      });
+    }
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 9. UPDATE AUTHENTICATOR COUNTER
+    // ───────────────────────────────────────────────────────────────────────
+
+    user.authenticators = authenticators.map(
+      (authenticator) => {
+
+        const sameCredential =
+          authenticator.credentialID ===
+          matchedAuthenticator.credentialID;
+
+        const sameDevice =
+          (authenticator.deviceFingerprint || "") ===
+          (matchedAuthenticator.deviceFingerprint || "");
+
+        if (
+          sameCredential &&
+          sameDevice
+        ) {
+          return {
+            ...(authenticator.toObject?.() ||
+              authenticator),
+
+            counter:
+              verification
+                .authenticationInfo
+                .newCounter,
+
+            lastUsedAt:
+              new Date(),
+          };
         }
-        : authenticator
+
+        return authenticator;
+      }
     );
+
+    // Clear legacy single authenticator
     user.authenticator = undefined;
 
-    // save in the db
     await user.save();
 
-    // save clocking in data in East African Time (EAT) timezone
-    if (!user?.hasClockedIn && !user?.isToClockOut) {
 
-      const now = new Date();
+    // ───────────────────────────────────────────────────────────────────────
+    // 10. GET FRESH CLOCKING TIMESTAMP
+    //
+    // IMPORTANT:
+    // This is deliberately created AFTER successful biometric verification.
+    // MongoDB receives the actual Date object.
+    // ───────────────────────────────────────────────────────────────────────
 
-      // Convert to Nairobi time
-      const eatTime = new Date(
-        now.toLocaleString("en-US", { timeZone: "Africa/Nairobi" })
-      );
+    const clockingTime = getCurrentTime();
 
-      const attendancePolicy = await getAttendancePolicy();
-      const targetClockIn = parseAttendanceTime(attendancePolicy.standardClockIn || '08:00', eatTime) || eatTime;
-      const graceMinutes = Number(attendancePolicy.gracePeriodMinutes ?? 15);
-      const graceDeadline = new Date(targetClockIn.getTime() + graceMinutes * 60 * 1000);
-      const isLate = eatTime > graceDeadline;
-      const isEmployee = user.role === "employee";
+    const {
+      formattedDate,
+      formattedTime,
+    } = formatEATDateTime(
+      clockingTime
+    );
+
+
+    // Debugging
+    console.log(
+      `[CLOCKING] ${user.email}`
+    );
+
+    console.log(
+      `UTC: ${clockingTime.toISOString()}`
+    );
+
+    console.log(
+      `EAT: ${formattedDate} ${formattedTime}`
+    );
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 11. FIND LATEST CLOCKING RECORD
+    //
+    // Database is the source of truth.
+    // ───────────────────────────────────────────────────────────────────────
+
+    const latestClocking =
+      await Clocking
+        .findOne({
+          email: user.email,
+        })
+        .sort({
+          clock_in: -1,
+        });
+
+
+    // An open record means the user has clocked in
+    // but has not yet clocked out.
+
+    const hasOpenClocking =
+      latestClocking &&
+      !latestClocking.clock_out;
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 12. DETERMINE ACTION
+    // ───────────────────────────────────────────────────────────────────────
+
+    const isClockingIn =
+      !hasOpenClocking;
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // 13. RESPONSE METADATA
+    // ───────────────────────────────────────────────────────────────────────
+
+    const verifyResultMeta = {
+      action: isClockingIn
+        ? "clock_in"
+        : "clock_out",
+
+      clockedOutside: false,
+
+      outsideLocation: null,
+
+      date: formattedDate,
+
+      time: formattedTime,
+
+      timezone: EAT_TIMEZONE,
+    };
+
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // CLOCK IN
+    // ═════════════════════════════════════════════════════════════════════════
+
+    if (isClockingIn) {
+
+      // ─────────────────────────────────────────────────────────────────────
+      // ATTENDANCE POLICY
+      // ─────────────────────────────────────────────────────────────────────
+
+      const attendancePolicy =
+        await getAttendancePolicy();
+
+
+      /*
+       * Your parseAttendanceTime function should interpret
+       * standardClockIn in Africa/Nairobi.
+       *
+       * We do NOT convert Date -> string -> Date.
+       */
+
+      const targetClockIn =
+        parseAttendanceTime(
+          attendancePolicy.standardClockIn ||
+          "08:00",
+
+          clockingTime
+        ) || clockingTime;
+
+
+      const graceMinutes =
+        Number(
+          attendancePolicy.gracePeriodMinutes ??
+          15
+        );
+
+
+      const graceDeadline =
+        new Date(
+          targetClockIn.getTime() +
+          graceMinutes * 60 * 1000
+        );
+
+
+      const isLate =
+        clockingTime >
+        graceDeadline;
+
+
+      const isEmployee =
+        user.role === "employee";
+
+
+      // ─────────────────────────────────────────────────────────────────────
+      // CLOCKING DATA
+      // ─────────────────────────────────────────────────────────────────────
 
       const clockingData = {
-        name: user.name,
-        email: user.email,
-        department: user.department,
-        supervisor: isEmployee ? "" : user.supervisor,
-        station: selectedStation,
-        phone: user.phone,
-        // store UTC
-        clock_in: now,
-        // updated when is clocking out, store UTC
-        clock_out: null,
-        // value isLate is determined at clock-in time
-        isLate: isLate,
-        // will update later when clocking out
-        isPresent: false,
+
+        name:
+          user.name,
+
+        email:
+          user.email,
+
+        department:
+          user.department,
+
+        supervisor:
+          isEmployee
+            ? ""
+            : user.supervisor,
+
+        station:
+          selectedStation ||
+          user.station ||
+          "",
+
+        phone:
+          user.phone,
+
+        // Store actual Date.
+        // MongoDB stores the instant in UTC.
+        clock_in:
+          clockingTime,
+
+        clock_out:
+          null,
+
+        isLate:
+          isLate,
+
+        isPresent:
+          false,
+
         userLocation: {
-          latitude: userCoords?.latitude || null,
-          longitude: userCoords?.longitude || null,
-        }
+
+          latitude:
+            userCoords?.latitude ??
+            null,
+
+          longitude:
+            userCoords?.longitude ??
+            null,
+        },
       };
 
-      const canClockOutsideNow = isOutsideClockingAuthorizedNow(user, now);
 
-      // Only persist outside-clock metadata while the user's dated authorization is active.
+      // ─────────────────────────────────────────────────────────────────────
+      // OUTSIDE CLOCKING
+      // ─────────────────────────────────────────────────────────────────────
+
+      const canClockOutsideNow =
+        isOutsideClockingAuthorizedNow(
+          user,
+          clockingTime
+        );
+
+
       if (canClockOutsideNow) {
-        clockingData.outsideLocation = outsideLocation || "";
-        clockingData.clockInLocationName = outsideLocation || "";
-        clockingData.clockedOutSide = true;
-        clockingData.outSideReason = user.outsideClockingDetails?.reason || "";
-        verifyResultMeta.clockedOutside = true;
-        verifyResultMeta.outsideLocation = outsideLocation || null;
-      } else {
-        if (outsideLocation) {
-          console.debug('outsideLocation provided but user not authorized', { email: user.email, canClockOutside: user.canClockOutside, outsideClockingDetails: user.outsideClockingDetails });
-        }
+
+        clockingData.outsideLocation =
+          outsideLocation || "";
+
+        clockingData.clockInLocationName =
+          outsideLocation || "";
+
+        clockingData.clockedOutSide =
+          true;
+
+        clockingData.outSideReason =
+          user.outsideClockingDetails?.reason ||
+          "";
+
+        verifyResultMeta.clockedOutside =
+          true;
+
+        verifyResultMeta.outsideLocation =
+          outsideLocation || null;
+      }
+      else if (outsideLocation) {
+
+        console.debug(
+          "outsideLocation provided but user not authorized",
+          {
+            email: user.email,
+
+            canClockOutside:
+              user.canClockOutside,
+
+            outsideClockingDetails:
+              user.outsideClockingDetails,
+          }
+        );
       }
 
-      await Clocking.create(clockingData);
 
-      user.hasClockedIn = true;
-      user.isToClockOut = true;
+      // ─────────────────────────────────────────────────────────────────────
+      // CREATE CLOCK-IN
+      // ─────────────────────────────────────────────────────────────────────
+
+      const createdClocking =
+        await Clocking.create(
+          clockingData
+        );
+
+
+      // ─────────────────────────────────────────────────────────────────────
+      // UPDATE USER STATE
+      // ─────────────────────────────────────────────────────────────────────
+
+      user.hasClockedIn =
+        true;
+
+      user.isToClockOut =
+        true;
 
       await user.save();
 
-      // send message clock
+
+      // ─────────────────────────────────────────────────────────────────────
+      // SEND CLOCK-IN MESSAGE
+      // ─────────────────────────────────────────────────────────────────────
+
       await SendMessageNow(
         user,
-        `Dear ${user.name}, you have successfully checked in at ${user.station} on ${formattedDate} at ${formattedTime}.We wish you a productive day.`
+
+        `Dear ${user.name}, you have successfully checked in at ${clockingData.station} on ${formattedDate} at ${formattedTime} EAT.`
       );
 
+
+      // ─────────────────────────────────────────────────────────────────────
+      // AUDIT LOG
+      // ─────────────────────────────────────────────────────────────────────
+
       await createAuditLog({
+
         req,
-        category: "attendance",
-        action: "attendance.clock_in",
-        description: "User clocked in",
-        actor: user,
+
+        category:
+          "attendance",
+
+        action:
+          "attendance.clock_in",
+
+        description:
+          "User clocked in",
+
+        actor:
+          user,
+
         metadata: {
-          station: selectedStation,
-          clockedOutside: verifyResultMeta.clockedOutside,
-          outsideLocation: verifyResultMeta.outsideLocation,
-          userLocation: clockingData.userLocation,
+
+          clockingId:
+            createdClocking._id,
+
+          station:
+            clockingData.station,
+
+          clockIn:
+            clockingTime.toISOString(),
+
+          clockedOutside:
+            verifyResultMeta.clockedOutside,
+
+          outsideLocation:
+            verifyResultMeta.outsideLocation,
+
+          userLocation:
+            clockingData.userLocation,
+
+          isLate:
+            isLate,
         },
       });
     }
+
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // CLOCK OUT
+    // ═════════════════════════════════════════════════════════════════════════
+
     else {
 
-      const latestClocking = await Clocking
-        .findOne({ email: user.email })
-        .sort({ clock_in: -1 });
+      // ─────────────────────────────────────────────────────────────────────
+      // GET FRESH CLOCK-OUT TIME
+      //
+      // This is intentionally created immediately before updating
+      // the clock-out record.
+      // ─────────────────────────────────────────────────────────────────────
 
-      if (!latestClocking) {
-        return res.status(404).json({ message: "No clock-in record found" });
-      }
+      const clockOutTime =
+        getCurrentTime();
 
-      const now = new Date();
-      latestClocking.clock_out = now;
 
-      const canClockOutsideNow = isOutsideClockingAuthorizedNow(user, now);
+      const {
+        formattedDate:
+        clockOutDate,
 
-      if (canClockOutsideNow) {
-        latestClocking.clockOutLocationName = outsideLocation || "";
-        latestClocking.outsideLocation = latestClocking.outsideLocation || outsideLocation || "";
-        latestClocking.clockedOutSide = true;
-        latestClocking.outSideReason = user.outsideClockingDetails?.reason || latestClocking.outSideReason || "";
-        verifyResultMeta.clockedOutside = true;
-        verifyResultMeta.outsideLocation = outsideLocation || null;
-      } else if (outsideLocation) {
-        console.debug('outsideLocation provided at clock-out but user not authorized', { email: user.email, canClockOutside: user.canClockOutside, outsideClockingDetails: user.outsideClockingDetails });
-      }
+        formattedTime:
+        clockOutFormattedTime,
+      } = formatEATDateTime(
+        clockOutTime
+      );
 
-      // Calculate difference in milliseconds
-      const diffMs = now - latestClocking.clock_in;
 
-      // Convert to hours
-      const diffHours = diffMs / (1000 * 60 * 60);
+      // ─────────────────────────────────────────────────────────────────────
+      // CALCULATE WORKED TIME
+      // ─────────────────────────────────────────────────────────────────────
+
+      const clockInTime =
+        latestClocking.clock_in;
+
+
+      const diffMs =
+        clockOutTime.getTime() -
+        clockInTime.getTime();
+
+
+      const diffHours =
+        diffMs /
+        (1000 * 60 * 60);
+
+
+      // Prevent negative values caused by invalid data
+      const safeDiffHours =
+        Math.max(
+          0,
+          diffHours
+        );
+
 
       // Present if worked 5 hours or more
-      latestClocking.isPresent = diffHours >= 5;
+      latestClocking.isPresent =
+        safeDiffHours >= 5;
+
+
+      // ─────────────────────────────────────────────────────────────────────
+      // SET CLOCK-OUT
+      // ─────────────────────────────────────────────────────────────────────
+
+      latestClocking.clock_out =
+        clockOutTime;
+
+
+      // ─────────────────────────────────────────────────────────────────────
+      // OUTSIDE CLOCKING
+      // ─────────────────────────────────────────────────────────────────────
+
+      const canClockOutsideNow =
+        isOutsideClockingAuthorizedNow(
+          user,
+          clockOutTime
+        );
+
+
+      if (canClockOutsideNow) {
+
+        latestClocking.clockOutLocationName =
+          outsideLocation || "";
+
+        latestClocking.outsideLocation =
+          latestClocking.outsideLocation ||
+          outsideLocation ||
+          "";
+
+        latestClocking.clockedOutSide =
+          true;
+
+        latestClocking.outSideReason =
+          user.outsideClockingDetails?.reason ||
+          latestClocking.outSideReason ||
+          "";
+
+        verifyResultMeta.clockedOutside =
+          true;
+
+        verifyResultMeta.outsideLocation =
+          outsideLocation || null;
+
+      }
+      else if (outsideLocation) {
+
+        console.debug(
+          "outsideLocation provided at clock-out but user not authorized",
+          {
+            email: user.email,
+
+            canClockOutside:
+              user.canClockOutside,
+
+            outsideClockingDetails:
+              user.outsideClockingDetails,
+          }
+        );
+      }
+
+
+      // ─────────────────────────────────────────────────────────────────────
+      // SAVE CLOCK-OUT
+      // ─────────────────────────────────────────────────────────────────────
 
       await latestClocking.save();
 
-      user.hasClockedIn = false;
-      user.isToClockOut = false;
+
+      // ─────────────────────────────────────────────────────────────────────
+      // UPDATE USER STATE
+      // ─────────────────────────────────────────────────────────────────────
+
+      user.hasClockedIn =
+        false;
+
+      user.isToClockOut =
+        false;
 
       await user.save();
 
-      // send message clock out
+
+      // ─────────────────────────────────────────────────────────────────────
+      // SEND CLOCK-OUT MESSAGE
+      // ─────────────────────────────────────────────────────────────────────
+
       await SendMessageNow(
         user,
-        `Dear ${user.name}, you have successfully checked out from ${user.station} on ${formattedDate} at ${formattedTime}. Thank you for your service today.`
+
+        `Dear ${user.name}, you have successfully checked out from ${latestClocking.station} on ${clockOutDate} at ${clockOutFormattedTime} EAT.`
       );
 
+
+      // ─────────────────────────────────────────────────────────────────────
+      // AUDIT LOG
+      // ─────────────────────────────────────────────────────────────────────
+
       await createAuditLog({
+
         req,
-        category: "attendance",
-        action: "attendance.clock_out",
-        description: "User clocked out",
-        actor: user,
+
+        category:
+          "attendance",
+
+        action:
+          "attendance.clock_out",
+
+        description:
+          "User clocked out",
+
+        actor:
+          user,
+
         metadata: {
-          station: latestClocking.station,
-          workedHours: Number(diffHours.toFixed(2)),
-          isPresent: latestClocking.isPresent,
-          clockedOutside: verifyResultMeta.clockedOutside,
-          outsideLocation: verifyResultMeta.outsideLocation,
+
+          clockingId:
+            latestClocking._id,
+
+          station:
+            latestClocking.station,
+
+          clockIn:
+            clockInTime.toISOString(),
+
+          clockOut:
+            clockOutTime.toISOString(),
+
+          workedHours:
+            Number(
+              safeDiffHours.toFixed(2)
+            ),
+
+          isPresent:
+            latestClocking.isPresent,
+
+          clockedOutside:
+            verifyResultMeta.clockedOutside,
+
+          outsideLocation:
+            verifyResultMeta.outsideLocation,
         },
       });
+
+
+      // Update response time to the exact clock-out time
+      verifyResultMeta.date =
+        clockOutDate;
+
+      verifyResultMeta.time =
+        clockOutFormattedTime;
     }
 
 
-    req.session.biometricVerified = true;
-    req.session.biometricVerifiedAt = Date.now();
+    // ───────────────────────────────────────────────────────────────────────
+    // BIOMETRIC SESSION
+    // ───────────────────────────────────────────────────────────────────────
+
+    req.session.biometricVerified =
+      true;
+
+    req.session.biometricVerifiedAt =
+      Date.now();
+
     delete req.session.authChallenge;
-    // include metadata so frontend can show whether outsideLocation was saved
-    res.json({ verified: true, meta: verifyResultMeta });
+
+
+    // ───────────────────────────────────────────────────────────────────────
+    // RESPONSE
+    // ───────────────────────────────────────────────────────────────────────
+
+    return res.json({
+
+      verified:
+        true,
+
+      meta:
+        verifyResultMeta,
+
+      timestamp: {
+
+        utc:
+          new Date().toISOString(),
+
+        date:
+          verifyResultMeta.date,
+
+        time:
+          verifyResultMeta.time,
+
+        timezone:
+          EAT_TIMEZONE,
+      },
+    });
+
   } catch (err) {
-    console.error("Auth verify error:", err);
-    res.status(401).json({ verified: false, message: err.message });
+
+    console.error(
+      "Auth verify error:",
+      err
+    );
+
+    return res.status(401).json({
+
+      verified:
+        false,
+
+      message:
+        err.message,
+    });
   }
 });
+
 
 
 // ─── Attendance ──────────────
@@ -2843,10 +3533,27 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const users = await User.find(userFilter, 'email isAccountActive isOnLeave');
     const emails = users.map(u => u.email);
 
-    const start = startDate ? new Date(startDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({
+        message: dateError.message,
+      });
+    };
+
+
+
+    // Fetch all clockings in range
+    const records = await Clocking.find({
+      email: { $in: emails },
+      clock_in: { $gte: start, $lte: end }
+    });
 
     // Today's date for present/absent counts
     const today = new Date();
@@ -2855,16 +3562,25 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const todayEnd = new Date(today);
     todayEnd.setHours(23, 59, 59, 999);
 
-    // Fetch all clockings in range
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end }
-    });
+    let startToday;
+    let endToday;
+
+    try {
+      const range = getSafeDateRange(todayStart, todayEnd);
+
+      startToday = range.start;
+      endToday = range.end;
+    } catch (dateError) {
+      return res.status(400).json({
+        message: dateError.message,
+      });
+    }
+
 
     // Today's clockings
     const todayRecords = await Clocking.find({
       email: { $in: emails },
-      clock_in: { $gte: todayStart, $lte: todayEnd }
+      clock_in: { $gte: startToday, $lte: endToday }
     });
 
     const totalEmployees = users.length;
@@ -3493,10 +4209,19 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
     const deptMap = {};
     users.forEach(u => deptMap[u.email] = u.department);
 
-    const start = startDate ? new Date(startDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({
+        message: dateError.message,
+      });
+    }
 
     const records = await Clocking.find({
       email: { $in: emails },
@@ -3583,10 +4308,19 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
     const allEmails = users.map(u => u.email);
 
     // Date range
-    const start = startDate ? new Date(startDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({
+        message: dateError.message,
+      });
+    }
 
     // Fetch all clockings in range for these users
     const records = await Clocking.find({
@@ -3709,10 +4443,19 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res
     const users = await User.find(userFilter, 'email');
     const emails = users.map(u => u.email);
 
-    const start = startDate ? new Date(startDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({
+        message: dateError.message,
+      });
+    }
 
     // Find all clockings in range
     const records = await Clocking.find({
@@ -4379,20 +5122,19 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     //---------------------------------------------------------
     // Date Range
     //---------------------------------------------------------
+    let start;
+    let end;
 
-    const start = startDate
-      ? new Date(startDate)
-      : new Date(
-        new Date().getFullYear(),
-        new Date().getMonth(),
-        1
-      );
+    try {
+      const range = getSafeDateRange(startDate, endDate);
 
-    const end = endDate
-      ? new Date(endDate)
-      : new Date();
-
-    end.setHours(23, 59, 59, 999);
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({
+        message: dateError.message,
+      });
+    }
 
     //---------------------------------------------------------
     // Working Days
@@ -6416,17 +7158,33 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
   }
 });
 
+
+
 app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
   try {
+    // ---------------------------------------------------------
+    // AUTHORIZATION
+    // ---------------------------------------------------------
     if (!req.session?.isOnline || !req.session?.userID) {
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
     }
 
     const currentUser = await User.findById(req.session.userID);
-    if (!currentUser || !["auditor", "admin", "superadmin"].includes(currentUser.rank)) {
-      return res.status(403).json({ message: "Access denied" });
+
+    if (
+      !currentUser ||
+      !["auditor", "admin", "superadmin"].includes(currentUser.rank)
+    ) {
+      return res.status(403).json({
+        message: "Access denied",
+      });
     }
 
+    // ---------------------------------------------------------
+    // QUERY PARAMETERS
+    // ---------------------------------------------------------
     const {
       category = "all",
       action = "all",
@@ -6437,25 +7195,155 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
       limit = 250,
     } = req.query;
 
-    const parsedLimit = Math.min(Math.max(Number(limit) || 250, 1), 500);
+    const parsedLimit = Math.min(
+      Math.max(Number(limit) || 250, 1),
+      500
+    );
+
     const query = {};
 
-    if (category !== "all") query.category = category;
-    if (action !== "all") query.action = action;
-    if (actorRank !== "all") query["actor.rank"] = actorRank;
+    // ---------------------------------------------------------
+    // BASIC FILTERS
+    // ---------------------------------------------------------
+    if (category !== "all") {
+      query.category = category;
+    }
 
+    if (action !== "all") {
+      query.action = action;
+    }
+
+    if (actorRank !== "all") {
+      query["actor.rank"] = actorRank;
+    }
+
+    // ---------------------------------------------------------
+    // SAFE DATE FILTER
+    // ---------------------------------------------------------
     if (dateFrom || dateTo) {
       query.occurredAt = {};
-      if (dateFrom) {
-        query.occurredAt.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
-      }
-      if (dateTo) {
-        query.occurredAt.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+
+      try {
+        if (dateFrom) {
+          const fromString = String(dateFrom).trim();
+
+          // Only accept YYYY-MM-DD
+          const fromMatch = fromString.match(
+            /^(\d{4})-(\d{2})-(\d{2})$/
+          );
+
+          if (!fromMatch) {
+            return res.status(400).json({
+              message:
+                "Invalid dateFrom format. Expected YYYY-MM-DD.",
+            });
+          }
+
+          const year = Number(fromMatch[1]);
+          const month = Number(fromMatch[2]);
+          const day = Number(fromMatch[3]);
+
+          // Construct explicitly rather than relying on
+          // environment-dependent date parsing.
+          const fromDate = new Date(
+            Date.UTC(year, month - 1, day, 0, 0, 0, 0)
+          );
+
+          // Validate the constructed date.
+          if (
+            Number.isNaN(fromDate.getTime()) ||
+            fromDate.getUTCFullYear() !== year ||
+            fromDate.getUTCMonth() !== month - 1 ||
+            fromDate.getUTCDate() !== day
+          ) {
+            return res.status(400).json({
+              message: "Invalid dateFrom.",
+            });
+          }
+
+          query.occurredAt.$gte = fromDate;
+        }
+
+        if (dateTo) {
+          const toString = String(dateTo).trim();
+
+          // Only accept YYYY-MM-DD
+          const toMatch = toString.match(
+            /^(\d{4})-(\d{2})-(\d{2})$/
+          );
+
+          if (!toMatch) {
+            return res.status(400).json({
+              message:
+                "Invalid dateTo format. Expected YYYY-MM-DD.",
+            });
+          }
+
+          const year = Number(toMatch[1]);
+          const month = Number(toMatch[2]);
+          const day = Number(toMatch[3]);
+
+          // End of requested day in UTC.
+          const toDate = new Date(
+            Date.UTC(
+              year,
+              month - 1,
+              day,
+              23,
+              59,
+              59,
+              999
+            )
+          );
+
+          // Validate the constructed date.
+          if (
+            Number.isNaN(toDate.getTime()) ||
+            toDate.getUTCFullYear() !== year ||
+            toDate.getUTCMonth() !== month - 1 ||
+            toDate.getUTCDate() !== day
+          ) {
+            return res.status(400).json({
+              message: "Invalid dateTo.",
+            });
+          }
+
+          query.occurredAt.$lte = toDate;
+        }
+
+        // -------------------------------------------------------
+        // VALIDATE DATE RANGE
+        // -------------------------------------------------------
+        if (
+          query.occurredAt.$gte &&
+          query.occurredAt.$lte &&
+          query.occurredAt.$gte > query.occurredAt.$lte
+        ) {
+          return res.status(400).json({
+            message: "dateFrom cannot be after dateTo.",
+          });
+        }
+      } catch (dateError) {
+        console.error(
+          "Audit log date parsing error:",
+          dateError
+        );
+
+        return res.status(400).json({
+          message: "Invalid audit log date range.",
+        });
       }
     }
 
+    // ---------------------------------------------------------
+    // SEARCH
+    // ---------------------------------------------------------
     if (search?.trim()) {
-      const regex = new RegExp(search.trim(), "i");
+      const regex = new RegExp(
+        search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        "i"
+      );
+
       query.$or = [
         { action: regex },
         { description: regex },
@@ -6466,51 +7354,135 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
       ];
     }
 
+    // ---------------------------------------------------------
+    // FETCH LOGS
+    // ---------------------------------------------------------
     const logs = await AuditLog.find(query)
-      .sort({ occurredAt: -1 })
+      .sort({
+        occurredAt: -1,
+      })
       .limit(parsedLimit)
       .lean();
 
+    // ---------------------------------------------------------
+    // CATEGORY COUNTS
+    // ---------------------------------------------------------
     const categoryCounts = logs.reduce((acc, log) => {
-      acc[log.category] = (acc[log.category] || 0) + 1;
+      acc[log.category] =
+        (acc[log.category] || 0) + 1;
+
       return acc;
     }, {});
 
+    // ---------------------------------------------------------
+    // ACTION COUNTS
+    // ---------------------------------------------------------
     const actionCounts = logs.reduce((acc, log) => {
-      acc[log.action] = (acc[log.action] || 0) + 1;
+      acc[log.action] =
+        (acc[log.action] || 0) + 1;
+
       return acc;
     }, {});
 
+    // ---------------------------------------------------------
+    // UNIQUE ACTORS
+    // ---------------------------------------------------------
     const uniqueActors = new Set(
       logs
-        .map((log) => log.actor?.email || log.actor?.userId || "")
+        .map(
+          (log) =>
+            log.actor?.email ||
+            log.actor?.userId ||
+            ""
+        )
         .filter(Boolean)
     ).size;
 
+    // ---------------------------------------------------------
+    // PRIVILEGED ACTIONS
+    // ---------------------------------------------------------
     const privilegedActions = logs.filter((log) =>
-      PRIVILEGED_AUDIT_RANKS.includes(log.actor?.rank)
+      PRIVILEGED_AUDIT_RANKS.includes(
+        log.actor?.rank
+      )
     ).length;
 
-    res.json({
+    // ---------------------------------------------------------
+    // TODAY
+    // ---------------------------------------------------------
+    const now = new Date();
+
+    const todayStart = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+      0,
+      0,
+      0,
+      0
+    );
+
+    const tomorrowStart = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      0,
+      0,
+      0,
+      0
+    );
+
+    const today = logs.filter((log) => {
+      if (!log.occurredAt) {
+        return false;
+      }
+
+      const occurredAt =
+        log.occurredAt instanceof Date
+          ? log.occurredAt
+          : new Date(log.occurredAt);
+
+      if (Number.isNaN(occurredAt.getTime())) {
+        return false;
+      }
+
+      return (
+        occurredAt >= todayStart &&
+        occurredAt < tomorrowStart
+      );
+    }).length;
+
+    // ---------------------------------------------------------
+    // RESPONSE
+    // ---------------------------------------------------------
+    return res.json({
       logs,
+
       metrics: {
         total: logs.length,
         uniqueActors,
         privilegedActions,
-        today: logs.filter((log) => {
-          const current = new Date(log.occurredAt);
-          const now = new Date();
-          return current.toDateString() === now.toDateString();
-        }).length,
+        today,
       },
+
       categoryCounts,
       actionCounts,
     });
+
   } catch (error) {
-    console.error("Fetch audit logs error:", error);
-    res.status(500).json({ message: "Failed to fetch audit logs" });
+    console.error(
+      "Fetch audit logs error:",
+      error
+    );
+
+    return res.status(500).json({
+      message: "Failed to fetch audit logs",
+    });
   }
 });
+
+
+
 
 app.post(`${BASE_ROUTE}/audit/logs/client-event`, async (req, res) => {
   try {
@@ -6545,6 +7517,8 @@ app.post(`${BASE_ROUTE}/audit/logs/client-event`, async (req, res) => {
     res.status(500).json({ message: "Failed to record audit event" });
   }
 });
+
+
 
 
 // get colleagues of the same station and department

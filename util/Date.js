@@ -7,6 +7,7 @@ dayjs.extend(timezone);
 
 export const TIMEZONE = "Africa/Nairobi";
 
+
 export const now = () => dayjs().tz(TIMEZONE);
 
 export const today = () => now().toDate();
@@ -54,6 +55,9 @@ export const addMinutes = (time, minutes) => {
 
 };
 
+
+
+
 export default {
     now,
     today,
@@ -67,5 +71,5 @@ export default {
     subtractMinutes,
     addMinutes,
     todayString,
-    isSameDay
+    isSameDay,
 };
