@@ -107,11 +107,22 @@ const ANALYTICS_FULL_ACCESS_RANKS = ["admin", "hr", "ceo", "superadmin"];
 
 const getRequestedDateRange = (query = {}) => {
   const startDate = query.startDate
-    ? new Date(query.startDate)
+    ? parseSafeDate(query.startDate, "startDate")
     : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 
-  const endDate = query.endDate ? new Date(query.endDate) : new Date();
+  const endDate = query.endDate
+    ? parseSafeDate(query.endDate, "endDate")
+    : new Date();
+
   endDate.setHours(23, 59, 59, 999);
+
+  if (!startDate || Number.isNaN(startDate.getTime())) {
+    throw new Error("Invalid startDate");
+  }
+
+  if (!endDate || Number.isNaN(endDate.getTime())) {
+    throw new Error("Invalid endDate");
+  }
 
   return { startDate, endDate };
 };
@@ -151,17 +162,17 @@ const parseSafeDate = (value, fieldName = "date") => {
 
   const valueString = String(value).trim();
 
-  // Only accept ISO date format: YYYY-MM-DD
-  const dateOnlyMatch = valueString.match(
-    /^(\d{4})-(\d{2})-(\d{2})$/
-  );
+  if (!valueString || valueString === "Invalid Date" || valueString === "NaN") {
+    throw new Error(`Invalid ${fieldName}: ${valueString || "empty"}`);
+  }
+
+  // YYYY-MM-DD should be treated explicitly to avoid OS/browser parsing drift.
+  const dateOnlyMatch = valueString.match(/^\d{4}-\d{2}-\d{2}$/);
 
   if (dateOnlyMatch) {
-    const year = Number(dateOnlyMatch[1]);
-    const month = Number(dateOnlyMatch[2]);
-    const day = Number(dateOnlyMatch[3]);
-
-    // Explicit construction avoids Windows/Linux parsing differences.
+    const year = Number(dateOnlyMatch[0].slice(0, 4));
+    const month = Number(dateOnlyMatch[0].slice(5, 7));
+    const day = Number(dateOnlyMatch[0].slice(8, 10));
     const date = new Date(year, month - 1, day);
 
     if (
@@ -175,20 +186,12 @@ const parseSafeDate = (value, fieldName = "date") => {
     return date;
   }
 
-  // Full ISO timestamp
-  if (valueString.includes("T")) {
-    const date = new Date(valueString);
-
-    if (Number.isNaN(date.getTime())) {
-      throw new Error(`Invalid ${fieldName}: ${valueString}`);
-    }
-
-    return date;
+  const date = new Date(valueString);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid ${fieldName}: ${valueString}`);
   }
 
-  throw new Error(
-    `Invalid ${fieldName} format. Expected YYYY-MM-DD. Received: ${valueString}`
-  );
+  return date;
 };
 
 
@@ -197,7 +200,7 @@ const getSafeDateRange = (startDate, endDate) => {
 
   let start;
 
-  if (startDate) {
+  if (startDate !== undefined && startDate !== null && startDate !== "") {
     start = parseSafeDate(startDate, "startDate");
   } else {
     start = new Date(
@@ -209,7 +212,7 @@ const getSafeDateRange = (startDate, endDate) => {
 
   let end;
 
-  if (endDate) {
+  if (endDate !== undefined && endDate !== null && endDate !== "") {
     end = parseSafeDate(endDate, "endDate");
   } else {
     end = new Date(now);
@@ -223,7 +226,6 @@ const getSafeDateRange = (startDate, endDate) => {
     throw new Error("Invalid endDate");
   }
 
-  // Full date range
   start.setHours(0, 0, 0, 0);
   end.setHours(23, 59, 59, 999);
 
@@ -894,11 +896,17 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
     if (['intern', 'attachee'].includes(role)) {
       if (!data.startDate) throw new Error("Start date is required for interns and attaches.");
       if (!data.endDate) throw new Error("End date is required for interns and attaches.");
-      const startDate = new Date(data.startDate);
-      const endDate = new Date(data.endDate);
-      if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
-        throw new Error("Start date and end date must be valid dates.");
+
+      let startDate;
+      let endDate;
+
+      try {
+        startDate = parseSafeDate(data.startDate, "startDate");
+        endDate = parseSafeDate(data.endDate, "endDate");
+      } catch (dateError) {
+        throw new Error(dateError.message);
       }
+
       if (startDate > endDate) {
         throw new Error("End date cannot be before start date.");
       }
@@ -3665,8 +3673,16 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
     const users = await User.find(userFilter, 'email');
     const emails = users.map(u => u.email);
 
-    const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth() - 6, 1);
-    const end = endDate ? new Date(endDate) : new Date();
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
 
     const records = await Clocking.find({
       email: { $in: emails },
@@ -3758,10 +3774,16 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     const userDeptMap = {};
     users.forEach(u => userDeptMap[u.email] = u.department);
 
-    const start = startDate ? new Date(startDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
 
     const records = await Clocking.find({
       email: { $in: emails },
@@ -3870,10 +3892,16 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (re
     const userDeptMap = {};
     users.forEach(u => userDeptMap[u.email] = u.department);
 
-    const start = startDate ? new Date(startDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
 
     const records = await Clocking.find({
       email: { $in: emails },
@@ -3949,21 +3977,15 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
       userDeptMap[u.email] = u.department;
     });
 
-    const start = startDate
-      ? new Date(startDate)
-      : new Date(
-        new Date().getFullYear(),
-        new Date().getMonth() - 6,
-        1
-      );
+    let start;
+    let end;
 
-    const end = endDate
-      ? new Date(endDate)
-      : new Date();
-
-    // Make sure the end date includes the entire day
-    if (endDate) {
-      end.setHours(23, 59, 59, 999);
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
     }
 
     const records = await Clocking.find({
@@ -4847,10 +4869,16 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res)
 
     // --- 2. Date range (optional) – filters users & devices by creation ---
     const { startDate, endDate } = req.query;
-    const start = startDate ? new Date(startDate) : new Date(0); // beginning of time
-    const end = endDate ? new Date(endDate) : new Date();
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
+    let start;
+    let end;
+
+    try {
+      const range = getSafeDateRange(startDate || new Date(0), endDate || new Date());
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
 
     // --- 3. Biometric enrollment stats from User ---
     const usersWithBiometric = await User.countDocuments({
@@ -4998,19 +5026,16 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 
     const attendanceQuery = {};
 
-    const start = startDate
-      ? new Date(startDate)
-      : new Date(
-        new Date().getFullYear(),
-        new Date().getMonth(),
-        1
-      );
+    let start;
+    let end;
 
-    const end = endDate
-      ? new Date(endDate)
-      : new Date();
-
-    end.setHours(23, 59, 59, 999);
+    try {
+      const range = getSafeDateRange(startDate, endDate);
+      start = range.start;
+      end = range.end;
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
 
     attendanceQuery.clock_in = {
       $gte: start,
@@ -6589,7 +6614,17 @@ app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
       return res.status(404).json({ message: "Current user not found" });
     }
 
-    if (new Date(req.body.endDate) < new Date(req.body.startDate)) {
+    let startDateValue;
+    let endDateValue;
+
+    try {
+      startDateValue = parseSafeDate(req.body.startDate, "startDate");
+      endDateValue = parseSafeDate(req.body.endDate, "endDate");
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
+
+    if (endDateValue < startDateValue) {
       return res.status(400).json("end date should be higher than start date");
     }
 
@@ -6940,6 +6975,20 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
     if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
+    let startDateValue;
+    let endDateValue;
+
+    try {
+      startDateValue = parseSafeDate(startDate, "startDate");
+      endDateValue = parseSafeDate(endDate, "endDate");
+    } catch (dateError) {
+      return res.status(400).json({ message: dateError.message });
+    }
+
+    if (endDateValue < startDateValue) {
+      return res.status(400).json({ message: "End date cannot be before start date." });
+    }
+
     // 4. Update Target User
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
@@ -6948,8 +6997,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
     // Update the permission and the details
     targetUser.canClockOutside = true;
     targetUser.outsideClockingDetails = {
-      startDate: new Date(startDate),
-      endDate: new Date(endDate),
+      startDate: startDateValue,
+      endDate: endDateValue,
       reason: reason,
       // Tracking who gave permission
       authorizedBy: currentUser.name,
