@@ -152,6 +152,16 @@ const parseSafeDate = (value, fieldName = "date") => {
     return null;
   }
 
+  if (Array.isArray(value)) {
+    const normalized = value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+    if (!normalized.length) {
+      return null;
+    }
+
+    const preferred = fieldName === "endDate" ? normalized[normalized.length - 1] : normalized[0];
+    return parseSafeDate(preferred, fieldName);
+  }
+
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) {
       throw new Error(`Invalid ${fieldName}`);
@@ -166,8 +176,16 @@ const parseSafeDate = (value, fieldName = "date") => {
     throw new Error(`Invalid ${fieldName}: ${valueString || "empty"}`);
   }
 
+  const candidateString = valueString.includes(",")
+    ? valueString.split(",").map((part) => part.trim()).filter(Boolean)[fieldName === "endDate" ? -1 : 0]
+    : valueString;
+
+  if (!candidateString) {
+    throw new Error(`Invalid ${fieldName}: ${valueString}`);
+  }
+
   // YYYY-MM-DD should be treated explicitly to avoid OS/browser parsing drift.
-  const dateOnlyMatch = valueString.match(/^\d{4}-\d{2}-\d{2}$/);
+  const dateOnlyMatch = candidateString.match(/^\d{4}-\d{2}-\d{2}$/);
 
   if (dateOnlyMatch) {
     const year = Number(dateOnlyMatch[0].slice(0, 4));
@@ -186,7 +204,7 @@ const parseSafeDate = (value, fieldName = "date") => {
     return date;
   }
 
-  const date = new Date(valueString);
+  const date = new Date(candidateString);
   if (Number.isNaN(date.getTime())) {
     throw new Error(`Invalid ${fieldName}: ${valueString}`);
   }
