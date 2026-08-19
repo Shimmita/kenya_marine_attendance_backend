@@ -104,7 +104,8 @@ const EAT_TIMEZONE = "Africa/Nairobi";
 const EAT_UTC_OFFSET_HOURS = 3;
 
 const getRequestedDateRange = (query = {}) => {
-  const { start, end } = getSafeDateRange(query.startDate, query.endDate);
+  const { startDate, endDate } = normalizeAnalyticsQuery(query);
+  const { start, end } = getSafeDateRange(startDate, endDate);
   return { startDate: start, endDate: end };
 };
 
@@ -189,7 +190,34 @@ const normalizeQueryValue = (value, fallback = "", preferLast = false) => {
   }
 
   const normalized = String(value).trim();
-  return normalized || fallback;
+  if (!normalized) return fallback;
+
+  const lowered = normalized.toLowerCase();
+  if (lowered === "undefined" || lowered === "null") return fallback;
+
+  return normalized;
+};
+
+const normalizeAnalyticsQuery = (query = {}) => ({
+  startDate: normalizeQueryValue(query.startDate, "", false),
+  endDate: normalizeQueryValue(query.endDate, "", true),
+  station: normalizeQueryValue(query.station, "all"),
+  department: normalizeQueryValue(query.department, "all"),
+  role: normalizeQueryValue(query.role, "all").toLowerCase(),
+  rank: normalizeQueryValue(query.rank, "all").toLowerCase(),
+  limit: normalizeQueryValue(query.limit, "250", true),
+});
+
+const isAllQueryValue = (value) => {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return (
+    !normalized ||
+    normalized === "all" ||
+    normalized === "all stations" ||
+    normalized === "all departments" ||
+    normalized === "undefined" ||
+    normalized === "null"
+  );
 };
 
 const getNairobiDateParts = (date = new Date()) => {
@@ -435,26 +463,27 @@ const getAnalyticsContext = async (req) => {
 };
 
 const buildAnalyticsUserFilter = (context, query = {}) => {
+  const filters = normalizeAnalyticsQuery(query);
   const userFilter = {};
 
   if (context.isSupervisor) {
     if (context.department) userFilter.department = context.department;
     if (context.station) userFilter.station = context.station;
   } else {
-    if (query.department && query.department !== "all" && query.department !== "") {
-      userFilter.department = query.department;
+    if (!isAllQueryValue(filters.department)) {
+      userFilter.department = filters.department;
     }
-    if (query.station && query.station !== "all" && query.station !== "") {
-      userFilter.station = query.station;
+    if (!isAllQueryValue(filters.station)) {
+      userFilter.station = filters.station;
     }
   }
 
-  if (query.role && query.role !== "all" && query.role !== "") {
-    userFilter.role = query.role;
+  if (!isAllQueryValue(filters.role)) {
+    userFilter.role = filters.role;
   }
 
-  if (query.rank && query.rank !== "all" && query.rank !== "") {
-    userFilter.rank = query.rank;
+  if (!isAllQueryValue(filters.rank)) {
+    userFilter.rank = filters.rank;
   }
 
   return userFilter;
@@ -3609,7 +3638,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
       station,
       role,
       rank,
-    } = req.query;
+    } = normalizeAnalyticsQuery(req.query);
     const userFilter = buildAnalyticsUserFilter(context, {
       department,
       station,
@@ -3749,7 +3778,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = req.query;
+    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email');
@@ -3890,9 +3919,9 @@ function getWeekNumber(d) {
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
+    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
 
-    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email department');
     const emails = users.map(u => u.email);
     const userDeptMap = {};
@@ -4005,9 +4034,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
+    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
 
-    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email department');
     const emails = users.map(u => u.email);
     const userDeptMap = {};
@@ -4079,11 +4108,13 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
+    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, {
       department,
-      station
+      station,
+      role,
+      rank,
     });
 
     const users = await User.find(
@@ -4344,7 +4375,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, station, department, role, rank } = req.query;
+    const { startDate, endDate, station, department, role, rank } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { station, department, role, rank });
     const users = await User.find(userFilter, 'email department');
@@ -4444,7 +4475,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = req.query;
+    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
 
     // Build user filter – includes department if provided
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
@@ -4464,7 +4495,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
         emails: []
       };
       stationMap[st].staff.push(u);
-      stationMap[st].emails.push(u.email);
+      stationMap[st].emails.push(String(u.email || "").toLowerCase());
       if (u.department) stationMap[st].departments.add(u.department);
     });
 
@@ -4523,7 +4554,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
       };
       // Initialize per‑employee present days sets
       stationMap[st].emails.forEach(email => {
-        stationStats[st].employeeMetrics[email] = new Set();
+        if (email) stationStats[st].employeeMetrics[email] = new Set();
       });
     });
 
@@ -4620,9 +4651,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
+    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
 
-    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email');
     const emails = users.map(u => u.email);
 
@@ -4696,7 +4727,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/outside-clocking`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("outside-clocking", context, req.query);
+    const payload = await buildAnalyticsView("outside-clocking", context, normalizeAnalyticsQuery(req.query));
     res.status(200).json(payload);
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
@@ -4706,7 +4737,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/outside-clocking`, async (re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/workforce`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("workforce", context, req.query);
+    const payload = await buildAnalyticsView("workforce", context, normalizeAnalyticsQuery(req.query));
     res.status(200).json(payload);
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
@@ -4716,7 +4747,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/workforce`, async (req, res)
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/productivity`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("productivity", context, req.query);
+    const payload = await buildAnalyticsView("productivity", context, normalizeAnalyticsQuery(req.query));
     res.status(200).json(payload);
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
@@ -4726,7 +4757,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/productivity`, async (req, r
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/executive`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const payload = await buildAnalyticsView("executive", context, req.query);
+    const payload = await buildAnalyticsView("executive", context, normalizeAnalyticsQuery(req.query));
     res.status(200).json(payload);
   } catch (error) {
     res.status(error.statusCode || 500).json({ message: error.message || "Unable to load analytics" });
@@ -4744,9 +4775,11 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
     // get the query
     const {
-      station = "",
-      department = "",
-    } = req.query;
+      station,
+      department,
+      role,
+      rank,
+    } = normalizeAnalyticsQuery(req.query);
 
     // get config for stations and depart from platform config
     const config = await PlatformConfig.getSingleton();
@@ -4754,25 +4787,26 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     const now = new Date();
     const startOfMonth = getNairobiMonthStart(now);
 
-    const workingDaysSoFar =
-      Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
+    const workingDaysSoFar = Math.max(countWeekdays(startOfMonth, now), 1);
 
     const userFilter = buildAnalyticsUserFilter(context, {
       station,
       department,
+      role,
+      rank,
     });
 
     const allUsers = await User.find(
       userFilter,
       "email name department station isAccountActive role"
-    );
+    ).lean();
 
     const emails = allUsers.map((u) => u.email);
 
     const records = await Clocking.find({
       email: { $in: emails },
-      clock_in: { $gte: startOfMonth },
-    });
+      clock_in: { $gte: startOfMonth, $lte: now },
+    }).lean();
 
     const totalStaff = allUsers.length;
 
@@ -4783,27 +4817,76 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       orgTotalOvertime: 0,
       stations: {},
       employeeMetrics: {},
+      employeesWithRecords: new Set(),
       inactiveUsers: allUsers.filter(u => !u.isAccountActive).length
     };
+
+    const normalizeEmailKey = (email) => String(email || "").trim().toLowerCase();
+    const userByEmail = new Map(allUsers.map((user) => [normalizeEmailKey(user.email), user]));
+
+    const ensureStationStats = (stationName) => {
+      const key = stationName || "Unassigned";
+      if (!stats.stations[key]) {
+        stats.stations[key] = {
+          totalHours: 0,
+          totalOvertime: 0,
+          totalCheckins: 0,
+          lateCount: 0,
+          staffSet: new Set(),
+          departments: {},
+          employeeScores: []
+        };
+      }
+      return stats.stations[key];
+    };
+
+    const ensureDepartmentStats = (stationObj, departmentName) => {
+      const key = departmentName || "Unassigned";
+      if (!stationObj.departments[key]) {
+        stationObj.departments[key] = {
+          totalHours: 0,
+          totalOvertime: 0,
+          lateCount: 0,
+          staffSet: new Set(),
+          employeeScores: []
+        };
+      }
+      return stationObj.departments[key];
+    };
+
+    allUsers.forEach((user) => {
+      const email = normalizeEmailKey(user.email);
+      if (!email) return;
+
+      const stationName = user.station || "Unassigned";
+      const departmentName = user.department || "Unassigned";
+      const stationObj = ensureStationStats(stationName);
+      const deptObj = ensureDepartmentStats(stationObj, departmentName);
+
+      stationObj.staffSet.add(email);
+      deptObj.staffSet.add(email);
+
+      stats.employeeMetrics[email] = {
+        hours: 0,
+        overtime: 0,
+        lateCount: 0,
+        earlyCount: 0,
+        daysPresent: new Set()
+      };
+    });
 
     // -----------------------------------
     // PROCESS RECORDS
     // -----------------------------------
 
     records.forEach(rec => {
-      const email = rec.email;
-      const station = rec.station || "Unassigned";
-      const department = rec.department || "Unassigned";
+      const email = normalizeEmailKey(rec.email);
+      const user = userByEmail.get(email);
+      if (!email || !user || !stats.employeeMetrics[email]) return;
 
-      if (!stats.employeeMetrics[email]) {
-        stats.employeeMetrics[email] = {
-          hours: 0,
-          overtime: 0,
-          lateCount: 0,
-          earlyCount: 0,
-          daysPresent: new Set()
-        };
-      }
+      const station = user.station || rec.station || "Unassigned";
+      const department = user.department || rec.department || "Unassigned";
+      stats.employeesWithRecords.add(email);
 
       let hoursWorked = 0;
 
@@ -4829,19 +4912,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       // STATION INIT
       // -----------------------------------
 
-      if (!stats.stations[station]) {
-        stats.stations[station] = {
-          totalHours: 0,
-          totalOvertime: 0,
-          totalCheckins: 0,
-          lateCount: 0,
-          staffSet: new Set(),
-          departments: {},
-          employeeScores: []
-        };
-      }
-
-      const stationObj = stats.stations[station];
+      const stationObj = ensureStationStats(station);
 
       stationObj.totalHours += hoursWorked;
       stationObj.totalCheckins++;
@@ -4856,17 +4927,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       // DEPARTMENT INIT
       // -----------------------------------
 
-      if (!stationObj.departments[department]) {
-        stationObj.departments[department] = {
-          totalHours: 0,
-          totalOvertime: 0,
-          lateCount: 0,
-          staffSet: new Set(),
-          employeeScores: []
-        };
-      }
-
-      const deptObj = stationObj.departments[department];
+      const deptObj = ensureDepartmentStats(stationObj, department);
 
       deptObj.totalHours += hoursWorked;
       deptObj.staffSet.add(email);
@@ -4913,7 +4974,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       });
 
       // assign to station & department
-      const user = allUsers.find(u => u.email === email);
+      const user = userByEmail.get(email);
       if (!user) return;
 
       const station = user.station || "Unassigned";
@@ -4950,7 +5011,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
         ((station.totalHours / (station.headcount * 160)) * 100).toFixed(1) + "%";
 
       station.disciplineRate =
-        ((station.lateCount / station.totalCheckins) * 100).toFixed(1) + "%";
+        station.totalCheckins > 0
+          ? ((station.lateCount / station.totalCheckins) * 100).toFixed(1) + "%"
+          : "0.0%";
 
       station.topPerformers =
         station.employeeScores
@@ -4972,7 +5035,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
           dept.averageHoursPerStaff > 160 ? true : false;
 
         dept.disciplineRate =
-          ((dept.lateCount / dept.headcount) * 100).toFixed(1) + "%";
+          dept.headcount > 0
+            ? ((dept.lateCount / dept.headcount) * 100).toFixed(1) + "%"
+            : "0.0%";
 
         dept.topPerformers =
           dept.employeeScores
@@ -4990,12 +5055,14 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     res.status(200).json({
       overview: {
         totalStaff,
-        activeStaffThisMonth: Object.keys(stats.employeeMetrics).length,
+        activeStaffThisMonth: stats.employeesWithRecords.size,
         inactiveAccounts: stats.inactiveUsers,
         totalOrgHours: stats.orgTotalHours.toFixed(1),
         totalOrgOvertime: stats.orgTotalOvertime.toFixed(1),
         averageStaffEfficiency:
-          ((stats.orgTotalHours / (totalStaff * 160)) * 100).toFixed(1) + "%"
+          totalStaff > 0
+            ? ((stats.orgTotalHours / (totalStaff * 160)) * 100).toFixed(1) + "%"
+            : "0.0%"
       },
       topPerformersOverall:
         employeeScores
@@ -5030,7 +5097,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res)
     }
 
     // --- 2. Date range (optional) – filters users & devices by creation ---
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate } = normalizeAnalyticsQuery(req.query);
     let start;
     let end;
 
@@ -5073,7 +5140,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res)
 
     // Active = updated in the last 7 days
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const activeDevices = await Device.countDocuments({
+    const activeDevices = await Devices.countDocuments({
       updatedAt: { $gte: sevenDaysAgo },
       createdAt: { $gte: start, $lte: end }
     });
@@ -5180,7 +5247,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       rank,
       startDate,
       endDate,
-    } = req.query;
+    } = normalizeAnalyticsQuery(req.query);
 
     //----------------------------------------------------
     // Attendance Query
@@ -5304,7 +5371,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       department,
       role,
       rank,
-    } = req.query;
+    } = normalizeAnalyticsQuery(req.query);
 
     //---------------------------------------------------------
     // Date Range
