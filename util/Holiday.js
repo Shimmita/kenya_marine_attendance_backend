@@ -44,6 +44,21 @@ export const KENYA_PUBLIC_HOLIDAYS = {
 
 };
 
+const TIMEZONE = "Africa/Nairobi";
+const UTC_OFFSET_HOURS = 3;
+
+const getDateParts = (date) => {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: TIMEZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        weekday: "short",
+    }).formatToParts(new Date(date));
+
+    return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+};
+
 /**
  * Returns all public holidays
  * for a given year.
@@ -62,14 +77,12 @@ export const getKenyaPublicHolidays = (year) => {
 
 export const isPublicHoliday = (date) => {
 
-    const d = new Date(date);
-
-    const year = d.getFullYear();
+    const parts = getDateParts(date);
+    const year = Number(parts.year);
 
     const holidays = getKenyaPublicHolidays(year);
 
-    const formatted =
-        d.toISOString().split("T")[0];
+    const formatted = formatDateKey(date);
 
     return holidays.includes(formatted);
 
@@ -82,9 +95,9 @@ export const isPublicHoliday = (date) => {
  */
 export const formatDateKey = (date) => {
 
-    const d = new Date(date);
+    const parts = getDateParts(date);
 
-    return d.toISOString().split("T")[0];
+    return `${parts.year}-${parts.month}-${parts.day}`;
 
 };
 
@@ -93,9 +106,9 @@ export const formatDateKey = (date) => {
  */
 export const isWeekend = (date) => {
 
-    const day = new Date(date).getDay();
+    const day = getDateParts(date).weekday;
 
-    return day === 0 || day === 6;
+    return day === "Sat" || day === "Sun";
 
 };
 
@@ -115,11 +128,15 @@ export const getWorkingDates = (year, month) => {
 
     for (let day = 1; day <= totalDays; day++) {
 
-        const current = new Date(
+        const current = new Date(Date.UTC(
             year,
             month - 1,
-            day
-        );
+            day,
+            -UTC_OFFSET_HOURS,
+            0,
+            0,
+            0
+        ));
 
         if (isWeekend(current))
             continue;

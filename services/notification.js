@@ -1,4 +1,5 @@
 import PlatformConfig from "../model/PlatformConfig.js";
+import MessageUser from "../model/MessageUser.js";
 import { SendMessageNow } from "../util/SendSMS.js";
 
 /*
@@ -69,10 +70,17 @@ const sendSMS = async (user, message) => {
 
 const sendInApp = async (user, message, type) => {
 
-    console.log(`IN-APP -> ${user?.email || "unknown"} (${type})`);
+    if (!user?.email || !message) {
+        return false;
+    }
 
-    // send SMS for now 
-    await sendSMS(user, message);
+    await MessageUser.create({
+        user_email: user.email,
+        message,
+        title: type,
+        label: "none",
+        status: "pending",
+    });
 
     return true;
 

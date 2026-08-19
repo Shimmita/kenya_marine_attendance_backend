@@ -33,7 +33,6 @@ import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 import Verification from "./model/VerifyReport.js";
 import {
-  formatDateKey,
   isPublicHoliday,
   isWeekend
 } from "./util/Holiday.js";
@@ -68,6 +67,7 @@ const environment = process.env.ENVIRONMENT_MODE;
 const PRIVILEGED_AUDIT_RANKS = ["admin", "hr", "superadmin"];
 const REMINDER_TRIGGER_SECRET = process.env.REMINDER_TRIGGER_SECRET || (environment !== "production" ? "kmfri-reminder-trigger-dev" : "");
 const MAX_USER_DEVICES = 2;
+const WEBAUTHN_TIMEOUT_MS = 60000;
 const CLIENT_AUDIT_ACTIONS = {
   "attendance.history_exported": {
     category: "attendance",
@@ -104,27 +104,12 @@ const maskPhone = (phone) => {
 
 const ANALYTICS_ACCESSIBLE_RANKS = ["admin", "hr", "ceo", "superadmin", "supervisor"];
 const ANALYTICS_FULL_ACCESS_RANKS = ["admin", "hr", "ceo", "superadmin"];
+const EAT_TIMEZONE = "Africa/Nairobi";
+const EAT_UTC_OFFSET_HOURS = 3;
 
 const getRequestedDateRange = (query = {}) => {
-  const startDate = query.startDate
-    ? parseSafeDate(query.startDate, "startDate")
-    : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-
-  const endDate = query.endDate
-    ? parseSafeDate(query.endDate, "endDate")
-    : new Date();
-
-  endDate.setHours(23, 59, 59, 999);
-
-  if (!startDate || Number.isNaN(startDate.getTime())) {
-    throw new Error("Invalid startDate");
-  }
-
-  if (!endDate || Number.isNaN(endDate.getTime())) {
-    throw new Error("Invalid endDate");
-  }
-
-  return { startDate, endDate };
+  const { start, end } = getSafeDateRange(query.startDate, query.endDate);
+  return { startDate: start, endDate: end };
 };
 
 const isReminderTriggerAuthorized = (req) => {
@@ -147,6 +132,148 @@ const isReminderTriggerAuthorized = (req) => {
 
 
 // PARSE DATES
+const normalizeDateInput = (value, fieldName = "date") => {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    const normalized = value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+    if (!normalized.length) return null;
+
+    const preferred = fieldName === "endDate" || fieldName === "dateTo"
+      ? normalized[normalized.length - 1]
+      : normalized[0];
+
+    return normalizeDateInput(preferred, fieldName);
+  }
+
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error(`Invalid ${fieldName}`);
+    }
+
+    return value;
+  }
+
+  const valueString = String(value).trim();
+
+  if (!valueString || valueString === "Invalid Date" || valueString === "NaN") {
+    throw new Error(`Invalid ${fieldName}: ${valueString || "empty"}`);
+  }
+
+  const parts = valueString.includes(",")
+    ? valueString.split(",").map((part) => part.trim()).filter(Boolean)
+    : null;
+  const candidateString = parts
+    ? parts[fieldName === "endDate" || fieldName === "dateTo" ? parts.length - 1 : 0]
+    : valueString;
+
+  if (!candidateString) {
+    throw new Error(`Invalid ${fieldName}: ${valueString}`);
+  }
+
+  return candidateString;
+};
+
+const getNairobiDateParts = (date = new Date()) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: EAT_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  return Object.fromEntries(parts.map((part) => [part.type, Number(part.value)]));
+};
+
+const getNairobiDateTimeParts = (date = new Date()) => {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: EAT_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+};
+
+const padDatePart = (value) => String(value).padStart(2, "0");
+
+const getNairobiDateKey = (date = new Date()) => {
+  const parts = getNairobiDateParts(date);
+  return `${parts.year}-${padDatePart(parts.month)}-${padDatePart(parts.day)}`;
+};
+
+const getNairobiMonthKey = (date = new Date()) => getNairobiDateKey(date).slice(0, 7);
+
+const getNairobiHourDecimal = (date = new Date()) => {
+  const parts = getNairobiDateTimeParts(date);
+  return Number(parts.hour || 0) + Number(parts.minute || 0) / 60;
+};
+
+const getNairobiWeekdayName = (date = new Date()) => {
+  const parts = getNairobiDateTimeParts(date);
+  return parts.weekday || "";
+};
+
+const getNairobiWeekdayIndex = (date = new Date()) => {
+  const weekday = getNairobiWeekdayName(date);
+  return { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[weekday] ?? 0;
+};
+
+const getNairobiMonthStart = (date = new Date()) => {
+  const parts = getNairobiDateParts(date);
+  return new Date(Date.UTC(parts.year, parts.month - 1, 1, -EAT_UTC_OFFSET_HOURS, 0, 0, 0));
+};
+
+const getNairobiDayBoundary = (year, month, day, boundary = "start") => {
+  const testDate = new Date(Date.UTC(year, month - 1, day, 12, 0, 0, 0));
+  const testParts = getNairobiDateParts(testDate);
+
+  if (testParts.year !== year || testParts.month !== month || testParts.day !== day) {
+    throw new Error("Invalid date");
+  }
+
+  if (boundary === "end") {
+    return new Date(Date.UTC(year, month - 1, day, 23 - EAT_UTC_OFFSET_HOURS, 59, 59, 999));
+  }
+
+  return new Date(Date.UTC(year, month - 1, day, -EAT_UTC_OFFSET_HOURS, 0, 0, 0));
+};
+
+const parseDateRangeBoundary = (value, fieldName = "date", boundary = "start") => {
+  const normalized = normalizeDateInput(value, fieldName);
+  if (!normalized) return null;
+
+  if (normalized instanceof Date) {
+    const parts = getNairobiDateParts(normalized);
+    return getNairobiDayBoundary(parts.year, parts.month, parts.day, boundary);
+  }
+
+  const isoDateMatch = String(normalized).match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+  if (isoDateMatch) {
+    return getNairobiDayBoundary(
+      Number(isoDateMatch[1]),
+      Number(isoDateMatch[2]),
+      Number(isoDateMatch[3]),
+      boundary
+    );
+  }
+
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`Invalid ${fieldName}. Expected YYYY-MM-DD.`);
+  }
+
+  const parts = getNairobiDateParts(parsed);
+  return getNairobiDayBoundary(parts.year, parts.month, parts.day, boundary);
+};
+
 const parseSafeDate = (value, fieldName = "date") => {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -176,8 +303,11 @@ const parseSafeDate = (value, fieldName = "date") => {
     throw new Error(`Invalid ${fieldName}: ${valueString || "empty"}`);
   }
 
-  const candidateString = valueString.includes(",")
-    ? valueString.split(",").map((part) => part.trim()).filter(Boolean)[fieldName === "endDate" ? -1 : 0]
+  const parts = valueString.includes(",")
+    ? valueString.split(",").map((part) => part.trim()).filter(Boolean)
+    : null;
+  const candidateString = parts
+    ? parts[fieldName === "endDate" ? parts.length - 1 : 0]
     : valueString;
 
   if (!candidateString) {
@@ -219,21 +349,18 @@ const getSafeDateRange = (startDate, endDate) => {
   let start;
 
   if (startDate !== undefined && startDate !== null && startDate !== "") {
-    start = parseSafeDate(startDate, "startDate");
+    start = parseDateRangeBoundary(startDate, "startDate", "start");
   } else {
-    start = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      1
-    );
+    start = getNairobiMonthStart(now);
   }
 
   let end;
 
   if (endDate !== undefined && endDate !== null && endDate !== "") {
-    end = parseSafeDate(endDate, "endDate");
+    end = parseDateRangeBoundary(endDate, "endDate", "end");
   } else {
-    end = new Date(now);
+    const parts = getNairobiDateParts(now);
+    end = getNairobiDayBoundary(parts.year, parts.month, parts.day, "end");
   }
 
   if (!start || Number.isNaN(start.getTime())) {
@@ -243,9 +370,6 @@ const getSafeDateRange = (startDate, endDate) => {
   if (!end || Number.isNaN(end.getTime())) {
     throw new Error("Invalid endDate");
   }
-
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
 
   if (start > end) {
     throw new Error("startDate cannot be after endDate");
@@ -322,6 +446,49 @@ const buildAnalyticsUserFilter = (context, query = {}) => {
   return userFilter;
 };
 
+const getWorkingDateKeysInRange = (start, end) => {
+  const keys = [];
+  const current = new Date(start);
+
+  while (current <= end) {
+    if (!isWeekend(current) && !isPublicHoliday(current)) {
+      keys.push(getNairobiDateKey(current));
+    }
+
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+
+  return keys;
+};
+
+const countApprovedLeaveDaysByGroup = (leaveRecords, emailGroupMap, workingDateKeys) => {
+  const groupedLeaveDays = {};
+
+  leaveRecords.forEach((leave) => {
+    if (String(leave.status || "").toLowerCase() !== "approved") return;
+
+    const email = String(leave.email || "").toLowerCase();
+    const group = emailGroupMap[email] || "Unassigned";
+
+    if (!groupedLeaveDays[group]) groupedLeaveDays[group] = new Set();
+
+    const leaveStart = parseDateRangeBoundary(leave.startDate, "startDate", "start");
+    const leaveEnd = parseDateRangeBoundary(leave.endDate, "endDate", "end");
+
+    workingDateKeys.forEach((dateKey) => {
+      const dayStart = parseDateRangeBoundary(dateKey, "date", "start");
+      if (dayStart >= leaveStart && dayStart <= leaveEnd) {
+        groupedLeaveDays[group].add(`${email}:${dateKey}`);
+      }
+    });
+  });
+
+  return Object.entries(groupedLeaveDays).reduce((acc, [group, values]) => {
+    acc[group] = values.size;
+    return acc;
+  }, {});
+};
+
 const buildAnalyticsDataset = async (context, query = {}) => {
   const { startDate, endDate } = getRequestedDateRange(query);
   const userFilter = buildAnalyticsUserFilter(context, query);
@@ -361,7 +528,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
   const { users, records, leaveRecords, startDate, endDate } = await buildAnalyticsDataset(context, query);
   const totalStaff = users.length;
   const today = new Date();
-  const todayKey = formatDateKey(today);
+  const todayKey = getNairobiDateKey(today);
 
   const employeeByEmail = new Map(users.map((user) => [user.email, user]));
 
@@ -372,16 +539,14 @@ const buildAnalyticsView = async (view, context, query = {}) => {
     return acc;
   }, {});
 
-  const todayRecords = records.filter((record) => record?.clock_in && formatDateKey(record.clock_in) === todayKey);
+  const todayRecords = records.filter((record) => record?.clock_in && getNairobiDateKey(record.clock_in) === todayKey);
   const todayPresent = new Set(todayRecords.map((record) => record.email).filter(Boolean));
 
   const approvedLeaveToday = leaveRecords.filter((leave) => {
     const status = String(leave.status || "").toLowerCase();
-    const todayValue = new Date(today);
-    todayValue.setHours(0, 0, 0, 0);
-    const start = new Date(leave.startDate);
-    const end = new Date(leave.endDate);
-    end.setHours(23, 59, 59, 999);
+    const todayValue = parseDateRangeBoundary(getNairobiDateKey(today), "startDate", "start");
+    const start = parseDateRangeBoundary(leave.startDate, "startDate", "start");
+    const end = parseDateRangeBoundary(leave.endDate, "endDate", "end");
     return status === "approved" && todayValue >= start && todayValue <= end;
   });
 
@@ -402,7 +567,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
     }
     acc[key].totalStaff += 1;
     const userRecords = recordGroups[user.email] || [];
-    const uniqueDays = new Set(userRecords.map((entry) => formatDateKey(entry.clock_in)).filter(Boolean));
+    const uniqueDays = new Set(userRecords.map((entry) => getNairobiDateKey(entry.clock_in)).filter(Boolean));
     acc[key].present += uniqueDays.size;
     acc[key].late += userRecords.filter((entry) => entry.isLate).length;
     acc[key].hours += userRecords.reduce((sum, entry) => {
@@ -449,7 +614,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
   const frequentAbsentees = users
     .map((user) => {
       const userRecords = recordGroups[user.email] || [];
-      const presentDays = new Set(userRecords.map((entry) => formatDateKey(entry.clock_in)).filter(Boolean)).size;
+      const presentDays = new Set(userRecords.map((entry) => getNairobiDateKey(entry.clock_in)).filter(Boolean)).size;
       const expectedDays = Math.max(1, Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1);
       const absentDays = Math.max(expectedDays - presentDays, 0);
       return { name: user.name, email: user.email, department: user.department || "Unassigned", absentDays };
@@ -684,6 +849,38 @@ const getUserAuthenticators = (user) => {
 const getActiveUserDevices = async (email) =>
   Devices.find({ user_email: email, device_lost: { $ne: true } }).sort({ createdAt: 1 });
 
+const getAuthenticatorDeviceFingerprint = (authenticator) =>
+  authenticator?.deviceFingerprint || authenticator?.device_fingerprint || "";
+
+const getAuthenticatorCredentialID = (authenticator) =>
+  authenticator?.credentialID || authenticator?.credentialId || authenticator?.id || "";
+
+const getDeviceBiometricState = async (user, deviceFingerprint = "") => {
+  const activeDevices = await getActiveUserDevices(user.email);
+  const activeDeviceFingerprints = activeDevices.map((device) => device.device_fingerprint);
+  const authenticators = getUserAuthenticators(user).filter((authenticator) => {
+    const authDeviceFingerprint = getAuthenticatorDeviceFingerprint(authenticator);
+    return !authDeviceFingerprint || activeDeviceFingerprints.includes(authDeviceFingerprint);
+  });
+
+  const currentDevice = deviceFingerprint
+    ? activeDevices.find((device) => device.device_fingerprint === deviceFingerprint)
+    : null;
+
+  const currentDeviceAuthenticators = deviceFingerprint
+    ? authenticators.filter((authenticator) => getAuthenticatorDeviceFingerprint(authenticator) === deviceFingerprint)
+    : [];
+
+  return {
+    activeDevices,
+    authenticators,
+    currentDevice,
+    currentDeviceAuthenticators,
+    accountRegistered: authenticators.length > 0 && activeDevices.length > 0,
+    currentDeviceRegistered: Boolean(currentDevice && currentDeviceAuthenticators.length > 0),
+  };
+};
+
 const syncUserDeviceFlags = async (user) => {
   const activeDevices = await getActiveUserDevices(user.email);
   user.hasDevices = activeDevices.length > 1;
@@ -711,10 +908,6 @@ const ensureSinglePrimaryDevice = async (email) => {
 
   return getActiveUserDevices(email);
 };
-
-
-
-const EAT_TIMEZONE = "Africa/Nairobi";
 
 const getCurrentTime = () => new Date();
 
@@ -1394,7 +1587,9 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
       metadata: { signInMethod: "password" },
     });
 
-    return res.status(200).json(sanitizeUserResponse(user));
+    const refreshedUser = await finalizeStaleClocking(user);
+
+    return res.status(200).json(sanitizeUserResponse(refreshedUser));
   } catch (error) {
     console.error("Signin error:", error);
     return res.status(400).json({ message: error.message });
@@ -1797,9 +1992,11 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     // 7. Return sanitized user
     // ─────────────────────────────────────────────────────────────────────────
 
+    const refreshedUser = await finalizeStaleClocking(user);
+
     return res
       .status(200)
-      .json(sanitizeUserResponse(user));
+      .json(sanitizeUserResponse(refreshedUser));
 
   } catch (error) {
 
@@ -2112,6 +2309,40 @@ app.put(
 
 // ─── Biometrics ───────────────────────────────────────────────────────────────
 
+app.get(`${BASE_ROUTE}/biometric/status`, async (req, res) => {
+  try {
+    if (!req.session.isOnline) {
+      return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
+    }
+
+    const user = await User.findById(req.session.userID);
+    if (!user) throw new Error("User not found");
+
+    const deviceFingerprint = String(req.query.device_fingerprint || "");
+    const state = await getDeviceBiometricState(user, deviceFingerprint);
+
+    const syncedDoneBiometric = Boolean(state.accountRegistered);
+    const syncedHasDevices = state.activeDevices.length > 1;
+    if (user.doneBiometric !== syncedDoneBiometric || user.hasDevices !== syncedHasDevices) {
+      user.doneBiometric = syncedDoneBiometric;
+      user.hasDevices = syncedHasDevices;
+      await user.save();
+    }
+
+    res.json({
+      registered: syncedDoneBiometric,
+      accountRegistered: syncedDoneBiometric,
+      currentDeviceRegistered: state.currentDeviceRegistered,
+      activeDeviceCount: state.activeDevices.length,
+      maxDevices: MAX_USER_DEVICES,
+      canEnrollDevice: state.currentDeviceRegistered || state.activeDevices.length < MAX_USER_DEVICES,
+    });
+  } catch (err) {
+    console.error("Biometric status error:", err);
+    res.status(400).json({ message: err.message });
+  }
+});
+
 /**
  * 1. Generate Registration Challenge
  */
@@ -2122,8 +2353,29 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    const activeDevices = await getActiveUserDevices(user.email);
-    if (activeDevices.length >= MAX_USER_DEVICES) {
+    const deviceFingerprint = String(req.query.device_fingerprint || "");
+    const state = await getDeviceBiometricState(user, deviceFingerprint);
+
+    if (deviceFingerprint) {
+      const existingOtherDevice = await Devices.findOne({
+        device_fingerprint: deviceFingerprint,
+        user_email: { $ne: user.email },
+      });
+
+      if (existingOtherDevice) {
+        throw new Error("This device is already enrolled by another account.");
+      }
+    }
+
+    if (state.currentDeviceRegistered) {
+      return res.json({
+        registered: true,
+        alreadyRegistered: true,
+        message: "This device biometric is already registered. You can clock in or out now.",
+      });
+    }
+
+    if (!state.currentDevice && state.activeDevices.length >= MAX_USER_DEVICES) {
       throw new Error(`You can only enroll up to ${MAX_USER_DEVICES} devices. Report a lost device or contact admin to clear one.`);
     }
 
@@ -2137,7 +2389,7 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
       authenticatorSelection: { userVerification: "required" },
     }); */
 
-    const existingAuthenticators = getUserAuthenticators(user);
+    const existingAuthenticators = state.authenticators;
 
     const options = await generateRegistrationOptions({
       rpName: "KMFRI Attendance",
@@ -2157,14 +2409,14 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
       },
 
       // improves Android/Pixel reliability
-      timeout: 60000,
+      timeout: WEBAUTHN_TIMEOUT_MS,
 
       // prevents duplicate registrations
       excludeCredentials: existingAuthenticators.map((authenticator) => ({
-        id: authenticator.credentialID,
+        id: getAuthenticatorCredentialID(authenticator),
         type: "public-key",
         transports: ["internal"],
-      })),
+      })).filter((credential) => credential.id),
     });
 
 
@@ -2324,15 +2576,45 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
 
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
-    const activeDevices = await getActiveUserDevices(user.email);
-    const activeDeviceFingerprints = activeDevices.map((device) => device.device_fingerprint);
-    const authenticators = getUserAuthenticators(user).filter(
-      (authenticator) =>
-        !authenticator.deviceFingerprint ||
-        activeDeviceFingerprints.includes(authenticator.deviceFingerprint)
-    );
+    const deviceFingerprint = String(req.query.device_fingerprint || "");
+    const state = await getDeviceBiometricState(user, deviceFingerprint);
+    const preferredAuthenticators = deviceFingerprint
+      ? state.authenticators.filter(
+        (authenticator) =>
+          getAuthenticatorDeviceFingerprint(authenticator) === deviceFingerprint ||
+          !getAuthenticatorDeviceFingerprint(authenticator)
+      )
+      : [];
+    const authenticators = preferredAuthenticators.length
+      ? preferredAuthenticators
+      : state.authenticators;
+
     if (!user || authenticators.length === 0) {
-      return res.status(400).json({ message: "Biometric not registered for this account" });
+      return res.status(400).json({
+        message: state.accountRegistered
+          ? "This browser does not have an enrolled biometric credential. Please add this device from Device Management."
+          : "Biometric not registered for this account",
+      });
+    }
+
+    const allowCredentials = [...new Map(
+      authenticators.map((authenticator) => {
+        const credentialID = getAuthenticatorCredentialID(authenticator);
+        return [
+          credentialID,
+          {
+            id: credentialID,
+            type: "public-key",
+
+            // force device/platform auth only
+            transports: ["internal"],
+          },
+        ];
+      })
+    ).values()].filter((credential) => credential.id);
+
+    if (allowCredentials.length === 0) {
+      return res.status(400).json({ message: "No usable biometric credentials found for this account" });
     }
 
     const options = await generateAuthenticationOptions({
@@ -2341,20 +2623,9 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
       userVerification: "required",
 
       // improves auth reliability across devices
-      timeout: 30000,
+      timeout: WEBAUTHN_TIMEOUT_MS,
 
-      allowCredentials: [...new Map(
-        authenticators.map((authenticator) => [
-          authenticator.credentialID,
-          {
-            id: authenticator.credentialID,
-            type: "public-key",
-
-            // force device/platform auth only
-            transports: ["internal"],
-          },
-        ])
-      ).values()],
+      allowCredentials,
     });
 
     req.session.authChallenge = options.challenge;
@@ -2390,6 +2661,18 @@ const parseAttendanceTime = (timeString, referenceDate = new Date()) => {
 const getAttendancePolicy = async () => {
   const cfg = await PlatformConfig.getSingleton();
   return cfg.attendancePolicy || {};
+};
+
+const getSystemClockOutTime = (clockIn, standardClockOut = "17:00") => {
+  const [hours, minutes] = String(standardClockOut || "17:00").split(":").map(Number);
+  const safeHours = Number.isFinite(hours) ? hours : 17;
+  const safeMinutes = Number.isFinite(minutes) ? minutes : 0;
+  const parts = getNairobiDateParts(clockIn);
+  const systemClockOut = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, safeHours - 3, safeMinutes, 0, 0));
+
+  if (systemClockOut > clockIn) return systemClockOut;
+
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 20, 59, 59, 999));
 };
 
 const normalizeKenyaPhone = (phone) => {
@@ -2469,16 +2752,31 @@ const isBeforeNairobiDate = (date, compareDate = new Date()) => {
 };
 
 const finalizeStaleClocking = async (user, now = new Date()) => {
-  if (!user || !user.isToClockOut) return user;
+  if (!user) return user;
 
-  const latestOpen = await Clocking.findOne({ email: user.email, clock_out: null }).sort({ clock_in: -1 });
-  if (!latestOpen) return user;
+  const staleOpenClockings = await Clocking.find({
+    email: user.email,
+    clock_out: null,
+  }).sort({ clock_in: 1 });
 
-  if (!isBeforeNairobiDate(latestOpen.clock_in, now)) return user;
+  const recordsToClose = staleOpenClockings.filter((record) =>
+    isBeforeNairobiDate(record.clock_in, now)
+  );
 
-  latestOpen.missedClockOut = true;
-  latestOpen.isPresent = true;
-  await latestOpen.save();
+  if (!recordsToClose.length) return user;
+
+  const attendancePolicy = await getAttendancePolicy();
+
+  await Promise.all(recordsToClose.map(async (record) => {
+    record.clock_out = getSystemClockOutTime(
+      record.clock_in,
+      attendancePolicy.standardClockOut || "17:00"
+    );
+    record.clockOutLocationName = record.clockOutLocationName || "System";
+    record.missedClockOut = true;
+    record.isPresent = true;
+    await record.save();
+  }));
 
   user.hasClockedIn = false;
   user.isToClockOut = false;
@@ -2588,17 +2886,17 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     const matchedAuthenticator =
       authenticators.find(
         (authenticator) =>
-          authenticator.credentialID === authResponse.id &&
-          authenticator.deviceFingerprint === device_fingerprint
+          getAuthenticatorCredentialID(authenticator) === authResponse.id &&
+          getAuthenticatorDeviceFingerprint(authenticator) === device_fingerprint
       ) ||
       authenticators.find(
         (authenticator) =>
-          authenticator.credentialID === authResponse.id &&
-          !authenticator.deviceFingerprint
+          getAuthenticatorCredentialID(authenticator) === authResponse.id &&
+          !getAuthenticatorDeviceFingerprint(authenticator)
       ) ||
       authenticators.find(
         (authenticator) =>
-          authenticator.credentialID === authResponse.id
+          getAuthenticatorCredentialID(authenticator) === authResponse.id
       );
 
     if (!matchedAuthenticator) {
@@ -2614,11 +2912,11 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     // 6. VERIFY DEVICE APPROVAL
     // ───────────────────────────────────────────────────────────────────────
 
-    const matchedDevice = await Devices.findOne({
+    let matchedDevice = await Devices.findOne({
       user_email: user.email,
 
       device_fingerprint:
-        matchedAuthenticator.deviceFingerprint ||
+        getAuthenticatorDeviceFingerprint(matchedAuthenticator) ||
         device_fingerprint,
 
       device_lost: {
@@ -2680,6 +2978,48 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       });
     }
 
+    const verifiedDeviceFingerprint = String(device_fingerprint || "");
+    const matchedAuthenticatorDeviceFingerprint = getAuthenticatorDeviceFingerprint(matchedAuthenticator);
+    let nextDeviceFingerprint = matchedAuthenticatorDeviceFingerprint || verifiedDeviceFingerprint;
+
+    if (
+      verifiedDeviceFingerprint &&
+      matchedAuthenticatorDeviceFingerprint &&
+      verifiedDeviceFingerprint !== matchedAuthenticatorDeviceFingerprint
+    ) {
+      const conflictingDevice = await Devices.findOne({
+        device_fingerprint: verifiedDeviceFingerprint,
+        user_email: { $ne: user.email },
+      });
+
+      if (conflictingDevice) {
+        return res.status(403).json({
+          verified: false,
+          message: "This device is already enrolled by another account.",
+        });
+      }
+
+      const currentDevice = await Devices.findOne({
+        user_email: user.email,
+        device_fingerprint: verifiedDeviceFingerprint,
+        device_lost: { $ne: true },
+      });
+
+      if (currentDevice) {
+        matchedDevice = currentDevice;
+        nextDeviceFingerprint = verifiedDeviceFingerprint;
+      } else if (matchedDevice) {
+        await Devices.updateOne(
+          { _id: matchedDevice._id },
+          { $set: { device_fingerprint: verifiedDeviceFingerprint } }
+        );
+        matchedDevice.device_fingerprint = verifiedDeviceFingerprint;
+        nextDeviceFingerprint = verifiedDeviceFingerprint;
+      }
+    } else if (verifiedDeviceFingerprint && !matchedAuthenticatorDeviceFingerprint) {
+      nextDeviceFingerprint = verifiedDeviceFingerprint;
+    }
+
 
     // ───────────────────────────────────────────────────────────────────────
     // 9. UPDATE AUTHENTICATOR COUNTER
@@ -2689,12 +3029,12 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       (authenticator) => {
 
         const sameCredential =
-          authenticator.credentialID ===
-          matchedAuthenticator.credentialID;
+          getAuthenticatorCredentialID(authenticator) ===
+          getAuthenticatorCredentialID(matchedAuthenticator);
 
         const sameDevice =
-          (authenticator.deviceFingerprint || "") ===
-          (matchedAuthenticator.deviceFingerprint || "");
+          getAuthenticatorDeviceFingerprint(authenticator) ===
+          getAuthenticatorDeviceFingerprint(matchedAuthenticator);
 
         if (
           sameCredential &&
@@ -2708,6 +3048,9 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
               verification
                 .authenticationInfo
                 .newCounter,
+
+            deviceFingerprint:
+              nextDeviceFingerprint,
 
             lastUsedAt:
               new Date(),
@@ -3437,14 +3780,12 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
     const now = new Date();
 
     // Date Ranges
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfMonth = getNairobiMonthStart(now);
     const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
 
-    const startOfWeek = new Date(now);
-    const dayOfWeek = now.getDay();
-    const diffToMonday = now.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
-    startOfWeek.setDate(diffToMonday);
-    startOfWeek.setHours(0, 0, 0, 0);
+    const startOfWeek = parseDateRangeBoundary(getNairobiDateKey(now), "startDate", "start");
+    const dayOfWeek = getNairobiWeekdayIndex(now);
+    startOfWeek.setUTCDate(startOfWeek.getUTCDate() + (dayOfWeek === 0 ? -6 : 1 - dayOfWeek));
 
     const records = await Clocking.find({
       email: userEmail,
@@ -3456,7 +3797,8 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
       let count = 0;
       let cur = new Date(start);
       while (cur <= end && cur <= now) {
-        if (cur.getDay() !== 0 && cur.getDay() !== 6) count++;
+        const day = getNairobiWeekdayIndex(cur);
+        if (day !== 0 && day !== 6) count++;
         cur.setDate(cur.getDate() + 1);
       }
       return count || 1;
@@ -3466,9 +3808,13 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
       const dailyMap = {};
 
       filteredRecords.forEach(rec => {
-        const dateKey = new Date(rec.clock_in).toISOString().split('T')[0];
+        const dateKey = getNairobiDateKey(rec.clock_in);
         if (!dailyMap[dateKey]) {
           dailyMap[dateKey] = { hours: 0, isLateAny: false, isEarlyAny: false, clockings: 0, missedClockOut: false };
+        }
+
+        if (rec.missedClockOut) {
+          dailyMap[dateKey].missedClockOut = true;
         }
 
         if (rec.clock_out) {
@@ -3497,9 +3843,9 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
         if (day.hours > 9) totalOvertime += (day.hours - 9);
 
         // Logical Classification
-        if (day.hours >= 5) presentDays++;
+        if (day.missedClockOut) presentDays++;
+        else if (day.hours >= 5) presentDays++;
         else if (day.hours > 0) halfDays++;
-        else if (day.missedClockOut) presentDays++;
 
         // Punctuality Strategy: Early trump's Late for the day
         if (day.isEarlyAny) earlyDays++;
@@ -3553,9 +3899,20 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
-
-    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const {
+      startDate,
+      endDate,
+      department,
+      station,
+      role,
+      rank,
+    } = req.query;
+    const userFilter = buildAnalyticsUserFilter(context, {
+      department,
+      station,
+      role,
+      rank,
+    });
     const users = await User.find(userFilter, 'email isAccountActive isOnLeave');
     const emails = users.map(u => u.email);
 
@@ -3582,17 +3939,13 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     });
 
     // Today's date for present/absent counts
-    const today = new Date();
-    const todayStart = new Date(today);
-    todayStart.setHours(0, 0, 0, 0);
-    const todayEnd = new Date(today);
-    todayEnd.setHours(23, 59, 59, 999);
+    const today = getNairobiDateKey(new Date());
 
     let startToday;
     let endToday;
 
     try {
-      const range = getSafeDateRange(todayStart, todayEnd);
+      const range = getSafeDateRange(today, today);
 
       startToday = range.start;
       endToday = range.end;
@@ -3603,24 +3956,32 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     }
 
 
-    // Today's clockings
-    const todayRecords = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: startToday, $lte: endToday }
-    });
+    // Today's clockings and approved leave
+    const [todayRecords, leaveTodayRecords] = await Promise.all([
+      Clocking.find({
+        email: { $in: emails },
+        clock_in: { $gte: startToday, $lte: endToday }
+      }).lean(),
+      Leave.find({
+        email: { $in: emails },
+        status: "approved",
+        startDate: { $lte: endToday },
+        endDate: { $gte: startToday },
+      }).lean(),
+    ]);
 
     const totalEmployees = users.length;
     const activeEmployeesToday = new Set(todayRecords.map(r => r.email)).size;
-    const onLeaveToday = users.filter(u => u.isOnLeave).length;
-    const presentToday = activeEmployeesToday - onLeaveToday; // simplified; adjust if needed
-    const absentToday = totalEmployees - activeEmployeesToday;
+    const onLeaveToday = new Set(leaveTodayRecords.map(r => r.email)).size;
+    const presentToday = activeEmployeesToday;
+    const absentToday = Math.max(totalEmployees - activeEmployeesToday - onLeaveToday, 0);
 
     // Attendance rate: present days / total working days in period
     const workingDays = countWeekdays(start, end); // helper to count weekdays
     const presentDaysMap = {};
     records.forEach(r => {
       if (!presentDaysMap[r.email]) presentDaysMap[r.email] = new Set();
-      presentDaysMap[r.email].add(r.clock_in.toDateString());
+      presentDaysMap[r.email].add(getNairobiDateKey(r.clock_in));
     });
     const totalPresentDays = Object.values(presentDaysMap).reduce((sum, set) => sum + set.size, 0);
     const attendanceRate = totalEmployees > 0 ? (totalPresentDays / (totalEmployees * workingDays)) * 100 : 0;
@@ -3685,9 +4046,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
+    const { startDate, endDate, department, station, role, rank } = req.query;
 
-    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email');
     const emails = users.map(u => u.email);
 
@@ -3702,30 +4063,72 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
       return res.status(400).json({ message: dateError.message });
     }
 
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end }
+    const [records, leaveRecords] = await Promise.all([
+      Clocking.find({
+        email: { $in: emails },
+        clock_in: { $gte: start, $lte: end }
+      }).lean(),
+      Leave.find({
+        email: { $in: emails },
+        startDate: { $lte: end },
+        endDate: { $gte: start },
+      }).lean(),
+    ]);
+
+    const workingDateKeys = getWorkingDateKeysInRange(start, end);
+    const totalStaff = users.length;
+    const dailyMap = workingDateKeys.reduce((acc, dateKey) => {
+      acc[dateKey] = {
+        date: dateKey,
+        presentEmails: new Set(),
+        lateEmails: new Set(),
+        leaveEmails: new Set(),
+      };
+      return acc;
+    }, {});
+
+    records.forEach((record) => {
+      const key = getNairobiDateKey(record.clock_in);
+      if (!dailyMap[key]) return;
+      if (record.email) dailyMap[key].presentEmails.add(record.email);
+      if (record.isLate && record.email) dailyMap[key].lateEmails.add(record.email);
     });
 
-    // Group by date
-    const dailyMap = {};
-    records.forEach(r => {
-      const key = r.clock_in.toISOString().split('T')[0];
-      if (!dailyMap[key]) dailyMap[key] = { total: 0, present: 0 };
-      dailyMap[key].total++;
-      if (r.clock_out) dailyMap[key].present++;
+    leaveRecords.forEach((leave) => {
+      if (String(leave.status || "").toLowerCase() !== "approved") return;
+
+      const leaveStart = parseDateRangeBoundary(leave.startDate, "startDate", "start");
+      const leaveEnd = parseDateRangeBoundary(leave.endDate, "endDate", "end");
+
+      workingDateKeys.forEach((dateKey) => {
+        const dayStart = parseDateRangeBoundary(dateKey, "date", "start");
+        if (dayStart >= leaveStart && dayStart <= leaveEnd) {
+          dailyMap[dateKey]?.leaveEmails.add(leave.email);
+        }
+      });
     });
 
-    // Compute daily attendance rate
-    const daily = Object.keys(dailyMap).map(date => ({
-      date,
-      attendance: (dailyMap[date].present / dailyMap[date].total) * 100
-    })).sort((a, b) => a.date.localeCompare(b.date));
+    const daily = Object.values(dailyMap).map((entry) => {
+      const present = entry.presentEmails.size;
+      const late = entry.lateEmails.size;
+      const onLeave = entry.leaveEmails.size;
+      const absent = Math.max(totalStaff - present - onLeave, 0);
+
+      return {
+        date: entry.date,
+        present,
+        absent,
+        late,
+        onLeave,
+        totalStaff,
+        attendance: totalStaff > 0 ? parseFloat(((present / totalStaff) * 100).toFixed(1)) : 0,
+      };
+    }).sort((a, b) => a.date.localeCompare(b.date));
 
     // Weekly aggregation
     const weeklyMap = {};
     daily.forEach(d => {
-      const week = getWeekNumber(new Date(d.date));
+      const week = getWeekNumber(parseDateRangeBoundary(d.date, "date", "start"));
       const key = `${d.date.substring(0, 4)}-W${String(week).padStart(2, '0')}`;
       if (!weeklyMap[key]) weeklyMap[key] = { total: 0, sum: 0 };
       weeklyMap[key].total++;
@@ -3770,11 +4173,11 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
 
 // Helper: get ISO week number
 function getWeekNumber(d) {
-  const date = new Date(d);
-  date.setHours(0, 0, 0, 0);
-  date.setDate(date.getDate() + 3 - (date.getDay() + 6) % 7);
-  const week1 = new Date(date.getFullYear(), 0, 4);
-  return 1 + Math.round(((date - week1) / 86400000 - 3 + (week1.getDay() + 6) % 7) / 7);
+  const parts = getNairobiDateParts(d);
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  date.setUTCDate(date.getUTCDate() + 3 - (date.getUTCDay() + 6) % 7);
+  const week1 = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
+  return 1 + Math.round(((date - week1) / 86400000 - 3 + (week1.getUTCDay() + 6) % 7) / 7);
 }
 
 
@@ -3809,11 +4212,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     });
 
     // Employees late today
-    const today = new Date();
-    const todayStart = new Date(today);
-    todayStart.setHours(0, 0, 0, 0);
-    const todayEnd = new Date(today);
-    todayEnd.setHours(23, 59, 59, 999);
+    const today = getNairobiDateKey(new Date());
+    const { start: todayStart, end: todayEnd } = getSafeDateRange(today, today);
     const lateToday = await Clocking.find({
       email: { $in: emails },
       clock_in: { $gte: todayStart, $lte: todayEnd },
@@ -3825,7 +4225,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     let totalLateMinutes = 0, lateCount = 0;
     records.forEach(r => {
       if (r.isLate) {
-        const hours = r.clock_in.getHours() + r.clock_in.getMinutes() / 60;
+        const hours = getNairobiHourDecimal(r.clock_in);
         const lateMins = Math.max(0, (hours - 8) * 60);
         totalLateMinutes += lateMins;
         lateCount++;
@@ -3839,7 +4239,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
       const dept = userDeptMap[r.email] || 'Unknown';
       if (!deptLateMap[dept]) deptLateMap[dept] = { total: 0, count: 0 };
       if (r.isLate) {
-        const hours = r.clock_in.getHours() + r.clock_in.getMinutes() / 60;
+        const hours = getNairobiHourDecimal(r.clock_in);
         const mins = Math.max(0, (hours - 8) * 60);
         deptLateMap[dept].total += mins;
         deptLateMap[dept].count++;
@@ -3856,7 +4256,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     const weekdayMap = { Mon: 0, Tue: 0, Wed: 0, Thu: 0, Fri: 0 };
     records.forEach(r => {
       if (r.isLate) {
-        const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][r.clock_in.getDay()];
+        const day = getNairobiWeekdayName(r.clock_in);
         if (weekdayMap[day] !== undefined) weekdayMap[day]++;
       }
     });
@@ -3875,8 +4275,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     // Heatmap – arrival times (hour vs day)
     const heatmapData = [];
     records.forEach(r => {
-      const hour = r.clock_in.getHours();
-      const day = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][r.clock_in.getDay()];
+      const hour = Math.floor(getNairobiHourDecimal(r.clock_in));
+      const day = getNairobiWeekdayName(r.clock_in);
       if (hour >= 6 && hour <= 12) {
         heatmapData.push({ hour, day, value: 1 });
       }
@@ -3934,7 +4334,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (re
     const deptEarlyMap = {};
 
     records.forEach(r => {
-      const hours = r.clock_out.getHours() + r.clock_out.getMinutes() / 60;
+      const hours = getNairobiHourDecimal(r.clock_out);
       if (hours < 17) {
         earlyCount++;
         const earlyMins = (17 - hours) * 60;
@@ -4039,7 +4439,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
       }
 
       userPresent[email].add(
-        r.clock_in.toDateString()
+        getNairobiDateKey(r.clock_in)
       );
     });
 
@@ -4101,7 +4501,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
       }
 
       monthPresent[monthKey][email].add(
-        r.clock_in.toDateString()
+        getNairobiDateKey(r.clock_in)
       );
     });
 
@@ -4241,13 +4641,13 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, station } = req.query;
+    const { startDate, endDate, station, department, role, rank } = req.query;
 
-    const userFilter = buildAnalyticsUserFilter(context, { station });
+    const userFilter = buildAnalyticsUserFilter(context, { station, department, role, rank });
     const users = await User.find(userFilter, 'email department');
     const emails = users.map(u => u.email);
     const deptMap = {};
-    users.forEach(u => deptMap[u.email] = u.department);
+    users.forEach(u => deptMap[String(u.email || "").toLowerCase()] = u.department || "Unassigned");
 
     let start;
     let end;
@@ -4263,44 +4663,66 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
       });
     }
 
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end }
-    });
+    const [records, leaveRecords] = await Promise.all([
+      Clocking.find({
+        email: { $in: emails },
+        clock_in: { $gte: start, $lte: end }
+      }).lean(),
+      Leave.find({
+        email: { $in: emails },
+        startDate: { $lte: end },
+        endDate: { $gte: start },
+      }).lean(),
+    ]);
 
-    const workingDays = countWeekdays(start, end);
+    const workingDateKeys = getWorkingDateKeysInRange(start, end);
+    const workingDays = workingDateKeys.length;
     const deptStats = {};
 
     // Initialize departments from all users
-    const allDepts = new Set(users.map(u => u.department || 'Unknown'));
+    const allDepts = new Set(users.map(u => u.department || 'Unassigned'));
     allDepts.forEach(d => {
-      deptStats[d] = { staffCount: 0, presentDays: 0, totalLate: 0, totalAbsent: 0 };
+      deptStats[d] = {
+        staffCount: 0,
+        presentDays: new Set(),
+        totalLate: 0,
+      };
     });
 
     // Count staff per department
     users.forEach(u => {
-      const dept = u.department || 'Unknown';
+      const dept = u.department || 'Unassigned';
       deptStats[dept].staffCount++;
     });
 
     // Process records
-    const deptPresent = {};
     records.forEach(r => {
-      const dept = deptMap[r.email] || 'Unknown';
-      if (!deptPresent[dept]) deptPresent[dept] = new Set();
-      deptPresent[dept].add(r.clock_in.toDateString());
+      const email = String(r.email || "").toLowerCase();
+      const dept = deptMap[email] || 'Unassigned';
+      if (!deptStats[dept]) return;
+      deptStats[dept].presentDays.add(`${email}:${getNairobiDateKey(r.clock_in)}`);
       if (r.isLate) deptStats[dept].totalLate++;
     });
+
+    const leaveDaysByDept = countApprovedLeaveDaysByGroup(leaveRecords, deptMap, workingDateKeys);
 
     // Compute rates
     const result = Object.keys(deptStats).map(dept => {
       const staff = deptStats[dept].staffCount;
-      const presentDays = deptPresent[dept] ? deptPresent[dept].size : 0;
-      const attendanceRate = (staff * workingDays) > 0 ? (presentDays / (staff * workingDays)) * 100 : 0;
+      const presentDays = deptStats[dept].presentDays.size;
+      const onLeaveDays = leaveDaysByDept[dept] || 0;
+      const maxPossibleDays = staff * workingDays;
+      const absentDays = Math.max(maxPossibleDays - presentDays - onLeaveDays, 0);
+      const attendanceRate = maxPossibleDays > 0 ? (presentDays / maxPossibleDays) * 100 : 0;
       const latenessRate = staff > 0 ? (deptStats[dept].totalLate / staff) : 0; // average late per staff
-      const absenteeismRate = 100 - attendanceRate;
+      const absenteeismRate = maxPossibleDays > 0 ? (absentDays / maxPossibleDays) * 100 : 0;
       return {
         department: dept,
+        staffCount: staff,
+        presentDays,
+        absentDays,
+        onLeaveDays,
+        totalLateCount: deptStats[dept].totalLate,
         attendanceRate: parseFloat(attendanceRate.toFixed(1)),
         latenessRate: parseFloat(latenessRate.toFixed(1)),
         absenteeismRate: parseFloat(absenteeismRate.toFixed(1))
@@ -4319,11 +4741,15 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station } = req.query;
+    const { startDate, endDate, department, station, role, rank } = req.query;
 
     // Build user filter – includes department if provided
-    const userFilter = buildAnalyticsUserFilter(context, { department, station });
+    const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email station department');
+    const emailStationMap = {};
+    users.forEach((user) => {
+      emailStationMap[String(user.email || "").toLowerCase()] = user.station || "Unassigned";
+    });
 
     // Group users by station
     const stationMap = {};
@@ -4363,13 +4789,21 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
     }
 
     // Fetch all clockings in range for these users
-    const records = await Clocking.find({
-      email: { $in: allEmails },
-      clock_in: { $gte: start, $lte: end }
-    });
+    const [records, leaveRecords] = await Promise.all([
+      Clocking.find({
+        email: { $in: allEmails },
+        clock_in: { $gte: start, $lte: end }
+      }).lean(),
+      Leave.find({
+        email: { $in: allEmails },
+        startDate: { $lte: end },
+        endDate: { $gte: start },
+      }).lean(),
+    ]);
 
     // Compute working days
-    const workingDays = countWeekdays(start, end);
+    const workingDateKeys = getWorkingDateKeysInRange(start, end);
+    const workingDays = workingDateKeys.length;
 
     // Per‑station aggregation
     const stationStats = {};
@@ -4392,14 +4826,14 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 
     // Process records
     records.forEach(r => {
-      const st = r.station || 'Unassigned';
+      const email = String(r.email || "").toLowerCase();
+      const st = emailStationMap[email] || 'Unassigned';
       if (!stationStats[st]) return; // should not happen, but guard
 
       const metric = stationStats[st];
-      const email = r.email;
 
       // Add present day
-      const dateKey = r.clock_in.toDateString();
+      const dateKey = getNairobiDateKey(r.clock_in);
       if (metric.employeeMetrics[email]) {
         metric.employeeMetrics[email].add(dateKey);
       }
@@ -4415,12 +4849,16 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
       if (r.isLate) metric.lateCount++;
     });
 
+    const leaveDaysByStation = countApprovedLeaveDaysByGroup(leaveRecords, emailStationMap, workingDateKeys);
+
     // Compute station-level rates
     const result = stationsList.map(st => {
       const stats = stationStats[st];
       const staffCount = stats.staffCount;
       const totalPresentDays = Object.values(stats.employeeMetrics).reduce((sum, set) => sum + set.size, 0);
       const maxPossibleDays = staffCount * workingDays;
+      const onLeaveDays = leaveDaysByStation[st] || 0;
+      const absentDays = Math.max(maxPossibleDays - totalPresentDays - onLeaveDays, 0);
       const attendanceRate = maxPossibleDays > 0 ? (totalPresentDays / maxPossibleDays) * 100 : 0;
 
       // Average hours per employee
@@ -4432,14 +4870,13 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
       // Lateness rate: average late per employee
       const latenessRate = staffCount > 0 ? (stats.lateCount / staffCount) : 0;
 
-      // Absenteeism rate = 1 - attendance rate
-      const absenteeismRate = 100 - attendanceRate;
+      const absenteeismRate = maxPossibleDays > 0 ? (absentDays / maxPossibleDays) * 100 : 0;
 
       // Top performers (simplified: by total hours)
       const employeeHours = {};
       records.forEach(r => {
-        if (r.station === st && r.clock_out) {
-          const email = r.email;
+        const email = String(r.email || "").toLowerCase();
+        if (emailStationMap[email] === st && r.clock_out) {
           const hours = (r.clock_out - r.clock_in) / (1000 * 60 * 60);
           employeeHours[email] = (employeeHours[email] || 0) + hours;
         }
@@ -4453,6 +4890,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
         station: st,
         staffCount,
         departments: stats.departments,
+        presentDays: totalPresentDays,
+        absentDays,
+        onLeaveDays,
         attendanceRate: parseFloat(attendanceRate.toFixed(1)),
         latenessRate: parseFloat(latenessRate.toFixed(1)),
         absenteeismRate: parseFloat(absenteeismRate.toFixed(1)),
@@ -4510,7 +4950,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res
     // Group by day and email
     const dailyMap = {};
     records.forEach(r => {
-      const dateKey = r.clock_in.toISOString().split('T')[0];
+      const dateKey = getNairobiDateKey(r.clock_in);
       const email = r.email;
       const key = `${dateKey}|${email}`;
       if (!dailyMap[key]) dailyMap[key] = { clockIn: false, clockOut: false };
@@ -4521,8 +4961,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res
     // For each working day in range, check all employees
     let current = new Date(start);
     while (current <= end) {
-      if (current.getDay() !== 0 && current.getDay() !== 6) {
-        const dateKey = current.toISOString().split('T')[0];
+      const currentDay = getNairobiWeekdayIndex(current);
+      if (currentDay !== 0 && currentDay !== 6) {
+        const dateKey = getNairobiDateKey(current);
         emails.forEach(email => {
           const key = `${dateKey}|${email}`;
           if (!dailyMap[key]) {
@@ -4608,7 +5049,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     const config = await PlatformConfig.getSingleton();
 
     const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfMonth = getNairobiMonthStart(now);
 
     const workingDaysSoFar =
       Math.ceil((now - startOfMonth) / (1000 * 60 * 60 * 24));
@@ -4674,7 +5115,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
         }
 
         stats.employeeMetrics[email].daysPresent.add(
-          rec.clock_in.toDateString()
+          getNairobiDateKey(rec.clock_in)
         );
       }
 
@@ -5194,7 +5635,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
         !isPublicHoliday(current)
       ) {
         workingDates.push(
-          formatDateKey(current)
+          getNairobiDateKey(current)
         );
       }
 
@@ -5260,7 +5701,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
         attendanceMap[record.email] = new Set();
       }
 
-      const dateKey = formatDateKey(record.clock_in);
+      const dateKey = getNairobiDateKey(record.clock_in);
 
       if (!workingDates.includes(dateKey))
         return;
@@ -5346,11 +5787,8 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     const department = currentSupervisor.department;
     const station = currentSupervisor.station;
 
-    const dateKey = (date) => new Date(date).toISOString().split("T")[0];
-    const hourDecimal = (date) => {
-      const d = new Date(date);
-      return d.getHours() + d.getMinutes() / 60;
-    };
+    const dateKey = getNairobiDateKey;
+    const hourDecimal = getNairobiHourDecimal;
     const hourLabel = (value) => {
       if (value == null || Number.isNaN(value)) return "—";
       const h = Math.floor(value);
@@ -5360,13 +5798,11 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     const countWeekdays = (start, end) => {
       let count = 0;
       const cursor = new Date(start);
-      cursor.setHours(0, 0, 0, 0);
       const last = new Date(end);
-      last.setHours(0, 0, 0, 0);
       while (cursor <= last) {
-        const day = cursor.getDay();
+        const day = getNairobiWeekdayIndex(cursor);
         if (day !== 0 && day !== 6) count++;
-        cursor.setDate(cursor.getDate() + 1);
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
       }
       return Math.max(count, 1);
     };
@@ -5387,7 +5823,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     const emails = staff.map((u) => u.email);
 
     const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfMonth = getNairobiMonthStart(now);
     const workingDaysSoFar = countWeekdays(startOfMonth, now);
     const todayKey = dateKey(now);
 
@@ -5476,7 +5912,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
         if (hoursWorked > 9) metric.overtime += hoursWorked - 9;
 
-        metric.daysPresent.add(rec.clock_in.toDateString());
+        metric.daysPresent.add(getNairobiDateKey(rec.clock_in));
 
         if (rec.isPresent) {
           metric.presentCount++;
@@ -7292,90 +7728,11 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
 
       try {
         if (dateFrom) {
-          const fromString = String(dateFrom).trim();
-
-          // Only accept YYYY-MM-DD
-          const fromMatch = fromString.match(
-            /^(\d{4})-(\d{2})-(\d{2})$/
-          );
-
-          if (!fromMatch) {
-            return res.status(400).json({
-              message:
-                "Invalid dateFrom format. Expected YYYY-MM-DD.",
-            });
-          }
-
-          const year = Number(fromMatch[1]);
-          const month = Number(fromMatch[2]);
-          const day = Number(fromMatch[3]);
-
-          // Construct explicitly rather than relying on
-          // environment-dependent date parsing.
-          const fromDate = new Date(
-            Date.UTC(year, month - 1, day, 0, 0, 0, 0)
-          );
-
-          // Validate the constructed date.
-          if (
-            Number.isNaN(fromDate.getTime()) ||
-            fromDate.getUTCFullYear() !== year ||
-            fromDate.getUTCMonth() !== month - 1 ||
-            fromDate.getUTCDate() !== day
-          ) {
-            return res.status(400).json({
-              message: "Invalid dateFrom.",
-            });
-          }
-
-          query.occurredAt.$gte = fromDate;
+          query.occurredAt.$gte = parseDateRangeBoundary(dateFrom, "dateFrom", "start");
         }
 
         if (dateTo) {
-          const toString = String(dateTo).trim();
-
-          // Only accept YYYY-MM-DD
-          const toMatch = toString.match(
-            /^(\d{4})-(\d{2})-(\d{2})$/
-          );
-
-          if (!toMatch) {
-            return res.status(400).json({
-              message:
-                "Invalid dateTo format. Expected YYYY-MM-DD.",
-            });
-          }
-
-          const year = Number(toMatch[1]);
-          const month = Number(toMatch[2]);
-          const day = Number(toMatch[3]);
-
-          // End of requested day in UTC.
-          const toDate = new Date(
-            Date.UTC(
-              year,
-              month - 1,
-              day,
-              23,
-              59,
-              59,
-              999
-            )
-          );
-
-          // Validate the constructed date.
-          if (
-            Number.isNaN(toDate.getTime()) ||
-            toDate.getUTCFullYear() !== year ||
-            toDate.getUTCMonth() !== month - 1 ||
-            toDate.getUTCDate() !== day
-          ) {
-            return res.status(400).json({
-              message: "Invalid dateTo.",
-            });
-          }
-
-          query.occurredAt.$lte = toDate;
+          query.occurredAt.$lte = parseDateRangeBoundary(dateTo, "dateTo", "end");
         }
 
         // -------------------------------------------------------
@@ -7479,25 +7836,9 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
     // ---------------------------------------------------------
     const now = new Date();
 
-    const todayStart = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate(),
-      0,
-      0,
-      0,
-      0
-    );
-
-    const tomorrowStart = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate() + 1,
-      0,
-      0,
-      0,
-      0
-    );
+    const todayRange = getSafeDateRange(getNairobiDateKey(now), getNairobiDateKey(now));
+    const todayStart = todayRange.start;
+    const tomorrowStart = new Date(todayRange.end.getTime() + 1);
 
     const today = logs.filter((log) => {
       if (!log.occurredAt) {

@@ -164,6 +164,8 @@ export const getAttendanceScheduleTimes = (policy = {}) => {
 
 export const startAttendanceScheduler = async () => {
 
+    await stopScheduler();
+
     const config =
         await PlatformConfig.getSingleton();
 
@@ -274,8 +276,6 @@ export const startAttendanceScheduler = async () => {
         throw err;
 
     }
-
-    await stopScheduler();
 
     scheduledTasks = newScheduledTasks;
 
