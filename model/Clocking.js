@@ -25,6 +25,8 @@ const clockingSchema = new mongoose.Schema(
         outsideLocation: { type: String, default: "" },
         clockInLocationName: { type: String, default: "" },
         clockOutLocationName: { type: String, default: "" },
+        clockInWithinPremise: { type: Boolean, required: false },
+        clockOutWithinPremise: { type: Boolean, required: false },
         userLocation: {
             latitude: { type: Number, required: false },
             longitude: { type: Number, required: false },

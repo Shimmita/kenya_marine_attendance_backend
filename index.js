@@ -2390,6 +2390,16 @@ const isOutsideClockingAuthorizedNow = (user, now = new Date()) => {
   }
 };
 
+const parseOptionalBoolean = (value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "yes") return true;
+    if (normalized === "false" || normalized === "no") return false;
+  }
+  return null;
+};
+
 const parseAttendanceTime = (timeString, referenceDate = new Date()) => {
   if (!timeString || typeof timeString !== 'string') return null;
   const [hours, minutes] = timeString.split(':').map((value) => Number(value));
@@ -2614,8 +2624,12 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       userCoords,
       device_fingerprint,
       outsideLocation,
+      isWithinGeofence,
       ...authResponse
     } = req.body;
+
+    const withinPremiseFromClient =
+      parseOptionalBoolean(isWithinGeofence);
 
 
     // ───────────────────────────────────────────────────────────────────────
@@ -3009,8 +3023,15 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           clockingTime
         );
 
+      const clockInOutsidePremise =
+        withinPremiseFromClient === null
+          ? Boolean(outsideLocation)
+          : !withinPremiseFromClient;
 
-      if (canClockOutsideNow) {
+      clockingData.clockInWithinPremise =
+        !clockInOutsidePremise;
+
+      if (canClockOutsideNow && clockInOutsidePremise) {
 
         clockingData.outsideLocation =
           outsideLocation || "";
@@ -3206,8 +3227,16 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           clockOutTime
         );
 
+      const clockOutOutsidePremise =
+        withinPremiseFromClient === null
+          ? Boolean(outsideLocation)
+          : !withinPremiseFromClient;
 
-      if (canClockOutsideNow) {
+      latestClocking.clockOutWithinPremise =
+        !clockOutOutsidePremise;
+
+
+      if (canClockOutsideNow && clockOutOutsidePremise) {
 
         latestClocking.clockOutLocationName =
           outsideLocation || "";
@@ -6563,7 +6592,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank))
+    const currentUserRank = String(currentUser.rank || "").toLowerCase();
+    if (!["hr", "supervisor", "superadmin"].includes(currentUserRank))
       return res.status(403).json({ message: "Access denied" });
 
     const targetUser = await User.findById(req.params.id);
@@ -6633,6 +6663,66 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
 
     res.json({
       message: `station updated successfully`,
+      user: targetUser,
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// update user on-leave status
+app.put(`${BASE_ROUTE}/admin/user/:id/update-on-leave`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const rawIsOnLeave = req.body?.isOnLeave;
+    const normalizedIsOnLeave =
+      typeof rawIsOnLeave === "string" ? rawIsOnLeave.trim().toLowerCase() : rawIsOnLeave;
+
+    const isValidValue =
+      typeof normalizedIsOnLeave === "boolean" ||
+      ["yes", "no", "true", "false"].includes(normalizedIsOnLeave);
+
+    if (!isValidValue)
+      return res.status(400).json({ message: "Invalid on-leave value" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "supervisor", "superadmin"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    const previousIsOnLeave = targetUser.isOnLeave;
+    targetUser.isOnLeave =
+      normalizedIsOnLeave === true ||
+      normalizedIsOnLeave === "true" ||
+      normalizedIsOnLeave === "yes";
+
+    await targetUser.save();
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_on_leave_updated",
+      description: "User on-leave status updated",
+      actor: currentUser,
+      target: targetUser,
+      metadata: {
+        previousIsOnLeave,
+        isOnLeave: targetUser.isOnLeave,
+      },
+    });
+
+    res.json({
+      message: `User leave status updated to ${targetUser.isOnLeave ? "Yes" : "No"}`,
       user: targetUser,
     });
 
