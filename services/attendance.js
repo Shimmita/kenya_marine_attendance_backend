@@ -272,6 +272,10 @@ export const markMissedClockOut = async (
     if (!attendance) return null;
 
     const config = await PlatformConfig.getSingleton();
+    if (config.attendancePolicy?.autoClockOutMissedSessions === false) {
+        return attendance;
+    }
+
     const standardClockOut = config.attendancePolicy?.standardClockOut || "17:00";
 
     attendance.clock_out = getSystemClockOutTime(attendance.clock_in, standardClockOut);

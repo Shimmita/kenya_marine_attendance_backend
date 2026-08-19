@@ -932,6 +932,11 @@ const createAuditLog = async ({
   status = "success",
 }) => {
   try {
+    if (action !== "superadmin.config.update") {
+      const cfg = await PlatformConfig.getSingleton();
+      if (cfg.masterSettings?.enableAuditLogging === false) return;
+    }
+
     const context = buildAuditRequestContext(req);
     await AuditLog.create({
       category,
@@ -974,7 +979,33 @@ const sendLeaveSms = async (user, message) => {
   }
 };
 
-const buildLeaveSmsMessage = (user, leave, event) => {
+const formatPlatformTemplate = (template, user, values = {}) => {
+  const firstName = user?.name?.split(" ")?.[0] || "User";
+  const replacements = {
+    firstName,
+    name: user?.name || "",
+    fullName: user?.name || firstName,
+    email: user?.email || "",
+    phone: user?.phone || "",
+    employeeId: user?.employeeId || "",
+    department: user?.department || "",
+    station: user?.station || "",
+    ...values,
+  };
+
+  return String(template || "").replace(/\{(\w+)\}/g, (match, key) => {
+    const value = replacements[key];
+    return value === undefined || value === null ? match : String(value);
+  });
+};
+
+const getConfiguredMessage = (config, key, fallback, user, values = {}) => {
+  const template = config?.notificationReminders?.[key] || fallback;
+  return formatPlatformTemplate(template, user, values);
+};
+
+const buildLeaveSmsMessage = async (user, leave, event) => {
+  const config = await PlatformConfig.getSingleton();
   const firstName = user?.name?.split(" ")?.[0] || "User";
   const leaveType = leave?.type || "leave";
   const start = formatLeaveDate(leave?.startDate);
@@ -982,19 +1013,43 @@ const buildLeaveSmsMessage = (user, leave, event) => {
   const range = start && end ? ` from ${start} to ${end}` : "";
 
   if (event === "submitted") {
-    return `Dear ${firstName}, your ${leaveType} request${range} has been submitted successfully and is awaiting review.`;
+    return getConfiguredMessage(
+      config,
+      "leaveSubmittedMessage",
+      `Dear ${firstName}, your ${leaveType} request${range} has been submitted successfully and is awaiting review.`,
+      user,
+      { type: leaveType, startDate: start, endDate: end }
+    );
   }
 
   if (event === "approved") {
-    return `Dear ${firstName}, your ${leaveType} request${range} has been approved.`;
+    return getConfiguredMessage(
+      config,
+      "leaveApprovedMessage",
+      `Dear ${firstName}, your ${leaveType} request${range} has been approved.`,
+      user,
+      { type: leaveType, startDate: start, endDate: end }
+    );
   }
 
   if (event === "rejected") {
-    return `Dear ${firstName}, your ${leaveType} request${range} has been rejected. Please contact your supervisor or HR for clarification.`;
+    return getConfiguredMessage(
+      config,
+      "leaveRejectedMessage",
+      `Dear ${firstName}, your ${leaveType} request${range} has been rejected. Please contact your supervisor or HR for clarification.`,
+      user,
+      { type: leaveType, startDate: start, endDate: end }
+    );
   }
 
   if (event === "cancelled") {
-    return `Dear ${firstName}, your ${leaveType} request${range} has been cancelled successfully.`;
+    return getConfiguredMessage(
+      config,
+      "leaveCancelledMessage",
+      `Dear ${firstName}, your ${leaveType} request${range} has been cancelled successfully.`,
+      user,
+      { type: leaveType, startDate: start, endDate: end }
+    );
   }
 
   return `Dear ${firstName}, your leave request has been updated.`;
@@ -1019,6 +1074,12 @@ const getUserAuthenticators = (user) => {
 
 const getActiveUserDevices = async (email) =>
   Devices.find({ user_email: email, device_lost: { $ne: true } }).sort({ createdAt: 1 });
+
+const getMaxUserDevices = async () => {
+  const cfg = await PlatformConfig.getSingleton();
+  const maxDevices = Number(cfg.masterSettings?.maxDevicesPerUser ?? MAX_USER_DEVICES);
+  return Number.isFinite(maxDevices) && maxDevices > 0 ? maxDevices : MAX_USER_DEVICES;
+};
 
 const getAuthenticatorDeviceFingerprint = (authenticator) =>
   authenticator?.deviceFingerprint || authenticator?.device_fingerprint || "";
@@ -1189,6 +1250,11 @@ const SESSION_COOKIE_SAME_SITE = normalizeSameSite(
   process.env.SESSION_COOKIE_SAME_SITE,
   "lax"
 );
+const SESSION_TIMEOUT_MINUTES = parsePositiveNumberEnv(
+  process.env.SESSION_TIMEOUT_MINUTES,
+  24 * 60
+);
+const DEFAULT_SESSION_MAX_AGE_MS = SESSION_TIMEOUT_MINUTES * 60 * 1000;
 const TRUST_PROXY = parsePositiveNumberEnv(process.env.TRUST_PROXY, 1);
 
 app.set("trust proxy", TRUST_PROXY);
@@ -1202,13 +1268,31 @@ app.use(
     name: process.env.SESSION_NAME,
     store,
     cookie: {
-      maxAge: 24 * 60 * 60 * 1000,
+      maxAge: DEFAULT_SESSION_MAX_AGE_MS,
       httpOnly: true,
       secure: SESSION_COOKIE_SECURE,
       sameSite: SESSION_COOKIE_SAME_SITE,
     },
   })
 );
+
+const sessionTimeoutCache = {
+  maxAgeMs: DEFAULT_SESSION_MAX_AGE_MS,
+  expiresAt: 0,
+};
+
+const getConfiguredSessionMaxAgeMs = async () => {
+  if (Date.now() < sessionTimeoutCache.expiresAt) {
+    return sessionTimeoutCache.maxAgeMs;
+  }
+
+  const cfg = await PlatformConfig.getSingleton();
+  const minutes = Number(cfg.masterSettings?.sessionTimeoutMinutes ?? SESSION_TIMEOUT_MINUTES);
+  sessionTimeoutCache.maxAgeMs =
+    (Number.isFinite(minutes) && minutes > 0 ? minutes : SESSION_TIMEOUT_MINUTES) * 60 * 1000;
+  sessionTimeoutCache.expiresAt = Date.now() + 60 * 1000;
+  return sessionTimeoutCache.maxAgeMs;
+};
 
 const saveSession = (req) =>
   new Promise((resolve, reject) => {
@@ -1222,6 +1306,18 @@ const saveSession = (req) =>
       else resolve();
     });
   });
+
+app.use(async (req, res, next) => {
+  try {
+    if (req.session?.cookie) {
+      req.session.cookie.maxAge = await getConfiguredSessionMaxAgeMs();
+    }
+  } catch (error) {
+    console.warn("Session timeout config unavailable:", error?.message || error);
+  }
+
+  next();
+});
 
 // ─── Auth check ───────────────────────────────────────────────────────────────
 
@@ -2221,6 +2317,7 @@ app.get(`${BASE_ROUTE}/biometric/status`, async (req, res) => {
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
     const state = await getDeviceBiometricState(user, deviceFingerprint);
+    const maxUserDevices = await getMaxUserDevices();
 
     const syncedDoneBiometric = Boolean(state.accountRegistered);
     const syncedHasDevices = state.activeDevices.length > 1;
@@ -2235,8 +2332,8 @@ app.get(`${BASE_ROUTE}/biometric/status`, async (req, res) => {
       accountRegistered: syncedDoneBiometric,
       currentDeviceRegistered: state.currentDeviceRegistered,
       activeDeviceCount: state.activeDevices.length,
-      maxDevices: MAX_USER_DEVICES,
-      canEnrollDevice: state.currentDeviceRegistered || state.activeDevices.length < MAX_USER_DEVICES,
+      maxDevices: maxUserDevices,
+      canEnrollDevice: state.currentDeviceRegistered || state.activeDevices.length < maxUserDevices,
     });
   } catch (err) {
     console.error("Biometric status error:", err);
@@ -2256,6 +2353,7 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
     const state = await getDeviceBiometricState(user, deviceFingerprint);
+    const maxUserDevices = await getMaxUserDevices();
 
     if (deviceFingerprint) {
       const existingOtherDevice = await Devices.findOne({
@@ -2276,8 +2374,8 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
       });
     }
 
-    if (!state.currentDevice && state.activeDevices.length >= MAX_USER_DEVICES) {
-      throw new Error(`You can only enroll up to ${MAX_USER_DEVICES} devices. Report a lost device or contact admin to clear one.`);
+    if (!state.currentDevice && state.activeDevices.length >= maxUserDevices) {
+      throw new Error(`You can only enroll up to ${maxUserDevices} devices. Report a lost device or contact admin to clear one.`);
     }
 
     const existingAuthenticators = state.authenticators;
@@ -2367,6 +2465,7 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
 
     const { credential } = verification.registrationInfo;
     const activeDevices = await getActiveUserDevices(user.email);
+    const maxUserDevices = await getMaxUserDevices();
     const existingOwnDevice = activeDevices.find(
       (deviceRecord) => deviceRecord.device_fingerprint === device_fingerprint
     );
@@ -2379,8 +2478,8 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       throw new Error("This device is already enrolled by another account.");
     }
 
-    if (!existingOwnDevice && activeDevices.length >= MAX_USER_DEVICES) {
-      throw new Error(`You can only enroll up to ${MAX_USER_DEVICES} devices.`);
+    if (!existingOwnDevice && activeDevices.length >= maxUserDevices) {
+      throw new Error(`You can only enroll up to ${maxUserDevices} devices.`);
     }
 
     const credentialRecord = {
@@ -2673,6 +2772,7 @@ const finalizeStaleClocking = async (user, now = new Date()) => {
   if (!recordsToClose.length) return user;
 
   const attendancePolicy = await getAttendancePolicy();
+  if (attendancePolicy.autoClockOutMissedSessions === false) return user;
 
   await Promise.all(recordsToClose.map(async (record) => {
     record.clock_out = getSystemClockOutTime(
@@ -2788,6 +2888,27 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 
     const withinPremiseFromClient =
       parseOptionalBoolean(isWithinGeofence);
+
+    const attendancePolicy =
+      await getAttendancePolicy();
+
+    const hasValidCoordinates =
+      Number.isFinite(Number(userCoords?.latitude)) &&
+      Number.isFinite(Number(userCoords?.longitude));
+
+    if (attendancePolicy.requireLocationForClocking !== false && !hasValidCoordinates) {
+      return res.status(400).json({
+        verified: false,
+        message: "Location access is required before clocking.",
+      });
+    }
+
+    if (attendancePolicy.requireStationSelection !== false && !selectedStation && !user.station) {
+      return res.status(400).json({
+        verified: false,
+        message: "Station selection is required before clocking.",
+      });
+    }
 
 
     // ───────────────────────────────────────────────────────────────────────
@@ -3073,10 +3194,6 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // ATTENDANCE POLICY
       // ─────────────────────────────────────────────────────────────────────
 
-      const attendancePolicy =
-        await getAttendancePolicy();
-
-
       /*
        * Your parseAttendanceTime function should interpret
        * standardClockIn in Africa/Nairobi.
@@ -3176,6 +3293,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // ─────────────────────────────────────────────────────────────────────
 
       const canClockOutsideNow =
+        attendancePolicy.allowClockOutsideStation !== false &&
         isOutsideClockingAuthorizedNow(
           user,
           clockingTime
@@ -3254,10 +3372,23 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // SEND CLOCK-IN MESSAGE
       // ─────────────────────────────────────────────────────────────────────
 
+      const messageConfig =
+        await PlatformConfig.getSingleton();
+
       await SendMessageNow(
         user,
 
-        `Dear ${user.name}, you have successfully checked in at ${clockingData.station} on ${formattedDate} at ${formattedTime} EAT.`
+        getConfiguredMessage(
+          messageConfig,
+          "clockInSuccessMessage",
+          `Dear ${user.name}, you have successfully checked in at ${clockingData.station} on ${formattedDate} at ${formattedTime} EAT.`,
+          user,
+          {
+            station: clockingData.station,
+            date: formattedDate,
+            time: formattedTime,
+          }
+        )
       );
 
 
@@ -3380,6 +3511,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // ─────────────────────────────────────────────────────────────────────
 
       const canClockOutsideNow =
+        attendancePolicy.allowClockOutsideStation !== false &&
         isOutsideClockingAuthorizedNow(
           user,
           clockOutTime
@@ -3460,10 +3592,23 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // SEND CLOCK-OUT MESSAGE
       // ─────────────────────────────────────────────────────────────────────
 
+      const messageConfig =
+        await PlatformConfig.getSingleton();
+
       await SendMessageNow(
         user,
 
-        `Dear ${user.name}, you have successfully checked out from ${latestClocking.station} on ${clockOutDate} at ${clockOutFormattedTime} EAT.`
+        getConfiguredMessage(
+          messageConfig,
+          "clockOutSuccessMessage",
+          `Dear ${user.name}, you have successfully checked out from ${latestClocking.station} on ${clockOutDate} at ${clockOutFormattedTime} EAT.`,
+          user,
+          {
+            station: latestClocking.station,
+            date: clockOutDate,
+            time: clockOutFormattedTime,
+          }
+        )
       );
 
 
@@ -3592,7 +3737,14 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 // ─── Attendance ──────────────
 
 app.post(`${BASE_ROUTE}/attendance/clockin`, async (req, res) => {
-  const BIOMETRIC_WINDOW_MS = 2 * 60 * 1000;
+  const cfg = await PlatformConfig.getSingleton();
+  const biometricWindowMinutes = Number(
+    cfg.masterSettings?.biometricVerificationWindowMinutes ?? 5
+  );
+  const BIOMETRIC_WINDOW_MS =
+    (Number.isFinite(biometricWindowMinutes) && biometricWindowMinutes > 0
+      ? biometricWindowMinutes
+      : 5) * 60 * 1000;
   const verified =
     req.session.biometricVerified &&
     Date.now() - req.session.biometricVerifiedAt < BIOMETRIC_WINDOW_MS;
@@ -4667,7 +4819,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 
     // Build user filter – includes department if provided
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
-    const users = await User.find(userFilter, 'email station department');
+    const users = await User.find(userFilter, 'email name station department');
     const emailStationMap = {};
     users.forEach((user) => {
       emailStationMap[String(user.email || "").toLowerCase()] = user.station || "Unassigned";
@@ -4803,9 +4955,26 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
           employeeHours[email] = (employeeHours[email] || 0) + hours;
         }
       });
-      const topPerformers = Object.keys(employeeHours)
-        .map(email => ({ email, hours: employeeHours[email] }))
-        .sort((a, b) => b.hours - a.hours)
+      const topPerformers = stationMap[st].staff
+        .map((employee) => {
+          const email = String(employee.email || "").toLowerCase();
+          const presentDays = stats.employeeMetrics[email]?.size || 0;
+          const attendanceRate = workingDays > 0 ? (presentDays / workingDays) * 100 : 0;
+          return {
+            name: employee.name || employee.email,
+            email: employee.email,
+            station: st,
+            department: employee.department || "Unassigned",
+            presentDays,
+            attendanceRate: parseFloat(attendanceRate.toFixed(1)),
+            hours: parseFloat(Number(employeeHours[email] || 0).toFixed(1)),
+          };
+        })
+        .sort((a, b) => {
+          const rateDiff = Number(b.attendanceRate || 0) - Number(a.attendanceRate || 0);
+          if (rateDiff !== 0) return rateDiff;
+          return Number(b.hours || 0) - Number(a.hours || 0);
+        })
         .slice(0, 5);
 
       return {
@@ -6561,6 +6730,29 @@ app.put(`${BASE_ROUTE}/admin/user/:id/toggle-active`, async (req, res) => {
     targetUser.isAccountActive = !targetUser.isAccountActive;
     await targetUser.save();
 
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_account_status_updated",
+      description: "User account status updated",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { isAccountActive: targetUser.isAccountActive },
+    });
+
+    const messageConfig = await PlatformConfig.getSingleton();
+    const messageKey = targetUser.isAccountActive
+      ? "accountActivatedMessage"
+      : "accountDeactivatedMessage";
+    const fallback = targetUser.isAccountActive
+      ? `Dear ${targetUser.name}, your KMFRI Attendance account has been activated. You may now access attendance services.`
+      : `Dear ${targetUser.name}, your KMFRI Attendance account has been deactivated. Please contact HR for assistance.`;
+
+    await SendMessageNow(
+      targetUser,
+      getConfiguredMessage(messageConfig, messageKey, fallback, targetUser)
+    );
+
     res.json({
       message: `User account is now ${targetUser.isAccountActive ? "Active" : "Deactivated"
         }`,
@@ -6880,6 +7072,21 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-on-leave`, async (req, res) => {
       },
     });
 
+    if (previousIsOnLeave !== targetUser.isOnLeave) {
+      const messageConfig = await PlatformConfig.getSingleton();
+      const messageKey = targetUser.isOnLeave
+        ? "manualLeaveEnabledMessage"
+        : "manualLeaveDisabledMessage";
+      const fallback = targetUser.isOnLeave
+        ? `Dear ${targetUser.name}, your attendance profile has been marked as on leave.`
+        : `Dear ${targetUser.name}, your attendance profile has been removed from on-leave status.`;
+
+      await SendMessageNow(
+        targetUser,
+        getConfiguredMessage(messageConfig, messageKey, fallback, targetUser)
+      );
+    }
+
     res.json({
       message: `User leave status updated to ${targetUser.isOnLeave ? "Yes" : "No"}`,
       user: targetUser,
@@ -7098,7 +7305,7 @@ app.post(`${BASE_ROUTE}/leave`, async (req, res) => {
 
     await sendLeaveSms(
       currentUser,
-      buildLeaveSmsMessage(currentUser, leave, "submitted")
+      await buildLeaveSmsMessage(currentUser, leave, "submitted")
     );
 
     await createAuditLog({
@@ -7260,7 +7467,7 @@ app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
     ) {
       await sendLeaveSms(
         targetUser,
-        buildLeaveSmsMessage(targetUser, updatedLeave, updatedLeave.status)
+        await buildLeaveSmsMessage(targetUser, updatedLeave, updatedLeave.status)
       );
     }
 
@@ -7333,7 +7540,7 @@ app.delete(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
 
       await sendLeaveSms(
         targetUser,
-        buildLeaveSmsMessage(targetUser, leave, "cancelled")
+        await buildLeaveSmsMessage(targetUser, leave, "cancelled")
       );
     }
 
@@ -7484,8 +7691,17 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
       },
     });
 
-    // send SMS notification to the user about the granted permission
-    await SendMessageNow(targetUser, `Dear ${targetUser.name}, you have been granted permission to clock outside of your assigned station  "${targetUser.station}"  from ${startDate} to ${endDate} for the reason "${reason}". Please ensure to adhere to the guidelines provided.`);
+    const messageConfig = await PlatformConfig.getSingleton();
+    await SendMessageNow(
+      targetUser,
+      getConfiguredMessage(
+        messageConfig,
+        "clockOutsideGrantedMessage",
+        `Dear ${targetUser.name}, you have been granted permission to clock outside of your assigned station "${targetUser.station}" from ${startDate} to ${endDate} for the reason "${reason}". Please ensure to adhere to the guidelines provided.`,
+        targetUser,
+        { startDate, endDate, reason }
+      )
+    );
 
     res.json({
       message: `Clock outside authorization updated for ${targetUser.name}`,
@@ -7533,8 +7749,16 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
     });
 
 
-    // send message notification to the user about the revoked permission
-    await SendMessageNow(targetUser, `Dear ${targetUser.name}, your permission to clock outside of you station "${targetUser.station}" has been revoked. Please ensure to adhere to the standard clocking procedures.`);
+    const messageConfig = await PlatformConfig.getSingleton();
+    await SendMessageNow(
+      targetUser,
+      getConfiguredMessage(
+        messageConfig,
+        "clockOutsideRevokedMessage",
+        `Dear ${targetUser.name}, your permission to clock outside of your station "${targetUser.station}" has been revoked. Please ensure to adhere to the standard clocking procedures.`,
+        targetUser
+      )
+    );
 
     res.json({
       message: `Clock outside authorization revoked for ${targetUser.name}`,
@@ -7577,11 +7801,19 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-on-leave`, async (req, res) => {
     });
 
 
-    // send message notification to the user about the revoked permission
-    await SendMessageNow(targetUser, `Dear ${targetUser.name}, your permission to clock outside of you station "${targetUser.station}" has been revoked. Please ensure to adhere to the standard clocking procedures.`);
+    const messageConfig = await PlatformConfig.getSingleton();
+    await SendMessageNow(
+      targetUser,
+      getConfiguredMessage(
+        messageConfig,
+        "manualLeaveDisabledMessage",
+        `Dear ${targetUser.name}, your attendance profile has been removed from on-leave status.`,
+        targetUser
+      )
+    );
 
     res.json({
-      message: `Clock outside authorization revoked for ${targetUser.name}`,
+      message: `On-leave status revoked for ${targetUser.name}`,
       user: targetUser,
     });
   } catch (error) {
@@ -8246,7 +8478,20 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     }
 
+    // =====================================================
+    // HOLIDAYS
+    // =====================================================
+
+    if (updates.holidays) {
+
+      cfg.holidays = updates.holidays;
+
+      cfg.markModified("holidays");
+
+    }
+
     await cfg.save();
+    sessionTimeoutCache.expiresAt = 0;
 
 
     // refresh scheduler
@@ -8302,7 +8547,7 @@ app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
     const { section = 'all' } = req.body || {};
     const defaults = getDefaultPlatformConfig();
     const cfg = await PlatformConfig.getSingleton();
-    const resettableSections = ['branding', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations', 'logoUrl'];
+    const resettableSections = ['branding', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations', 'holidays', 'logoUrl'];
 
     if (section === 'all') {
       Object.entries(defaults).forEach(([key, value]) => {
@@ -8331,6 +8576,7 @@ app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
     }
 
     await cfg.save();
+    sessionTimeoutCache.expiresAt = 0;
 
     if (section === 'all' || section === 'attendancePolicy') {
       await refreshAttendanceScheduler();
@@ -8658,7 +8904,19 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
             cfg.masterSettings.maintenanceMode,
 
           selfRegistration:
-            cfg.masterSettings.allowEmployeeSelfRegistration
+            cfg.masterSettings.allowEmployeeSelfRegistration,
+
+          maxDevicesPerUser:
+            cfg.masterSettings.maxDevicesPerUser,
+
+          biometricVerificationWindowMinutes:
+            cfg.masterSettings.biometricVerificationWindowMinutes,
+
+          sessionTimeoutMinutes:
+            cfg.masterSettings.sessionTimeoutMinutes,
+
+          auditLogging:
+            cfg.masterSettings.enableAuditLogging
 
         },
 
@@ -8673,11 +8931,29 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
           gracePeriod:
             cfg.attendancePolicy.gracePeriodMinutes,
 
+          clockInReminderOffset:
+            cfg.attendancePolicy.clockInReminderOffsetMinutes,
+
+          clockOutReminderOffset:
+            cfg.attendancePolicy.clockOutReminderOffsetMinutes,
+
+          midnightProcessingTime:
+            cfg.attendancePolicy.midnightProcessingTime,
+
+          workingDays:
+            cfg.attendancePolicy.workingDays,
+
           biometric:
             cfg.attendancePolicy.requireBiometricVerification,
 
           allowClockOutside:
-            cfg.attendancePolicy.allowClockOutsideStation
+            cfg.attendancePolicy.allowClockOutsideStation,
+
+          autoClockOutMissedSessions:
+            cfg.attendancePolicy.autoClockOutMissedSessions,
+
+          markAbsenteesAutomatically:
+            cfg.attendancePolicy.markAbsenteesAutomatically
 
         },
 

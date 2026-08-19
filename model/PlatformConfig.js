@@ -206,6 +206,10 @@ const defaultNotificationReminders = {
 
     clockOutMessage: 'Dear {firstName}, please remember to clock out before leaving your station.',
 
+    clockInSuccessMessage: 'Dear {firstName}, you have successfully checked in at {station} on {date} at {time} EAT.',
+
+    clockOutSuccessMessage: 'Dear {firstName}, you have successfully checked out from {station} on {date} at {time} EAT.',
+
     internRegMessage: `Dear {firstName}, your KMFRI Attendance account is ready. Login: {email} | Password: {password}. Please change your password after login.`,
 
     staffRegMessage: `Dear {firstName}, your KMFRI Attendance account is ready. Login: {employeeId} | Password: {password}. Please change your password after login.`,
@@ -228,6 +232,10 @@ const defaultNotificationReminders = {
 
     leaveCancelledMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) has been cancelled.',
 
+    manualLeaveEnabledMessage: 'Dear {firstName}, your attendance profile has been marked as on leave.',
+
+    manualLeaveDisabledMessage: 'Dear {firstName}, your attendance profile has been removed from on-leave status.',
+
     missedClockOutMessage: 'Dear {firstName}, you did not clock out yesterday. Please ensure you complete your attendance records.',
 
     absentMessage: 'Dear {firstName}, no attendance was recorded for you yesterday. Please contact HR if this is incorrect.',
@@ -249,26 +257,45 @@ const defaultAttendancePolicy = {
 
     gracePeriodMinutes: 15,
 
-    // NEW patch later
+    minimumWorkHours: 8,
+
+    halfDayWorkHours: 4,
+
+    earlyDepartureGraceMinutes: 15,
+
     clockInReminderOffsetMinutes: 0,
 
-    // NEW
     clockOutReminderOffsetMinutes: 0,
 
-    // NEW
     midnightProcessingTime: "00:00",
 
     workingDays: [1, 2, 3, 4, 5],
 
-    allowClockOutsideStation: false,
+    requireLocationForClocking: true,
+
+    requireStationSelection: true,
+
+    autoClockOutMissedSessions: true,
+
+    markAbsenteesAutomatically: true,
+
+    allowClockOutsideStation: true,
 
     requireBiometricVerification: true
 
 };
 
 const defaultMasterSettings = {
+    allowEmployeeSelfRegistration: false,
     maintenanceMode: false,
     requirePasswordResetOnFirstLogin: false,
+    maxDevicesPerUser: 2,
+    biometricVerificationWindowMinutes: 5,
+    sessionTimeoutMinutes: 1440,
+    enableAuditLogging: true,
+    enableAttendanceExports: true,
+    enableLeaveManagement: true,
+    enableSupervisorManagement: true,
 
 };
 
@@ -307,6 +334,8 @@ const platformConfigSchema = new mongoose.Schema({
         clockOutReminderMinutes: { type: Number, default: defaultNotificationReminders.clockOutReminderMinutes },
         clockInMessage: { type: String, default: defaultNotificationReminders.clockInMessage },
         clockOutMessage: { type: String, default: defaultNotificationReminders.clockOutMessage },
+        clockInSuccessMessage: { type: String, default: defaultNotificationReminders.clockInSuccessMessage },
+        clockOutSuccessMessage: { type: String, default: defaultNotificationReminders.clockOutSuccessMessage },
         internRegMessage: { type: String, default: defaultNotificationReminders.internRegMessage },
         staffRegMessage: { type: String, default: defaultNotificationReminders.staffRegMessage },
         authorisedClockOut: { type: String, default: defaultNotificationReminders.authorisedClockOut },
@@ -318,6 +347,8 @@ const platformConfigSchema = new mongoose.Schema({
         leaveApprovedMessage: { type: String, default: defaultNotificationReminders.leaveApprovedMessage },
         leaveRejectedMessage: { type: String, default: defaultNotificationReminders.leaveRejectedMessage },
         leaveCancelledMessage: { type: String, default: defaultNotificationReminders.leaveCancelledMessage },
+        manualLeaveEnabledMessage: { type: String, default: defaultNotificationReminders.manualLeaveEnabledMessage },
+        manualLeaveDisabledMessage: { type: String, default: defaultNotificationReminders.manualLeaveDisabledMessage },
         missedClockOutMessage: { type: String, default: defaultNotificationReminders.missedClockOutMessage },
         absentMessage: { type: String, default: defaultNotificationReminders.absentMessage },
         channels: { type: [String], default: defaultNotificationReminders.channels },
@@ -343,6 +374,21 @@ const platformConfigSchema = new mongoose.Schema({
             default: defaultAttendancePolicy.gracePeriodMinutes
         },
 
+        minimumWorkHours: {
+            type: Number,
+            default: defaultAttendancePolicy.minimumWorkHours
+        },
+
+        halfDayWorkHours: {
+            type: Number,
+            default: defaultAttendancePolicy.halfDayWorkHours
+        },
+
+        earlyDepartureGraceMinutes: {
+            type: Number,
+            default: defaultAttendancePolicy.earlyDepartureGraceMinutes
+        },
+
         clockInReminderOffsetMinutes: {
             type: Number,
             default: defaultAttendancePolicy.clockInReminderOffsetMinutes
@@ -361,6 +407,26 @@ const platformConfigSchema = new mongoose.Schema({
         workingDays: {
             type: [Number],
             default: [1, 2, 3, 4, 5]
+        },
+
+        requireLocationForClocking: {
+            type: Boolean,
+            default: defaultAttendancePolicy.requireLocationForClocking
+        },
+
+        requireStationSelection: {
+            type: Boolean,
+            default: defaultAttendancePolicy.requireStationSelection
+        },
+
+        autoClockOutMissedSessions: {
+            type: Boolean,
+            default: defaultAttendancePolicy.autoClockOutMissedSessions
+        },
+
+        markAbsenteesAutomatically: {
+            type: Boolean,
+            default: defaultAttendancePolicy.markAbsenteesAutomatically
         },
 
         allowClockOutsideStation: {
@@ -386,6 +452,12 @@ const platformConfigSchema = new mongoose.Schema({
         maintenanceMode: { type: Boolean, default: defaultMasterSettings.maintenanceMode },
         requirePasswordResetOnFirstLogin: { type: Boolean, default: defaultMasterSettings.requirePasswordResetOnFirstLogin },
         maxDevicesPerUser: { type: Number, default: defaultMasterSettings.maxDevicesPerUser },
+        biometricVerificationWindowMinutes: { type: Number, default: defaultMasterSettings.biometricVerificationWindowMinutes },
+        sessionTimeoutMinutes: { type: Number, default: defaultMasterSettings.sessionTimeoutMinutes },
+        enableAuditLogging: { type: Boolean, default: defaultMasterSettings.enableAuditLogging },
+        enableAttendanceExports: { type: Boolean, default: defaultMasterSettings.enableAttendanceExports },
+        enableLeaveManagement: { type: Boolean, default: defaultMasterSettings.enableLeaveManagement },
+        enableSupervisorManagement: { type: Boolean, default: defaultMasterSettings.enableSupervisorManagement },
     },
 }, { timestamps: true });
 
@@ -431,6 +503,19 @@ const normalizeStation = (station) => {
         radiusMeters: Number(station?.radiusMeters ?? 500),
         active: station?.active !== false,
     };
+};
+
+const applyNestedDefaults = (target, defaults) => {
+    let changed = false;
+
+    for (const [key, value] of Object.entries(defaults)) {
+        if (typeof target?.[key] === 'undefined') {
+            target[key] = Array.isArray(value) ? [...value] : value;
+            changed = true;
+        }
+    }
+
+    return changed;
 };
 
 export const getDefaultPlatformConfig = () => ({
@@ -529,6 +614,14 @@ platformConfigSchema.statics.getSingleton = async function () {
             cfg.dropdowns = defaultDropdowns;
             changed = true;
         }
+        if (!cfg.attendancePolicy) {
+            cfg.attendancePolicy = { ...defaultAttendancePolicy };
+            changed = true;
+        }
+        if (!cfg.masterSettings) {
+            cfg.masterSettings = { ...defaultMasterSettings };
+            changed = true;
+        }
         if (!Array.isArray(cfg.themes) || cfg.themes.length === 0) {
             cfg.themes = defaultThemes;
             changed = true;
@@ -538,6 +631,14 @@ platformConfigSchema.statics.getSingleton = async function () {
                 cfg.notificationReminders[key] = value;
                 changed = true;
             }
+        }
+        if (applyNestedDefaults(cfg.attendancePolicy, defaultAttendancePolicy)) {
+            cfg.markModified('attendancePolicy');
+            changed = true;
+        }
+        if (applyNestedDefaults(cfg.masterSettings, defaultMasterSettings)) {
+            cfg.markModified('masterSettings');
+            changed = true;
         }
         if (!cfg.activeThemeName) {
             cfg.activeThemeName = defaultThemes[0].name;

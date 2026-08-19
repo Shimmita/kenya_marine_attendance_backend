@@ -158,7 +158,9 @@ const registerMidnightAttendanceJob = async () => {
         */
 
         const users =
-            await getAbsentUsersYesterday(start, end);
+            config.attendancePolicy?.markAbsenteesAutomatically === false
+                ? []
+                : await getAbsentUsersYesterday(start, end);
 
         let absentCount = 0;
 
