@@ -74,10 +74,6 @@ const CLIENT_AUDIT_ACTIONS = {
     description: "Attendance history exported",
   },
 };
-const PASSWORD_RESET_CODE_TTL_MS = 1000 * 60 * 20;
-const hashResetCode = (code) =>
-  crypto.createHash("sha256").update(String(code)).digest("hex");
-
 const generateResetCode = (length = 8) => {
   const chars =
     "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789@#$%";
@@ -176,6 +172,26 @@ const normalizeDateInput = (value, fieldName = "date") => {
   return candidateString;
 };
 
+const normalizeQueryValue = (value, fallback = "", preferLast = false) => {
+  if (value === undefined || value === null) return fallback;
+
+  if (Array.isArray(value)) {
+    const values = value
+      .map((entry) => normalizeQueryValue(entry, "", preferLast))
+      .filter(Boolean);
+
+    if (!values.length) return fallback;
+    return preferLast ? values[values.length - 1] : values[0];
+  }
+
+  if (typeof value === "object") {
+    return fallback;
+  }
+
+  const normalized = String(value).trim();
+  return normalized || fallback;
+};
+
 const getNairobiDateParts = (date = new Date()) => {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: EAT_TIMEZONE,
@@ -208,8 +224,6 @@ const getNairobiDateKey = (date = new Date()) => {
   const parts = getNairobiDateParts(date);
   return `${parts.year}-${padDatePart(parts.month)}-${padDatePart(parts.day)}`;
 };
-
-const getNairobiMonthKey = (date = new Date()) => getNairobiDateKey(date).slice(0, 7);
 
 const getNairobiHourDecimal = (date = new Date()) => {
   const parts = getNairobiDateTimeParts(date);
@@ -1597,35 +1611,9 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
 });
 
 
-// ─── LDAP Authentication Helper ───────────────────────────────────────────────
-// TEMPORARY:
-// Active Directory / LDAP communication is currently bypassed.
-// authenticateWithLDAP() is still used by the signin route so that
-// when AD is available, only this function needs to be switched back.
-//
-// CURRENT AUTHENTICATION:
-// User.employeeId + User.password
-//
-// FUTURE AUTHENTICATION:
-// Active Directory / LDAP
-// ──────────────────────────────────────────────────────────────────────────────
+// ─── Staff Authentication Helper ──────────────────────────────────────────────
 
-const LDAP_TIMEOUT_MS = 5000; // 5 second timeout for LDAP connection
-const LDAP_REQUEST_TIMEOUT_MS = 10000; // 10 second timeout for entire LDAP auth process
-
-const authenticateWithLDAP = async (userId, password) => {
-
-  // ===========================================================================
-  // TEMPORARY LOCAL AUTHENTICATION
-  // ===========================================================================
-  // Using the User model while Active Directory is unavailable.
-  //
-  // When AD is active:
-  // 1. Comment out this entire LOCAL AUTHENTICATION section.
-  // 2. Uncomment the REAL LDAP section below.
-  // 3. No changes will be required in the signin-staff route.
-  // ===========================================================================
-
+const authenticateStaffCredentials = async (userId, password) => {
   try {
     const user = await User.findOne({
       employeeId: userId.trim(),
@@ -1657,244 +1645,10 @@ const authenticateWithLDAP = async (userId, password) => {
 
     throw new Error("Invalid credentials!");
   }
-
-
-  // ===========================================================================
-  // REAL ACTIVE DIRECTORY / LDAP AUTHENTICATION
-  // ===========================================================================
-  // DO NOT DELETE THIS CODE.
-  //
-  // When Active Directory is available:
-  //
-  // 1. Comment out the LOCAL AUTHENTICATION section above.
-  // 2. Remove the comment block around this section.
-  // 3. The signin-staff route will automatically authenticate through AD.
-  // ===========================================================================
-
-  /*
-  const url = process.env.LDAP_URL;
-  const baseDN = process.env.LDAP_BASE_DN;
-
-  // Create LDAP client with timeout settings
-  const client = ldapjs.createClient({
-    url,
-    timeout: LDAP_TIMEOUT_MS,
-    connectTimeout: LDAP_TIMEOUT_MS,
-  });
-
-  // Handle connection errors at the client level
-  client.on("error", (err) => {
-    console.error(
-      "LDAP client error:",
-      err.code,
-      err.message
-    );
-  });
-
-  const tryBind = (dn) =>
-    new Promise((resolve, reject) => {
-      client.bind(dn, password, (err) => {
-        if (err) return reject(err);
-        resolve(true);
-      });
-    });
-
-  // Wrap entire LDAP process in a timeout promise
-  return Promise.race([
-
-    // -------------------------------------------------------------------------
-    // Main LDAP authentication logic
-    // -------------------------------------------------------------------------
-    (async () => {
-      try {
-
-        // =====================================================================
-        // 1. UPN
-        // =====================================================================
-
-        try {
-          const upn = `${userId}${process.env.UPN_METHOD_URL}`;
-
-          await tryBind(upn);
-
-          return {
-            success: true,
-            method: "UPN",
-          };
-
-        } catch (err) {
-          console.log(
-            "UPN failed:",
-            err.message
-          );
-        }
-
-
-        // =====================================================================
-        // 2. DOMAIN
-        // =====================================================================
-
-        try {
-          const domainUser =
-            `${process.env.LDAP_DOMAIN}\\${userId}`;
-
-          await tryBind(domainUser);
-
-          return {
-            success: true,
-            method: "DOMAIN",
-          };
-
-        } catch (err) {
-          console.log(
-            "DOMAIN failed:",
-            err.message
-          );
-        }
-
-
-        // =====================================================================
-        // 3. SEARCH + BIND
-        // =====================================================================
-
-        return new Promise((resolve, reject) => {
-
-          client.bind(
-            process.env.LDAP_BIND_DN,
-            process.env.LDAP_BIND_PASSWORD,
-            (err) => {
-
-              if (err) {
-                return reject(
-                  new Error("Invalid credentials!")
-                );
-              }
-
-              const opts = {
-                scope: "sub",
-
-                filter:
-                  `(|` +
-                  `(sAMAccountName=${userId})` +
-                  `(employeeID=${userId})` +
-                  `(cn=${userId})` +
-                  `)`,
-
-                attributes: ["dn"],
-              };
-
-
-              client.search(
-                baseDN,
-                opts,
-                (err, res) => {
-
-                  if (err) {
-                    return reject(err);
-                  }
-
-                  let userDN = null;
-
-
-                  res.on(
-                    "searchEntry",
-                    (entry) => {
-
-                      userDN =
-                        entry.objectName;
-
-                      console.log(
-                        "Found user DN:",
-                        userDN
-                      );
-                    }
-                  );
-
-
-                  res.on(
-                    "end",
-                    async () => {
-
-                      if (!userDN) {
-                        return reject(
-                          new Error(
-                            "User not found!"
-                          )
-                        );
-                      }
-
-                      try {
-
-                        await tryBind(userDN);
-
-                        resolve({
-                          success: true,
-                          method: "SEARCH",
-                        });
-
-                      } catch (err) {
-
-                        reject(
-                          new Error(
-                            "Invalid credentials!"
-                          )
-                        );
-                      }
-                    }
-                  );
-                }
-              );
-            }
-          );
-        });
-
-      } catch (err) {
-        throw err;
-
-      } finally {
-
-        try {
-          client.unbind();
-        } catch (e) {
-          // Ignore unbind errors
-        }
-      }
-    })(),
-
-    // -------------------------------------------------------------------------
-    // Timeout promise
-    // -------------------------------------------------------------------------
-
-    new Promise((_, reject) =>
-      setTimeout(
-        () =>
-          reject(
-            new Error("ETIMEDOUT")
-          ),
-        LDAP_REQUEST_TIMEOUT_MS
-      )
-    ),
-
-  ]).catch((err) => {
-
-    // Ensure cleanup on any error
-    try {
-      client.unbind();
-    } catch (e) {
-      // Ignore unbind errors
-    }
-
-    throw err;
-  });
-  */
 };
 
 
-// ─── Sign In (Staff - LDAP / Temporary Local) ─────────────────────────────────
-// The route continues calling authenticateWithLDAP().
-// Currently that function uses local User authentication.
-// When AD is enabled, the same route automatically uses LDAP.
-// ──────────────────────────────────────────────────────────────────────────────
+// ─── Sign In (Staff) ──────────────────────────────────────────────────────────
 
 app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
   const { userId, password } = req.body;
@@ -1916,15 +1670,9 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
 
     // ─────────────────────────────────────────────────────────────────────────
     // 2. Authenticate staff
-    //
-    // CURRENT:
-    // authenticateWithLDAP() → User model + bcrypt
-    //
-    // FUTURE:
-    // authenticateWithLDAP() → Active Directory / LDAP
     // ─────────────────────────────────────────────────────────────────────────
 
-    const isValidStaff = await authenticateWithLDAP(
+    const isValidStaff = await authenticateStaffCredentials(
       userId,
       password
     );
@@ -2111,34 +1859,6 @@ app.post(`${BASE_ROUTE}/auth/request-password-reset`, async (req, res) => {
 
       throw new Error("No account was found for that email address.");
     }
-
-
-
-
-    // AD users cannot self-reset
-    /*  if (user.role === "employee") {
-       await createAuditLog({
-         req,
-         category: "password_reset",
-         action: "password_reset.request_rejected",
-         description: "Password reset requested for AD-managed account.",
-         actor: user,
-         target: user,
-         metadata: {
-           reason: "ad_managed_account",
-         },
-         status: "failed",
-       });
- 
-       return res.status(403).json({
-         message:
-           "This account is managed by Active Directory. Please contact ICT support.",
-       });
-     } */
-
-
-
-
     // if user profile ispassword reset flag is true, then they cannot request another password reset
     if (user.isPasswordReset) {
       await createAuditLog({
@@ -2299,7 +2019,7 @@ app.put(
         user: updatedUser,
       });
 
-    } catch (error) {
+    } catch {
       res.status(500).json({ message: "Failed to update profile" });
     }
   }
@@ -2378,16 +2098,6 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     if (!state.currentDevice && state.activeDevices.length >= MAX_USER_DEVICES) {
       throw new Error(`You can only enroll up to ${MAX_USER_DEVICES} devices. Report a lost device or contact admin to clear one.`);
     }
-
-    // temp fix so that it can register outside google emails
-    // can make use of platform to force using device bound auth
-    /* const options = await generateRegistrationOptions({
-      rpName: "KMFRI Attendance",
-      rpID: getRpID(),
-      userID: Uint8Array.from(Buffer.from(user._id.toString())),
-      userName: user.email,
-      authenticatorSelection: { userVerification: "required" },
-    }); */
 
     const existingAuthenticators = state.authenticators;
 
@@ -3677,13 +3387,6 @@ app.post(`${BASE_ROUTE}/attendance/clockin`, async (req, res) => {
   }
 
   try {
-    // TODO: record attendance in database, e.g.:
-    // await AttendanceRecord.create({
-    //   userID: req.session.userID,
-    //   clockInTime: new Date(),
-    //   type: "clock-in",
-    // });
-
     req.session.biometricVerified = false; // one-shot — clear after use
     res.json({ message: "Clock-in successful", timestamp: new Date() });
   } catch (err) {
@@ -5795,17 +5498,6 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
       const m = Math.round((value - h) * 60);
       return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
     };
-    const countWeekdays = (start, end) => {
-      let count = 0;
-      const cursor = new Date(start);
-      const last = new Date(end);
-      while (cursor <= last) {
-        const day = getNairobiWeekdayIndex(cursor);
-        if (day !== 0 && day !== 6) count++;
-        cursor.setUTCDate(cursor.getUTCDate() + 1);
-      }
-      return Math.max(count, 1);
-    };
 
     // -----------------------------------
     // FETCH STAFF (scoped to supervisor's own department + station)
@@ -6467,7 +6159,7 @@ app.get(`${BASE_ROUTE}/admin/notification`, async (req, res) => {
     res.json(messages)
 
   } catch (error) {
-    res.status(400).send(err.message);
+    res.status(400).send(error.message);
   }
 });
 
@@ -6487,7 +6179,7 @@ app.get(`${BASE_ROUTE}/user/notification`, async (req, res) => {
     res.json(messages)
 
   } catch (error) {
-    res.status(400).send(err.message);
+    res.status(400).send(error.message);
   }
 });
 
@@ -6543,7 +6235,7 @@ app.post(`${BASE_ROUTE}/user/signout`, async (req, res) => {
     res.clearCookie(process.env.SESSION_NAME);
     res.status(200).send("logged out successfully");
   } catch (error) {
-    res.status(400).send(err.message);
+    res.status(400).send(error.message);
   }
 });
 
@@ -7688,15 +7380,13 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
     // ---------------------------------------------------------
     // QUERY PARAMETERS
     // ---------------------------------------------------------
-    const {
-      category = "all",
-      action = "all",
-      actorRank = "all",
-      search = "",
-      dateFrom,
-      dateTo,
-      limit = 250,
-    } = req.query;
+    const category = normalizeQueryValue(req.query.category, "all");
+    const action = normalizeQueryValue(req.query.action, "all");
+    const actorRank = normalizeQueryValue(req.query.actorRank, "all");
+    const search = normalizeQueryValue(req.query.search, "");
+    const dateFrom = normalizeQueryValue(req.query.dateFrom, "", false);
+    const dateTo = normalizeQueryValue(req.query.dateTo, "", true);
+    const limit = normalizeQueryValue(req.query.limit, "250", true);
 
     const parsedLimit = Math.min(
       Math.max(Number(limit) || 250, 1),
@@ -7762,9 +7452,9 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
     // ---------------------------------------------------------
     // SEARCH
     // ---------------------------------------------------------
-    if (search?.trim()) {
+    if (search) {
       const regex = new RegExp(
-        search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         "i"
       );
 
@@ -7951,7 +7641,7 @@ app.get(`${BASE_ROUTE}/user/colleagues`, async (req, res) => {
     }).select("-password"); // Security: Ensure passwords aren't sent
 
     res.status(200).json(colleagues);
-  } catch (error) {
+  } catch {
     res.status(500).json({ message: "Server error while fetching colleagues" });
   }
 });
@@ -7980,7 +7670,7 @@ app.post(`${BASE_ROUTE}/verify/create`, async (req, res) => {
 
     res.json({ token, dataHash });
 
-  } catch (err) {
+  } catch {
     res.status(500).json({ message: 'Failed to create verification' });
   }
 });
@@ -8018,7 +7708,7 @@ app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
       contentMatch // true/false/null
     });
 
-  } catch (err) {
+  } catch {
     res.status(500).json({ message: 'Verification failed' });
   }
 });
