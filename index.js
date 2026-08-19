@@ -38,9 +38,99 @@ import {
 } from "./util/Holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
 import { countWeekdays } from "./util/WorkingDay.js";
+
+const PORT = process.env.PORT || 5000;
+const BASE_ROUTE = process.env.BASE_ROUTE;
+const environment = process.env.ENVIRONMENT_MODE;
+const DEFAULT_WEBAUTHN_TIMEOUT_MS = 120000;
+
+const trimEnvValue = (value) =>
+  String(value || "").trim().replace(/^["']|["']$/g, "");
+
+const parseEnvList = (...values) =>
+  values
+    .flatMap((value) => trimEnvValue(value).split(","))
+    .map((value) => trimEnvValue(value))
+    .filter(Boolean);
+
+const normalizeOrigin = (origin) => {
+  const value = trimEnvValue(origin);
+  if (!value) return "";
+
+  try {
+    const parsed = new URL(value);
+    return parsed.origin;
+  } catch {
+    return value.replace(/\/+$/, "");
+  }
+};
+
+const normalizeHostname = (host) => {
+  const value = trimEnvValue(host).split(",")[0]?.trim() || "";
+  if (!value) return "";
+
+  try {
+    return new URL(`http://${value}`).hostname;
+  } catch {
+    return value.replace(/:\d+$/, "");
+  }
+};
+
+const isLocalHostname = (hostname) =>
+  ["localhost", "127.0.0.1", "::1"].includes(String(hostname || "").toLowerCase());
+
+const getForwardedProtocol = (req) =>
+  trimEnvValue(req?.get?.("x-forwarded-proto")).split(",")[0]?.trim() || req?.protocol || "";
+
+const getForwardedHost = (req) =>
+  trimEnvValue(req?.get?.("x-forwarded-host")).split(",")[0]?.trim() || req?.get?.("host") || "";
+
+const getRequestOrigin = (req) => {
+  const origin = normalizeOrigin(req?.get?.("origin"));
+  if (origin) return origin;
+
+  const protocol = getForwardedProtocol(req);
+  const host = getForwardedHost(req);
+  return protocol && host ? normalizeOrigin(`${protocol}://${host}`) : "";
+};
+
+const getRequestRpID = (req) => normalizeHostname(getForwardedHost(req) || req?.hostname);
+
+const parsePositiveNumberEnv = (value, fallback) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const parseBooleanEnv = (value, fallback) => {
+  if (value === undefined || value === null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(normalized)) return true;
+  if (["false", "0", "no", "n"].includes(normalized)) return false;
+  return fallback;
+};
+
+const normalizeCookieSecure = (value, fallback = "auto") => {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (String(value).trim().toLowerCase() === "auto") return "auto";
+  return parseBooleanEnv(value, fallback);
+};
+
+const normalizeSameSite = (value, fallback = "lax") => {
+  const normalized = String(value || fallback).trim().toLowerCase();
+  return ["lax", "strict", "none"].includes(normalized) ? normalized : fallback;
+};
+
 const allowedOrigins = [
-  process.env.CROSS_ORIGIN_ALLOWED,
-  process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION
+  ...new Set(
+    parseEnvList(
+      process.env.CROSS_ORIGIN_ALLOWED,
+      process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION,
+      process.env.ORIGIN_LOCAL,
+      process.env.ORIGIN_PROD
+    )
+      .map(normalizeOrigin)
+      .filter(Boolean)
+  ),
 ];
 
 const mongoDBSession = connectMongoStore(session);
@@ -50,24 +140,25 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
         callback(null, true);
       } else {
         callback(new Error("Not allowed by CORS"));
       }
     },
     credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   })
 );
 
-const PORT = process.env.PORT || 5000;
-const BASE_ROUTE = process.env.BASE_ROUTE;
-const environment = process.env.ENVIRONMENT_MODE;
 const PRIVILEGED_AUDIT_RANKS = ["admin", "hr", "superadmin"];
 const REMINDER_TRIGGER_SECRET = process.env.REMINDER_TRIGGER_SECRET || (environment !== "production" ? "kmfri-reminder-trigger-dev" : "");
 const MAX_USER_DEVICES = 2;
-const WEBAUTHN_TIMEOUT_MS = 60000;
+const WEBAUTHN_TIMEOUT_MS = parsePositiveNumberEnv(
+  process.env.WEBAUTHN_TIMEOUT_MS,
+  DEFAULT_WEBAUTHN_TIMEOUT_MS
+);
 const CLIENT_AUDIT_ACTIONS = {
   "attendance.history_exported": {
     category: "attendance",
@@ -754,16 +845,53 @@ const buildAnalyticsView = async (view, context, query = {}) => {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const getRpID = () =>
-  environment === "SANDBOX"
-    // "localhost or domain names in production"
-    ? process.env.DOMAIN_NAME_LOCAL
-    : process.env.DOMAIN_NAME_PROD;
+const getConfiguredRpIDs = (req) => {
+  const configuredRpIDs = environment === "SANDBOX"
+    ? parseEnvList(process.env.DOMAIN_NAME_LOCAL || "localhost")
+    : parseEnvList(process.env.DOMAIN_NAME_PROD, process.env.DOMAIN_NAME_LOCAL);
+  const requestRpID = getRequestRpID(req);
+  const rpIDs = [
+    requestRpID && (environment === "SANDBOX" || !isLocalHostname(requestRpID)) ? requestRpID : "",
+    ...configuredRpIDs,
+  ];
 
-const getExpectedOrigin = () =>
-  environment === "SANDBOX"
-    ? process.env.ORIGIN_LOCAL || "http://localhost:5173"
-    : process.env.ORIGIN_PROD;
+  return [...new Set(rpIDs.map(trimEnvValue).filter(Boolean))];
+};
+
+const getRpID = (req) => getConfiguredRpIDs(req)[0] || "localhost";
+
+const getExpectedRPID = (req) => {
+  const rpIDs = getConfiguredRpIDs(req);
+  if (rpIDs.length > 1) return rpIDs;
+  return rpIDs[0] || "localhost";
+};
+
+const getExpectedOrigin = (req) => {
+  const origins = environment === "SANDBOX"
+    ? parseEnvList(process.env.ORIGIN_LOCAL || "http://localhost:5173")
+    : parseEnvList(
+      process.env.ORIGIN_PROD,
+      process.env.CROSS_ORIGIN_ALLOWED_PRODUCTION,
+      process.env.ORIGIN_LOCAL
+    );
+  const requestOrigin = getRequestOrigin(req);
+
+  const normalizedOrigins = [
+    ...new Set(
+      [
+        requestOrigin && (!allowedOrigins.length || allowedOrigins.includes(requestOrigin))
+          ? requestOrigin
+          : "",
+        ...origins,
+      ]
+        .map(normalizeOrigin)
+        .filter(Boolean)
+    ),
+  ];
+
+  if (normalizedOrigins.length > 1) return normalizedOrigins;
+  return normalizedOrigins[0] || "http://localhost:5173";
+};
 
 const snapshotUser = (user) => ({
   userId: user?._id?.toString?.() || user?.userId || "",
@@ -1053,7 +1181,17 @@ const store = new mongoDBSession({
   collection: process.env.SESSION_STORE_NAME,
 });
 
-app.set("trust proxy", 1);
+const SESSION_COOKIE_SECURE = normalizeCookieSecure(
+  process.env.SESSION_COOKIE_SECURE,
+  "auto"
+);
+const SESSION_COOKIE_SAME_SITE = normalizeSameSite(
+  process.env.SESSION_COOKIE_SAME_SITE,
+  "lax"
+);
+const TRUST_PROXY = parsePositiveNumberEnv(process.env.TRUST_PROXY, 1);
+
+app.set("trust proxy", TRUST_PROXY);
 
 app.use(
   session({
@@ -1065,11 +1203,25 @@ app.use(
     store,
     cookie: {
       maxAge: 24 * 60 * 60 * 1000,
-      secure: environment !== "SANDBOX",
-      sameSite: environment === "SANDBOX" ? "lax" : "none",
+      httpOnly: true,
+      secure: SESSION_COOKIE_SECURE,
+      sameSite: SESSION_COOKIE_SAME_SITE,
     },
   })
 );
+
+const saveSession = (req) =>
+  new Promise((resolve, reject) => {
+    if (!req.session?.save) {
+      resolve();
+      return;
+    }
+
+    req.session.save((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 
 // ─── Auth check ───────────────────────────────────────────────────────────────
 
@@ -2132,10 +2284,11 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
 
     const options = await generateRegistrationOptions({
       rpName: "KMFRI Attendance",
-      rpID: getRpID(),
+      rpID: getRpID(req),
 
       userID: Uint8Array.from(Buffer.from(user._id.toString())),
       userName: user.email,
+      userDisplayName: user.name || user.email,
 
       attestationType: "none",
 
@@ -2160,6 +2313,7 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
 
 
     req.session.registrationChallenge = options.challenge;
+    await saveSession(req);
     res.json(options);
   } catch (err) {
     console.error("Register challenge error:", err);
@@ -2181,6 +2335,8 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
  */
 app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
   try {
+    if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
+
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
@@ -2203,8 +2359,8 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
     const verification = await verifyRegistrationResponse({
       response,
       expectedChallenge,
-      expectedOrigin: getExpectedOrigin(),
-      expectedRPID: getRpID(),
+      expectedOrigin: getExpectedOrigin(req),
+      expectedRPID: getExpectedRPID(req),
     });
 
     if (!verification.verified) return res.status(400).json({ registered: false });
@@ -2280,6 +2436,7 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
 
     await user.save();
     delete req.session.registrationChallenge;
+    await saveSession(req);
 
     await createAuditLog({
       req,
@@ -2357,7 +2514,7 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
     }
 
     const options = await generateAuthenticationOptions({
-      rpID: getRpID(),
+      rpID: getRpID(req),
 
       userVerification: "required",
 
@@ -2369,6 +2526,7 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
 
     req.session.authChallenge = options.challenge;
     req.session.biometricVerified = false;
+    await saveSession(req);
 
     res.json(options);
   } catch (error) {
@@ -2697,10 +2855,10 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
         expectedChallenge,
 
         expectedOrigin:
-          getExpectedOrigin(),
+          getExpectedOrigin(req),
 
         expectedRPID:
-          getRpID(),
+          getExpectedRPID(req),
 
         credential: {
           id: matchedAuthenticator.credentialID,
@@ -3380,6 +3538,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       Date.now();
 
     delete req.session.authChallenge;
+    await saveSession(req);
 
 
     // ───────────────────────────────────────────────────────────────────────
