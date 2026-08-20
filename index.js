@@ -23,6 +23,7 @@ import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
+import ExportDocument from "./model/ExportDocument.js";
 import Feedback from "./model/Feedback.js";
 import Leave from "./model/Leave.js";
 import MessageAdmin from "./model/MessageAdmin.js";
@@ -191,6 +192,13 @@ const maskPhone = (phone) => {
 
 const ANALYTICS_ACCESSIBLE_RANKS = ["admin", "hr", "ceo", "superadmin", "supervisor"];
 const ANALYTICS_FULL_ACCESS_RANKS = ["admin", "hr", "ceo", "superadmin"];
+const normalizeStationAccessName = (value = "") =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/\bcenter\b/g, "centre");
+const SUPER_HR_STATION = "mombasa centre";
 const EAT_TIMEZONE = "Africa/Nairobi";
 const EAT_UTC_OFFSET_HOURS = 3;
 
@@ -547,6 +555,7 @@ const getAnalyticsContext = async (req) => {
     rank,
     role,
     isSupervisor: rank === "supervisor",
+    isStationScopedHr: rank === "hr" && normalizeStationAccessName(user.station) !== SUPER_HR_STATION,
     canAccessAll: ANALYTICS_FULL_ACCESS_RANKS.includes(rank),
     department: user.department || "",
     station: user.station || "",
@@ -558,8 +567,13 @@ const buildAnalyticsUserFilter = (context, query = {}) => {
   const userFilter = {};
 
   if (context.isSupervisor) {
-    if (context.department) userFilter.department = context.department;
-    if (context.station) userFilter.station = context.station;
+    userFilter.department = context.department || "__NO_SUPERVISOR_DEPARTMENT_ASSIGNED__";
+    userFilter.station = context.station || "__NO_SUPERVISOR_STATION_ASSIGNED__";
+  } else if (context.isStationScopedHr) {
+    userFilter.station = context.station || "__NO_HR_STATION_ASSIGNED__";
+    if (!isAllQueryValue(filters.department)) {
+      userFilter.department = filters.department;
+    }
   } else {
     if (!isAllQueryValue(filters.department)) {
       userFilter.department = filters.department;
@@ -1382,7 +1396,7 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
 
     const { password } = data;
 
-    if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
+    if (!validator.isEmail(email)) throw new Error("Provided email is invalid!");
     if (!data.phone?.trim()) throw new Error("Phone number is required.");
 
     if (['intern', 'attachee'].includes(role)) {
@@ -1854,7 +1868,7 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
 app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
   const { email, password } = req.body;
   try {
-    if (!validator.isEmail(email)) throw new Error("Provided email is malformed!");
+    if (!validator.isEmail(email)) throw new Error("Invalid credentials!");
     if (!password || password.length < 6) throw new Error("Password must be at least 6 characters!");
 
     const user = await User.findOne({ email });
@@ -7997,12 +8011,7 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
     const search = normalizeQueryValue(req.query.search, "");
     const dateFrom = normalizeQueryValue(req.query.dateFrom, "", false);
     const dateTo = normalizeQueryValue(req.query.dateTo, "", true);
-    const limit = normalizeQueryValue(req.query.limit, "250", true);
 
-    const parsedLimit = Math.min(
-      Math.max(Number(limit) || 250, 1),
-      500
-    );
 
     const query = {};
 
@@ -8086,7 +8095,6 @@ app.get(`${BASE_ROUTE}/audit/logs`, async (req, res) => {
       .sort({
         occurredAt: -1,
       })
-      .limit(parsedLimit)
       .lean();
 
     // ---------------------------------------------------------
@@ -8286,11 +8294,155 @@ app.post(`${BASE_ROUTE}/verify/create`, async (req, res) => {
   }
 });
 
+app.post(`${BASE_ROUTE}/verify/export/create`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline) {
+      return res.status(401).json({ message: "Unauthorized Access" });
+    }
+
+    const currentUser = await User.findById(req.session.userID).lean();
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const rank = String(currentUser.rank || "").toLowerCase();
+    if (!["admin", "hr", "ceo", "superadmin", "supervisor", "auditor"].includes(rank)) {
+      return res.status(403).json({ message: "Unauthorized Access" });
+    }
+
+    const {
+      documentBase64,
+      type = "attendance_export",
+      title = "KMFRI Attendance Export",
+      scope = "",
+      filename = "",
+      metadata = {},
+    } = req.body || {};
+
+    const normalizedBase64 = typeof documentBase64 === "string" && documentBase64
+      ? documentBase64.split(",").pop()
+      : "";
+
+    const dataHash = crypto
+      .createHash("sha256")
+      .update(normalizedBase64 || JSON.stringify({ title, scope, filename, metadata }))
+      .digest("hex");
+
+    const token = crypto.randomBytes(32).toString("hex");
+
+    await ExportDocument.create({
+      token,
+      type,
+      title,
+      scope,
+      filename,
+      documentBase64: normalizedBase64,
+      dataHash,
+      metadata,
+      generatedBy: {
+        userId: currentUser._id,
+        name: currentUser.name || "",
+        rank: currentUser.rank || "",
+        station: currentUser.station || "",
+        department: currentUser.department || "",
+      },
+      expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000),
+    });
+
+    res.status(201).json({ token, dataHash });
+  } catch (error) {
+    console.error("Export verification create error:", error);
+    res.status(500).json({ message: "Failed to create export verification" });
+  }
+});
+
+app.put(`${BASE_ROUTE}/verify/export/:token/content`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline) {
+      return res.status(401).json({ message: "Unauthorized Access" });
+    }
+
+    const currentUser = await User.findById(req.session.userID).lean();
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const { token } = req.params;
+    const { documentBase64, metadata = {} } = req.body || {};
+
+    if (!documentBase64 || typeof documentBase64 !== "string") {
+      return res.status(400).json({ message: "Export document content is required" });
+    }
+
+    const record = await ExportDocument.findOne({ token });
+    if (!record) {
+      return res.status(404).json({ message: "Export verification token not found" });
+    }
+
+    const ownerId = record.generatedBy?.userId?.toString?.();
+    if (ownerId && ownerId !== currentUser._id.toString() && currentUser.rank !== "superadmin") {
+      return res.status(403).json({ message: "Unauthorized Access" });
+    }
+
+    const normalizedBase64 = documentBase64.includes(",")
+      ? documentBase64.split(",").pop()
+      : documentBase64;
+
+    const dataHash = crypto
+      .createHash("sha256")
+      .update(normalizedBase64)
+      .digest("hex");
+
+    record.documentBase64 = normalizedBase64;
+    record.dataHash = dataHash;
+    record.metadata = {
+      ...(record.metadata || {}),
+      ...metadata,
+    };
+    await record.save();
+
+    res.json({ token, dataHash });
+  } catch (error) {
+    console.error("Export verification update error:", error);
+    res.status(500).json({ message: "Failed to update export verification" });
+  }
+});
+
 
 // verify
 app.get(`${BASE_ROUTE}/verify/:token`, async (req, res) => {
   try {
     const { token } = req.params;
+
+    const exportRecord = await ExportDocument.findOne({ token }).lean();
+
+    if (exportRecord) {
+      if (exportRecord.expiresAt && exportRecord.expiresAt < new Date()) {
+        return res.json({ valid: false, expired: true });
+      }
+
+      const providedHash = req.query.hash;
+      const contentMatch = providedHash ? providedHash === exportRecord.dataHash : null;
+
+      return res.json({
+        valid: true,
+        createdAt: exportRecord.createdAt,
+        expiresAt: exportRecord.expiresAt,
+        type: exportRecord.type,
+        title: exportRecord.title,
+        scope: exportRecord.scope,
+        filename: exportRecord.filename,
+        message: "This is an official KMFRI attendance export",
+        dataHash: exportRecord.dataHash,
+        contentMatch,
+        document: {
+          mimeType: exportRecord.mimeType || "application/pdf",
+          base64: exportRecord.documentBase64,
+        },
+        metadata: exportRecord.metadata || {},
+        generatedBy: exportRecord.generatedBy || {},
+      });
+    }
 
     const record = await Verification.findOne({ token });
 
