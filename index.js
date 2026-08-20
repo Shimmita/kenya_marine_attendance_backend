@@ -2757,8 +2757,14 @@ const isBeforeNairobiDate = (date, compareDate = new Date()) => {
   return d < now;
 };
 
-const finalizeStaleClocking = async (user, now = new Date()) => {
-  if (!user) return user;
+const finalizeStaleClockingWithInfo = async (user, now = new Date()) => {
+  if (!user) {
+    return {
+      user,
+      closedCount: 0,
+      autoClockOutEnabled: true,
+    };
+  }
 
   const staleOpenClockings = await Clocking.find({
     email: user.email,
@@ -2769,10 +2775,22 @@ const finalizeStaleClocking = async (user, now = new Date()) => {
     isBeforeNairobiDate(record.clock_in, now)
   );
 
-  if (!recordsToClose.length) return user;
+  if (!recordsToClose.length) {
+    return {
+      user,
+      closedCount: 0,
+      autoClockOutEnabled: true,
+    };
+  }
 
   const attendancePolicy = await getAttendancePolicy();
-  if (attendancePolicy.autoClockOutMissedSessions === false) return user;
+  if (attendancePolicy.autoClockOutMissedSessions === false) {
+    return {
+      user,
+      closedCount: 0,
+      autoClockOutEnabled: false,
+    };
+  }
 
   await Promise.all(recordsToClose.map(async (record) => {
     record.clock_out = getSystemClockOutTime(
@@ -2789,7 +2807,16 @@ const finalizeStaleClocking = async (user, now = new Date()) => {
   user.isToClockOut = false;
   await user.save();
 
-  return user;
+  return {
+    user,
+    closedCount: recordsToClose.length,
+    autoClockOutEnabled: true,
+  };
+};
+
+const finalizeStaleClocking = async (user, now = new Date()) => {
+  const result = await finalizeStaleClockingWithInfo(user, now);
+  return result.user;
 };
 
 /**
@@ -2847,7 +2874,8 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     }
 
     user = await clearExpiredOutsideClocking(user);
-    user = await finalizeStaleClocking(user);
+    const staleClockingResult = await finalizeStaleClockingWithInfo(user);
+    user = staleClockingResult.user;
 
     const authenticators = getUserAuthenticators(user);
 
@@ -2883,8 +2911,13 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       device_fingerprint,
       outsideLocation,
       isWithinGeofence,
+      expectedAction,
       ...authResponse
     } = req.body;
+
+    const normalizedExpectedAction = String(expectedAction || "")
+      .trim()
+      .toLowerCase();
 
     const withinPremiseFromClient =
       parseOptionalBoolean(isWithinGeofence);
@@ -3153,6 +3186,36 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     const hasOpenClocking =
       latestClocking &&
       !latestClocking.clock_out;
+
+    const databaseAction =
+      hasOpenClocking
+        ? "clock_out"
+        : "clock_in";
+
+    if (
+      ["clock_in", "clock_out"].includes(normalizedExpectedAction) &&
+      normalizedExpectedAction !== databaseAction
+    ) {
+      delete req.session.authChallenge;
+      await saveSession(req);
+
+      const staleMessage =
+        staleClockingResult.closedCount > 0
+          ? "Your previous missed clock-out was closed by the system. Please press Clock In to start today's attendance."
+          : databaseAction === "clock_out"
+            ? "You are already clocked in. Please refresh and use Clock Out."
+            : "You are not currently clocked in. Please refresh and use Clock In.";
+
+      return res.status(409).json({
+        verified: false,
+        message: staleMessage,
+        meta: {
+          actionRequired: databaseAction,
+          staleClockOutClosed: staleClockingResult.closedCount > 0,
+          closedCount: staleClockingResult.closedCount,
+        },
+      });
+    }
 
 
     // ───────────────────────────────────────────────────────────────────────
