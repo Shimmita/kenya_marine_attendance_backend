@@ -198,6 +198,19 @@ const normalizeStationAccessName = (value = "") =>
     .replace(/\s+/g, " ")
     .replace(/\bcenter\b/g, "centre");
 const SUPER_HR_STATION = "mombasa centre";
+const isMombasaCentreHr = (user = {}) =>
+  String(user.rank || "").toLowerCase() === "hr" &&
+  normalizeStationAccessName(user.station) === SUPER_HR_STATION;
+const isStationScopedHr = (user = {}) =>
+  String(user.rank || "").toLowerCase() === "hr" && !isMombasaCentreHr(user);
+const buildUserManagementScopeFilter = (user = {}) => {
+  if (!isStationScopedHr(user)) return {};
+  return { station: user.station || "__NO_HR_STATION_ASSIGNED__" };
+};
+const canAccessManagedUser = (manager = {}, target = {}) => {
+  if (!isStationScopedHr(manager)) return true;
+  return normalizeStationAccessName(manager.station) === normalizeStationAccessName(target.station);
+};
 const EAT_TIMEZONE = "Africa/Nairobi";
 const EAT_UTC_OFFSET_HOURS = 3;
 
@@ -7488,6 +7501,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/toggle-active`, async (req, res) => {
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     targetUser = await refreshUserAutomaticRestrictions(targetUser);
 
     // Prevent admin from deactivating themselves
@@ -7559,11 +7575,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-rank`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "superadmin"].includes(currentUser.rank))
-      return res.status(403).json({ message: "unauthorised operation!" });
-
-    if (!["employee"].includes(currentUser.role))
-      return res.status(403).json({ message: "You are not yet permanent employee!" });
+    if (String(currentUser.rank || "").toLowerCase() !== "superadmin")
+      return res.status(403).json({ message: "Only superadmin can update user rank" });
 
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
@@ -7641,6 +7654,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-role`, async (req, res) => {
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     targetUser.role = role;
     await targetUser.save();
 
@@ -7677,9 +7693,11 @@ app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
     if (!["admin", "hr", "ceo", "supervisor", "auditor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
-    await refreshAutomaticRestrictionsForUsers();
+    const scopeFilter = buildUserManagementScopeFilter(currentUser);
 
-    const users = await User.find().sort({ createdAt: -1 });
+    await refreshAutomaticRestrictionsForUsers(scopeFilter);
+
+    const users = await User.find(scopeFilter).sort({ createdAt: -1 });
 
     res.json(users);
   } catch (error) {
@@ -7734,6 +7752,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-department`, async (req, res) => {
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     targetUser.department = department.trim();
     await targetUser.save();
 
@@ -7781,6 +7802,12 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-station`, async (req, res) => {
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
+
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
+    if (isStationScopedHr(currentUser) && normalizeStationAccessName(station) !== normalizeStationAccessName(currentUser.station))
+      return res.status(403).json({ message: "Station HR cannot move users outside their station" });
 
     targetUser.station = station;
     await targetUser.save();
@@ -7833,6 +7860,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-on-leave`, async (req, res) => {
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
+
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
 
     const previousIsOnLeave = targetUser.isOnLeave;
     targetUser.isOnLeave =
@@ -7897,6 +7927,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
+
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
 
     targetUser.authenticators = [];
     targetUser.authenticator = undefined;
@@ -7986,7 +8019,17 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-password`, async (req, res) => {
 // get all supervisors
 app.get(`${BASE_ROUTE}/all/supervisors`, async (req, res) => {
   try {
-    const supervisors = await Supervisor.find({})
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (!["admin", "hr", "ceo", "supervisor", "auditor", "superadmin"].includes(currentUser.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const supervisors = await Supervisor.find(buildUserManagementScopeFilter(currentUser));
     res.status(200).json(supervisors)
   } catch (error) {
     res.status(400).send(error.message)
@@ -8019,9 +8062,16 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
     });
 
     const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
     if (!supervisorInUserDB) {
       return res.status(404).json({ message: "Supervisor not found" });
     }
+
+    if (!canAccessManagedUser(currentUser, targetUser) || !canAccessManagedUser(currentUser, supervisorInUserDB))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     // fetch the potential supervisor data in supervisor data
     const userInSupervisorDb = await Supervisor.findOne({ email: supervisor.email });
     if (!userInSupervisorDb)
@@ -8032,7 +8082,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-supervisor`, async (req, res) => {
       return res.status(400).json({ message: "Selected user is not eligible to be a supervisor" });
 
     // Prevent assigning user as their own supervisor
-    if (targetUser._id.toString() === userInSupervisorDb._id.toString())
+    if (String(targetUser.email || "").toLowerCase() === String(userInSupervisorDb.email || "").toLowerCase())
       return res.status(400).json({ message: "User cannot supervise themselves" });
 
     // Store supervisor as name or email (since schema uses string)
@@ -8446,6 +8496,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     targetUser = await refreshUserAutomaticRestrictions(targetUser);
 
     if (targetUser.isAccountActive === false) {
@@ -8539,6 +8592,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     // Reset fields to default values
     targetUser.canClockOutside = false;
     targetUser.outsideClockingDetails = {
@@ -8598,6 +8654,9 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-on-leave`, async (req, res) => {
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
 
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
     // Reset fields to default values
     targetUser.isOnLeave = false;
     // save changes
@@ -8650,6 +8709,9 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
+
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
 
     // Prevent HR from deleting themselves
     if (targetUser._id.toString() === currentUser._id.toString())
