@@ -18,7 +18,7 @@ const reminderDeliverySchema = new mongoose.Schema(
     type: {
       type: String,
       required: true,
-      enum: ["CLOCK_IN_REMINDER", "CLOCK_OUT_REMINDER"],
+      enum: ["CLOCK_IN_REMINDER", "CLOCK_OUT_REMINDER", "HOLIDAY_NOTICE"],
       index: true,
     },
     dateKey: {

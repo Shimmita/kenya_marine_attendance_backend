@@ -8,20 +8,30 @@ import { SendMessageNow } from "../util/SendSMS.js";
 |--------------------------------------------------------------------------
 */
 
-export const formatMessage = (template, user) => {
+export const formatMessage = (template, user, values = {}) => {
 
     if (!template) return "";
 
     const firstName = user?.name?.split(" ")[0] || "User";
+    const replacements = {
+        firstName,
+        name: user?.name || "",
+        fullName: user?.name || "",
+        email: user?.email || "",
+        phone: user?.phone || "",
+        employeeId: user?.employeeId || "",
+        role: user?.role || "",
+        rank: user?.rank || "",
+        department: user?.department || "",
+        station: user?.station || "",
+        ...values,
+    };
 
-    return template
-
-        .replace(/\{firstName\}/gi, firstName)
-        .replace(/\{name\}/gi, user?.name || "")
-        .replace(/\{email\}/gi, user?.email || "")
-        .replace(/\{phone\}/gi, user?.phone || "")
-        .replace(/\{department\}/gi, user?.department || "")
-        .replace(/\{station\}/gi, user?.station || "");
+    return Object.entries(replacements).reduce(
+        (message, [key, value]) =>
+            message.replace(new RegExp(`\\{${key}\\}`, "gi"), value == null ? "" : String(value)),
+        String(template)
+    );
 
 };
 
@@ -115,7 +125,9 @@ export const sendNotification = async (
 
     template,
 
-    type
+    type,
+
+    values = {}
 
 ) => {
 
@@ -127,7 +139,7 @@ export const sendNotification = async (
             config.notificationReminders?.channels || [];
 
         const message =
-            formatMessage(template, user);
+            formatMessage(template, user, values);
 
         let delivered = false;
 

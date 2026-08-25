@@ -34,11 +34,10 @@ import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 import Verification from "./model/VerifyReport.js";
 import {
-  isPublicHoliday,
-  isWeekend
-} from "./util/Holiday.js";
+  getHolidayForDate,
+  getWorkingDateKeysInRange as getConfiguredWorkingDateKeysInRange
+} from "./services/holiday.js";
 import { SendMessageNow } from "./util/SendSMS.js";
-import { countWeekdays } from "./util/WorkingDay.js";
 
 const PORT = process.env.PORT || 5000;
 const BASE_ROUTE = process.env.BASE_ROUTE;
@@ -594,20 +593,8 @@ const buildAnalyticsUserFilter = (context, query = {}) => {
   return userFilter;
 };
 
-const getWorkingDateKeysInRange = (start, end) => {
-  const keys = [];
-  const current = new Date(start);
-
-  while (current <= end) {
-    if (!isWeekend(current) && !isPublicHoliday(current)) {
-      keys.push(getNairobiDateKey(current));
-    }
-
-    current.setUTCDate(current.getUTCDate() + 1);
-  }
-
-  return keys;
-};
+const getWorkingDateKeysInRange = async (start, end) =>
+  getConfiguredWorkingDateKeysInRange(start, end);
 
 const countApprovedLeaveDaysByGroup = (leaveRecords, emailGroupMap, workingDateKeys) => {
   const groupedLeaveDays = {};
@@ -640,6 +627,8 @@ const countApprovedLeaveDaysByGroup = (leaveRecords, emailGroupMap, workingDateK
 const buildAnalyticsDataset = async (context, query = {}) => {
   const { startDate, endDate } = getRequestedDateRange(query);
   const userFilter = buildAnalyticsUserFilter(context, query);
+
+  await refreshAutomaticRestrictionsForUsers(userFilter);
 
   const users = await User.find(
     userFilter,
@@ -1018,6 +1007,279 @@ const getConfiguredMessage = (config, key, fallback, user, values = {}) => {
   return formatPlatformTemplate(template, user, values);
 };
 
+const sendConfiguredSystemMessage = async (user, key, fallback, values = {}) => {
+  try {
+    if (!user?.phone) {
+      console.warn(`System message skipped (${user?.email || "unknown"}): missing phone`);
+      return false;
+    }
+
+    const config = await PlatformConfig.getSingleton();
+    const message = getConfiguredMessage(config, key, fallback, user, values);
+    await SendMessageNow(user, message);
+    return true;
+  } catch (error) {
+    console.error(`System message failed (${user?.email || "unknown"}):`, error?.message || error);
+    return false;
+  }
+};
+
+const MAINTENANCE_NOTICE_TITLE = "Platform Maintenance";
+const deprecatedMasterSettingKeys = [
+  "allowEmployeeSelfRegistration",
+  "enableAttendanceExports",
+  "enableLeaveManagement",
+  "enableSupervisorManagement",
+];
+const writableMasterSettingKeys = new Set([
+  "maintenanceMode",
+  "maintenanceStartAt",
+  "maintenanceEndAt",
+  "maintenanceMessage",
+  "requirePasswordResetOnFirstLogin",
+  "maxDevicesPerUser",
+  "biometricVerificationWindowMinutes",
+  "sessionTimeoutMinutes",
+  "enableAuditLogging",
+]);
+
+const sanitizeMasterSettingsPatch = (currentSettings = {}, updates = {}) => {
+  const current = currentSettings?.toObject?.() || currentSettings || {};
+  const next = { ...current };
+
+  for (const [key, value] of Object.entries(updates || {})) {
+    if (writableMasterSettingKeys.has(key)) {
+      next[key] = value;
+    }
+  }
+
+  deprecatedMasterSettingKeys.forEach((key) => {
+    delete next[key];
+  });
+
+  return next;
+};
+
+const parseOptionalDate = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const formatMaintenanceDateTime = (value) => {
+  const date = parseOptionalDate(value);
+  if (!date) return "";
+
+  return date.toLocaleString("en-KE", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: EAT_TIMEZONE,
+  });
+};
+
+const getMaintenanceState = (cfg, now = new Date()) => {
+  const settings = cfg?.masterSettings || {};
+  const enabled = !!settings.maintenanceMode;
+  const startAt = parseOptionalDate(settings.maintenanceStartAt);
+  const endAt = parseOptionalDate(settings.maintenanceEndAt);
+  const scheduled = enabled && startAt && startAt > now;
+  const expired = enabled && endAt && endAt <= now;
+  const active = enabled && !expired && (!startAt || startAt <= now);
+  const startLabel = formatMaintenanceDateTime(startAt);
+  const endLabel = formatMaintenanceDateTime(endAt);
+  const fallbackMessage = startLabel && endLabel
+    ? `KMFRI Attendance is under scheduled maintenance from ${startLabel} to ${endLabel}. Please be patient while services are restored.`
+    : "KMFRI Attendance is under scheduled maintenance. Please be patient while services are restored.";
+
+  return {
+    enabled,
+    active,
+    scheduled,
+    expired,
+    startAt: startAt?.toISOString?.() || null,
+    endAt: endAt?.toISOString?.() || null,
+    startLabel,
+    endLabel,
+    message: settings.maintenanceMessage || fallbackMessage,
+  };
+};
+
+const getMaintenanceNoticeValues = (state, extra = {}) => ({
+  startDate: state.startLabel || "the scheduled start time",
+  endDate: state.endLabel || "the scheduled end time",
+  reason: state.message || "",
+  ...extra,
+});
+
+const sendBroadcastFromTemplate = async (cfg, key, fallback, values = {}, title = MAINTENANCE_NOTICE_TITLE) => {
+  const template = cfg?.notificationReminders?.[key] || fallback;
+  const channels = cfg?.notificationReminders?.channels || [];
+  const users = await User.find({ email: { $nin: [null, ""] } });
+
+  const results = await Promise.allSettled(users.map(async (user) => {
+    const message = formatPlatformTemplate(template, user, values);
+    let sent = false;
+
+    if (channels.includes("sms") && user.phone) {
+      try {
+        await SendMessageNow(user, message);
+        sent = true;
+      } catch (error) {
+        console.error(`[maintenance] SMS failed for ${user.email}:`, error?.message || error);
+      }
+    }
+
+    if (channels.includes("in_app")) {
+      try {
+        await MessageUser.create({
+          user_email: user.email,
+          title,
+          message,
+          label: "system",
+          status: "pending",
+        });
+        sent = true;
+      } catch (error) {
+        console.error(`[maintenance] In-app notice failed for ${user.email}:`, error?.message || error);
+      }
+    }
+
+    if (channels.includes("email")) {
+      console.log(`EMAIL -> ${user.email} (${title})`);
+      sent = true;
+    }
+
+    if (!sent) {
+      throw new Error(`No maintenance notice channel delivered for ${user.email}`);
+    }
+  }));
+
+  const delivered = results.filter((result) => result.status === "fulfilled").length;
+  const failed = results.length - delivered;
+
+  if (failed) {
+    console.warn(`[maintenance] Broadcast finished with ${failed} failed recipient(s).`);
+  }
+
+  return { total: users.length, delivered, failed };
+};
+
+const notifyMaintenanceScheduled = async (cfg, state) => {
+  const fallback = "Dear {firstName}, KMFRI Attendance will be under scheduled maintenance from {startDate} to {endDate}. Services may be temporarily unavailable. Thank you for your patience.";
+  return sendBroadcastFromTemplate(
+    cfg,
+    "maintenanceModeMessage",
+    fallback,
+    getMaintenanceNoticeValues(state),
+    MAINTENANCE_NOTICE_TITLE
+  );
+};
+
+const notifyMaintenanceRestored = async (cfg) => {
+  const fallback = "Dear {firstName}, KMFRI Attendance services have been restored. You may now continue using the platform.";
+  return sendBroadcastFromTemplate(
+    cfg,
+    "maintenanceRestoredMessage",
+    fallback,
+    {},
+    "Platform Services Restored"
+  );
+};
+
+const getMaintenanceFingerprint = (state) =>
+  JSON.stringify([
+    !!state?.enabled,
+    state?.startAt || "",
+    state?.endAt || "",
+    state?.message || "",
+  ]);
+
+const handleMaintenanceConfigNotifications = async (cfg, previousState, nextState) => {
+  let changed = false;
+
+  if (
+    nextState.enabled &&
+    !nextState.expired &&
+    getMaintenanceFingerprint(previousState) !== getMaintenanceFingerprint(nextState)
+  ) {
+    await notifyMaintenanceScheduled(cfg, nextState);
+    cfg.masterSettings.maintenanceNotifiedAt = new Date();
+    cfg.masterSettings.maintenanceRestoredNotifiedAt = null;
+    changed = true;
+  }
+
+  if (previousState.enabled && !nextState.enabled) {
+    await notifyMaintenanceRestored(cfg);
+    cfg.masterSettings.maintenanceRestoredNotifiedAt = new Date();
+    changed = true;
+  }
+
+  if (changed) {
+    cfg.markModified("masterSettings");
+    await cfg.save();
+  }
+};
+
+const syncMaintenanceWindow = async (cfg = null, source = "request") => {
+  const config = cfg || await PlatformConfig.getSingleton();
+  const state = getMaintenanceState(config);
+
+  if (!state.expired) return { config, state, changed: false };
+
+  const restoredAt = new Date();
+  const restoredConfig = await PlatformConfig.findOneAndUpdate(
+    {
+      _id: config._id,
+      "masterSettings.maintenanceMode": true,
+      "masterSettings.maintenanceEndAt": { $lte: restoredAt },
+    },
+    {
+      $set: {
+        "masterSettings.maintenanceMode": false,
+        "masterSettings.maintenanceStartAt": null,
+        "masterSettings.maintenanceEndAt": null,
+        "masterSettings.maintenanceMessage": "",
+        "masterSettings.maintenanceRestoredNotifiedAt": restoredAt,
+      },
+    },
+    { new: true }
+  );
+
+  if (!restoredConfig) {
+    const latestConfig = await PlatformConfig.getSingleton();
+    return { config: latestConfig, state: getMaintenanceState(latestConfig), changed: false };
+  }
+
+  await notifyMaintenanceRestored(restoredConfig);
+  console.log(`[maintenance] Window expired and services were restored (${source}).`);
+
+  return { config: restoredConfig, state: getMaintenanceState(restoredConfig), changed: true };
+};
+
+const buildMaintenanceResponse = (state) => ({
+  code: "MAINTENANCE_MODE",
+  message: state.message,
+  maintenance: {
+    enabled: state.enabled,
+    active: state.active,
+    scheduled: state.scheduled,
+    startAt: state.startAt,
+    endAt: state.endAt,
+    startLabel: state.startLabel,
+    endLabel: state.endLabel,
+    message: state.message,
+  },
+});
+
+const isSuperadminUser = (user) => user?.rank === "superadmin";
+
+const sendMaintenanceModeResponse = (res, state) =>
+  res.status(503).json(buildMaintenanceResponse(state));
+
 const buildLeaveSmsMessage = async (user, leave, event) => {
   const config = await PlatformConfig.getSingleton();
   const firstName = user?.name?.split(" ")?.[0] || "User";
@@ -1221,6 +1483,19 @@ mongoose
 
     }
 
+    try {
+
+      await runAutomaticRestrictionSweep("startup");
+      startAutomaticRestrictionSweep();
+      await runMaintenanceWindowSweep("startup");
+      startMaintenanceWindowSweep();
+
+    } catch (err) {
+
+      console.error("Automatic account or maintenance sweep failed to start:", err);
+
+    }
+
     /*
     |--------------------------------------------------------------------------
     | Start Express Server
@@ -1335,6 +1610,25 @@ app.use(async (req, res, next) => {
 
 // ─── Auth check ───────────────────────────────────────────────────────────────
 
+app.get(`${BASE_ROUTE}/maintenance/status`, async (req, res) => {
+  try {
+    const { state } = await syncMaintenanceWindow(null, "status");
+    return res.status(200).json({
+      enabled: state.enabled,
+      active: state.active,
+      scheduled: state.scheduled,
+      startAt: state.startAt,
+      endAt: state.endAt,
+      startLabel: state.startLabel,
+      endLabel: state.endLabel,
+      message: state.message,
+    });
+  } catch (error) {
+    console.error("Maintenance status check failed:", error);
+    return res.status(500).json({ message: "Failed to load maintenance status." });
+  }
+});
+
 app.use(BASE_ROUTE, clearExpiredTemporaryAccountForSession);
 
 app.post(`${BASE_ROUTE}/notifications/trigger-reminders`, async (req, res) => {
@@ -1367,12 +1661,43 @@ app.post(`${BASE_ROUTE}/notifications/trigger-reminders`, async (req, res) => {
 });
 
 app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
-  if (req.session?.isOnline) {
-    res.status(200).json({ valid: true });
-  } else {
-    res.status(200).json({ valid: false });
+  try {
+    const { state } = await syncMaintenanceWindow(null, "valid");
+
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(200).json({ valid: false, maintenance: state });
+    }
+
+    const user = await refreshUserAutomaticRestrictions(
+      await User.findById(req.session.userID)
+    );
+
+    if (!user || user.isAccountActive === false) {
+      req.session.isOnline = false;
+      await saveSession(req);
+      return res.status(200).json({ valid: false, reason: "account_inactive" });
+    }
+
+    if (state.active && !isSuperadminUser(user)) {
+      req.session.isOnline = false;
+      await saveSession(req);
+      return res.status(200).json({
+        valid: false,
+        reason: "maintenance_mode",
+        ...buildMaintenanceResponse(state),
+      });
+    }
+
+    return res.status(200).json({ valid: true });
+  } catch (error) {
+    console.error("Session validity check failed:", error);
+    return res.status(200).json({ valid: false });
   }
 });
+
+app.use(BASE_ROUTE, enforceMaintenanceModeForRequests);
+
+app.use(BASE_ROUTE, enforceRequiredPasswordResetForAuthenticatedRequests);
 
 
 
@@ -1453,7 +1778,7 @@ app.post(`${BASE_ROUTE}/auth/signup`, async (req, res) => {
         throw new Error("Phone number already exists.");
     }
     const hashedPassword = await bcrypt.hash(password, 10);
-    const createdUser = await User.create({ ...data, password: hashedPassword });
+    const createdUser = await User.create({ ...data, password: hashedPassword, isPasswordReset: true });
     // Create audit log for single user registration by HR
     await createAuditLog({
       req,
@@ -1571,7 +1896,8 @@ app.post(`${BASE_ROUTE}/auth/staffsignup`, async (req, res) => {
       department,
       station,
       employeeId,
-      password: hashedPassword
+      password: hashedPassword,
+      isPasswordReset: true,
     });
 
     await createAuditLog({
@@ -1659,7 +1985,8 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
         const email = user.email?.trim().toLowerCase();
         const name = user.name?.trim();
         const employeeId = user.employeeId?.toString().trim();
-        const role = (user.role || "employee").toLowerCase().trim();
+        const submittedRole = (user.role || "employee").toLowerCase().trim();
+        const role = submittedRole === "staff" ? "employee" : submittedRole === "attache" ? "attachee" : submittedRole;
         const phone = normalizeKenyaPhone(user.phone?.trim(), true);
 
         if (!email || !validator.isEmail(email)) {
@@ -1678,13 +2005,44 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
         }
 
         if (!employeeId) {
-          errors.push(`Row ${row}: Employee ID is required.`);
+          errors.push(`Row ${row}: Staff/ID number is required.`);
           continue;
         }
 
-        if (!["employee", "staff"].includes(role)) {
-          errors.push(`Row ${row}: Only employee or staff roles are allowed.`);
+        if (!["employee", "intern", "attachee"].includes(role)) {
+          errors.push(`Row ${row}: Invalid registration role.`);
           continue;
+        }
+
+        let startDate = user.startDate?.toString().trim() || "";
+        let endDate = user.endDate?.toString().trim() || "";
+
+        if (["intern", "attachee"].includes(role)) {
+          if (!startDate) {
+            errors.push(`Row ${row}: Start date is required for interns and attaches.`);
+            continue;
+          }
+
+          if (!endDate) {
+            errors.push(`Row ${row}: End date is required for interns and attaches.`);
+            continue;
+          }
+
+          try {
+            const parsedStartDate = parseSafeDate(startDate, "startDate");
+            const parsedEndDate = parseSafeDate(endDate, "endDate");
+
+            if (parsedStartDate > parsedEndDate) {
+              errors.push(`Row ${row}: End date cannot be before start date.`);
+              continue;
+            }
+          } catch (dateError) {
+            errors.push(`Row ${row}: ${dateError.message}`);
+            continue;
+          }
+        } else {
+          startDate = "";
+          endDate = "";
         }
 
         // Duplicate checks inside uploaded file
@@ -1694,7 +2052,7 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
         }
 
         if (employeeIdSet.has(employeeId)) {
-          errors.push(`Row ${row}: Duplicate Employee ID in uploaded file.`);
+          errors.push(`Row ${row}: Duplicate Staff/ID number in uploaded file.`);
           continue;
         }
 
@@ -1718,9 +2076,11 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
           name,
           email,
           phone,
-          role: "employee",
+          role,
           station: user.station?.trim() || "",
           department: user.department?.trim() || "",
+          startDate: startDate || null,
+          endDate: endDate || null,
         });
 
       } catch (err) {
@@ -1765,7 +2125,7 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
       }
 
       if (existingEmployeeIds.has(user.employeeId)) {
-        errors.push(`Row ${user.row}: Employee Staff Number already exists.`);
+        errors.push(`Row ${user.row}: Staff/ID number already exists.`);
         continue;
       }
 
@@ -1799,7 +2159,7 @@ app.post(`${BASE_ROUTE}/admin/batch-register`, async (req, res) => {
     await Promise.all(
       usersWithPasswords.map(async ({ user, plainPassword }) => {
         user.password = await bcrypt.hash(plainPassword, 10);
-        user.isPasswordReset = false;
+        user.isPasswordReset = true;
       })
     );
 
@@ -1871,13 +2231,21 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     if (!validator.isEmail(email)) throw new Error("Invalid credentials!");
     if (!password || password.length < 6) throw new Error("Password must be at least 6 characters!");
 
-    const user = await User.findOne({ email });
+    let user = await User.findOne({ email });
     if (!user) throw new Error("Access not granted contact HR!");
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) throw new Error("Invalid credentials!");
 
     if (!user.email_verified) throw new Error("Email not verified. Contact admin.");
+
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanSignIn(user);
+
+    const { state: maintenanceState } = await syncMaintenanceWindow(null, "signin");
+    if (maintenanceState.active && !isSuperadminUser(user)) {
+      return sendMaintenanceModeResponse(res, maintenanceState);
+    }
 
     // init user session
     req.session.isOnline = true;
@@ -1977,7 +2345,7 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     // 3. Find user in DB
     // ─────────────────────────────────────────────────────────────────────────
 
-    const user = await User.findOne({
+    let user = await User.findOne({
       employeeId: userId.trim(),
     });
 
@@ -1985,6 +2353,14 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
       throw new Error(
         "You don't have access contact HR !"
       );
+    }
+
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanSignIn(user);
+
+    const { state: maintenanceState } = await syncMaintenanceWindow(null, "signin-staff");
+    if (maintenanceState.active && !isSuperadminUser(user)) {
+      return sendMaintenanceModeResponse(res, maintenanceState);
     }
 
 
@@ -2245,8 +2621,12 @@ app.put(
 
       /* update password */
       if (newPassword) {
+        if (String(newPassword).length < 6) {
+          return res.status(400).json({ message: "New password must be at least 6 characters." });
+        }
         const hashedPassword = await bcrypt.hash(newPassword, 10);
         updateData.password = hashedPassword;
+        updateData.isPasswordReset = false;
       }
 
       /* update avatar */
@@ -2317,6 +2697,68 @@ app.put(
 );
 
 
+// Complete required first-login or temporary-password change.
+app.put(`${BASE_ROUTE}/user/password/required-reset`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const newPassword = String(req.body?.newPassword || "");
+    const confirmPassword = String(req.body?.confirmPassword || "");
+
+    if (!newPassword || !confirmPassword) {
+      return res.status(400).json({ message: "New password and confirmation are required." });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: "New password must be at least 6 characters." });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ message: "Passwords do not match." });
+    }
+
+    let user = await User.findById(req.session.userID).select("+password");
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    user = await refreshUserAutomaticRestrictions(user);
+
+    if (user.isAccountActive === false) {
+      return res.status(403).json({ message: "Your account is inactive. Please contact HR." });
+    }
+
+    const sameAsCurrent = await bcrypt.compare(newPassword, user.password);
+    if (sameAsCurrent) {
+      return res.status(400).json({ message: "Choose a new password that is different from the temporary password." });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.isPasswordReset = false;
+    await user.save();
+
+    await createAuditLog({
+      req,
+      category: "profile",
+      action: "profile.required_password_changed",
+      description: "User completed required password change",
+      actor: user,
+      metadata: { changedFields: ["password"], requiredPasswordReset: true },
+    });
+
+    return res.status(200).json({
+      message: "Password updated successfully.",
+      user: sanitizeUserResponse(user),
+    });
+  } catch (error) {
+    console.error("Required password reset error:", error);
+    return res.status(500).json({ message: error.message || "Failed to update password." });
+  }
+});
+
+
 
 // ─── Biometrics ───────────────────────────────────────────────────────────────
 
@@ -2326,8 +2768,10 @@ app.get(`${BASE_ROUTE}/biometric/status`, async (req, res) => {
       return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
     }
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
     const state = await getDeviceBiometricState(user, deviceFingerprint);
@@ -2362,8 +2806,10 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
     const state = await getDeviceBiometricState(user, deviceFingerprint);
@@ -2449,8 +2895,10 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
 
     const expectedChallenge = req.session.registrationChallenge;
     if (!expectedChallenge) throw new Error("No registration challenge found. Please restart.");
@@ -2583,8 +3031,10 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
 
     if (!req.session.isOnline) return res.status(401).json({ message: "session expired, logout and login again to proceed!" });
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
     const deviceFingerprint = String(req.query.device_fingerprint || "");
     const state = await getDeviceBiometricState(user, deviceFingerprint);
     const preferredAuthenticators = deviceFingerprint
@@ -2648,13 +3098,45 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
   }
 });
 
+const TEMPORARY_ACCOUNT_ROLES = new Set(["intern", "attachee"]);
+
+const normalizeUserRole = (role) => String(role || "").trim().toLowerCase();
+
+const getPlacementRoleLabel = (role) => {
+  const normalized = normalizeUserRole(role);
+  if (normalized === "attachee") return "attaché";
+  if (normalized === "intern") return "intern";
+  return "user";
+};
+
+const getNairobiBoundaryForStoredDate = (value, fieldName = "date", boundary = "end") => {
+  if (!value) return null;
+  return parseDateRangeBoundary(value, fieldName, boundary);
+};
+
+const isDateWindowEnded = (endDate, now = new Date()) => {
+  const end = getNairobiBoundaryForStoredDate(endDate, "endDate", "end");
+  return Boolean(end && now > end);
+};
+
+const resetOutsideClockingFields = (user) => {
+  user.canClockOutside = false;
+  user.outsideClockingDetails = {
+    startDate: null,
+    endDate: null,
+    reason: "",
+    authorizedBy: "",
+    authorizedByRole: "",
+  };
+};
+
 const isOutsideClockingAuthorizedNow = (user, now = new Date()) => {
   if (!user?.canClockOutside || !user?.outsideClockingDetails) return false;
 
   try {
-    const start = new Date(user.outsideClockingDetails.startDate);
-    const end = new Date(user.outsideClockingDetails.endDate);
-    return now >= start && now <= end;
+    const start = getNairobiBoundaryForStoredDate(user.outsideClockingDetails.startDate, "startDate", "start");
+    const end = getNairobiBoundaryForStoredDate(user.outsideClockingDetails.endDate, "endDate", "end");
+    return Boolean(start && end && now >= start && now <= end);
   } catch (e) {
     console.warn('Outside clocking date validation failed:', e.message);
     return false;
@@ -2716,48 +3198,235 @@ const normalizeKenyaPhone = (phone) => {
 const clearExpiredOutsideClocking = async (user, now = new Date()) => {
   if (!user?.canClockOutside || !user?.outsideClockingDetails?.endDate) return user;
 
-  const end = new Date(user.outsideClockingDetails.endDate);
-  if (now <= end) return user;
+  if (!isDateWindowEnded(user.outsideClockingDetails.endDate, now)) return user;
 
-  user.canClockOutside = false;
-  user.outsideClockingDetails = {
-    startDate: null,
-    endDate: null,
-    reason: "",
-    authorizedBy: "",
-    authorizedByRole: "",
-  };
-
+  const expiredEndDate = formatLeaveDate(user.outsideClockingDetails.endDate);
+  resetOutsideClockingFields(user);
   await user.save();
+
+  await sendConfiguredSystemMessage(
+    user,
+    "clockOutsideRevokedMessage",
+    `Dear ${user.name}, your permission to clock outside of your station "${user.station}" has expired. Please follow standard in-premise clocking procedures.`,
+    { endDate: expiredEndDate }
+  );
+
   return user;
 };
 
 const clearExpiredTemporaryAccount = async (user, now = new Date()) => {
   if (!user) return user;
-  if (!['intern', 'attachee'].includes(user.role)) return user;
+  if (!TEMPORARY_ACCOUNT_ROLES.has(normalizeUserRole(user.role))) return user;
   if (!user.endDate) return user;
 
-  const expiry = new Date(user.endDate);
-  expiry.setHours(23, 59, 59, 999);
-  if (now <= expiry) return user;
+  if (!isDateWindowEnded(user.endDate, now)) return user;
+
+  const wasActive = user.isAccountActive !== false;
+  const expiredEndDate = formatLeaveDate(user.endDate);
+  const roleLabel = getPlacementRoleLabel(user.role);
+
+  if (user.hasClockedIn || user.isToClockOut) {
+    const staleResult = await finalizeStaleClockingWithInfo(user, now);
+    user = staleResult.user || user;
+  }
 
   user.isAccountActive = false;
-  user.doneBiometric = false;
-  user.authenticator = null;
-  user.authenticators = [];
+  user.hasClockedIn = false;
+  user.isToClockOut = false;
+
+  if (user.canClockOutside || user.outsideClockingDetails?.endDate) {
+    resetOutsideClockingFields(user);
+  }
 
   await user.save();
+
+  if (wasActive) {
+    await sendConfiguredSystemMessage(
+      user,
+      "accountExpiredMessage",
+      `Dear ${user.name}, your KMFRI Attendance ${roleLabel} account reached its end date (${expiredEndDate}) and has been automatically deactivated. Please contact HR for assistance.`,
+      {
+        role: roleLabel,
+        endDate: expiredEndDate,
+      }
+    );
+  }
+
   return user;
 };
 
-async function clearExpiredTemporaryAccountForSession(req, res, next) {
-  if (req.session?.userID) {
-    const user = await User.findById(req.session.userID);
-    if (user) {
-      await clearExpiredTemporaryAccount(user);
-    }
+const refreshUserAutomaticRestrictions = async (user, now = new Date()) => {
+  if (!user) return user;
+  user = await clearExpiredTemporaryAccount(user, now);
+  user = await clearExpiredOutsideClocking(user, now);
+  return user;
+};
+
+const refreshAutomaticRestrictionsForUsers = async (filter = {}, now = new Date()) => {
+  const expirableUserFilter = {
+    $or: [
+      { role: { $in: Array.from(TEMPORARY_ACCOUNT_ROLES) }, endDate: { $nin: [null, ""] } },
+      { canClockOutside: true, "outsideClockingDetails.endDate": { $ne: null } },
+    ],
+  };
+
+  const hasFilter = filter && Object.keys(filter).length > 0;
+  const users = await User.find(
+    hasFilter
+      ? { $and: [filter, expirableUserFilter] }
+      : expirableUserFilter
+  );
+
+  await Promise.all(users.map((user) => refreshUserAutomaticRestrictions(user, now)));
+};
+
+const assertAccountCanSignIn = (user) => {
+  if (user?.isAccountActive === false) {
+    const roleLabel = getPlacementRoleLabel(user.role);
+    throw new Error(`This ${roleLabel} account is inactive or has reached its end date. Please contact HR.`);
   }
-  return next();
+};
+
+const assertAccountCanClock = (user) => {
+  if (user?.isAccountActive === false) {
+    throw new Error("Your account is inactive or has reached its end date. Clocking is disabled. Please contact HR.");
+  }
+  if (user?.isOnLeave === true) {
+    throw new Error("Clocking is disabled while your account is marked as on leave.");
+  }
+  if (user?.isPasswordReset === true) {
+    throw new Error("Please change your temporary password before using clocking services.");
+  }
+};
+
+const AUTOMATIC_RESTRICTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+let automaticRestrictionSweepTimer = null;
+
+const MAINTENANCE_SWEEP_INTERVAL_MS = 60 * 1000;
+let maintenanceSweepTimer = null;
+
+const runMaintenanceWindowSweep = async (source = "scheduled") => {
+  await syncMaintenanceWindow(null, source);
+};
+
+const startMaintenanceWindowSweep = () => {
+  if (maintenanceSweepTimer) {
+    clearInterval(maintenanceSweepTimer);
+  }
+
+  maintenanceSweepTimer = setInterval(() => {
+    runMaintenanceWindowSweep().catch((error) => {
+      console.error("[maintenance] Scheduled window sweep failed:", error);
+    });
+  }, MAINTENANCE_SWEEP_INTERVAL_MS);
+
+  if (typeof maintenanceSweepTimer.unref === "function") {
+    maintenanceSweepTimer.unref();
+  }
+};
+
+const isRequiredPasswordResetAllowedPath = (req) => {
+  const path = req.path || "";
+  if (path === "/valid") return true;
+  if (path === "/maintenance/status") return true;
+  if (path === "/auth/signin") return true;
+  if (path === "/auth/signin-staff") return true;
+  if (path === "/auth/request-password-reset") return true;
+  if (path === "/user/signout") return true;
+  if (path === "/user/password/required-reset") return true;
+  if (req.method === "GET" && path === "/user/profile") return true;
+  return false;
+};
+
+const isMaintenanceAllowedPath = (req) => {
+  const path = req.path || "";
+  if (path === "/maintenance/status") return true;
+  if (path === "/valid") return true;
+  if (path === "/auth/signin") return true;
+  if (path === "/auth/signin-staff") return true;
+  if (path === "/user/signout") return true;
+  if (req.method === "GET" && path === "/superadmin/config") return true;
+  return false;
+};
+
+async function enforceMaintenanceModeForRequests(req, res, next) {
+  try {
+    if (isMaintenanceAllowedPath(req)) return next();
+
+    const { state } = await syncMaintenanceWindow(null, "request");
+    if (!state.active) return next();
+
+    if (req.session?.userID) {
+      const user = await User.findById(req.session.userID);
+      if (isSuperadminUser(user)) return next();
+    }
+
+    if (req.session) {
+      req.session.isOnline = false;
+      await saveSession(req);
+    }
+
+    return sendMaintenanceModeResponse(res, state);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function enforceRequiredPasswordResetForAuthenticatedRequests(req, res, next) {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) return next();
+    if (isRequiredPasswordResetAllowedPath(req)) return next();
+
+    const user = await refreshUserAutomaticRestrictions(
+      await User.findById(req.session.userID)
+    );
+
+    if (user?.isPasswordReset === true && user?.isAccountActive !== false) {
+      return res.status(403).json({
+        message: "Please change your temporary password before continuing.",
+        code: "PASSWORD_RESET_REQUIRED",
+      });
+    }
+
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+const runAutomaticRestrictionSweep = async (source = "scheduled") => {
+  await refreshAutomaticRestrictionsForUsers();
+  console.log(`[account-expiry] Automatic restriction sweep completed (${source}).`);
+};
+
+const startAutomaticRestrictionSweep = () => {
+  if (automaticRestrictionSweepTimer) {
+    clearInterval(automaticRestrictionSweepTimer);
+  }
+
+  automaticRestrictionSweepTimer = setInterval(() => {
+    runAutomaticRestrictionSweep().catch((error) => {
+      console.error("[account-expiry] Automatic restriction sweep failed:", error);
+    });
+  }, AUTOMATIC_RESTRICTION_SWEEP_INTERVAL_MS);
+
+  if (typeof automaticRestrictionSweepTimer.unref === "function") {
+    automaticRestrictionSweepTimer.unref();
+  }
+};
+
+async function clearExpiredTemporaryAccountForSession(req, res, next) {
+  try {
+    if (req.session?.userID) {
+      const user = await User.findById(req.session.userID);
+      if (user) {
+        await refreshUserAutomaticRestrictions(user);
+      }
+    }
+    return next();
+  } catch (error) {
+    return next(error);
+  }
 };
 
 const getNairobiLocalDate = (date = new Date()) => {
@@ -2887,7 +3556,12 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       });
     }
 
-    user = await clearExpiredOutsideClocking(user);
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
+    const todayHoliday = await getHolidayForDate(new Date());
+    if (todayHoliday) {
+      throw new Error(`Clocking is disabled today because it is ${todayHoliday.name}. Please resume clocking on the next configured working day.`);
+    }
     const staleClockingResult = await finalizeStaleClockingWithInfo(user);
     user = staleClockingResult.user;
 
@@ -3814,6 +4488,15 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 // ─── Attendance ──────────────
 
 app.post(`${BASE_ROUTE}/attendance/clockin`, async (req, res) => {
+  const todayHoliday = await getHolidayForDate(new Date());
+  if (todayHoliday) {
+    return res.status(403).json({
+      code: "HOLIDAY_CLOCKING_DISABLED",
+      message: `Clocking is disabled today because it is ${todayHoliday.name}. Please resume clocking on the next configured working day.`,
+      holiday: todayHoliday,
+    });
+  }
+
   const cfg = await PlatformConfig.getSingleton();
   const biometricWindowMinutes = Number(
     cfg.masterSettings?.biometricVerificationWindowMinutes ?? 5
@@ -3849,7 +4532,7 @@ app.get(`${BASE_ROUTE}/user/profile`, async (req, res) => {
   try {
     if (!req.session.isOnline) return res.status(401).json({ message: "Unauthorized" });
 
-    let user = await clearExpiredOutsideClocking(
+    let user = await refreshUserAutomaticRestrictions(
       await User.findById(req.session.userID).select("-password").select("-authenticator").select("-authenticators")
     );
     user = await finalizeStaleClocking(user);
@@ -3869,8 +4552,10 @@ app.post(`${BASE_ROUTE}/user/profile`, async (req, res) => {
 
     const { name, department, supervisor, phone, startDate, endDate } = req.body;
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
 
     user.name = name || user.name;
     user.department = department || user.department;
@@ -3941,23 +4626,12 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
       clock_in: { $gte: startOfMonth, $lte: endOfMonth }
     });
 
-    // Helper: Calculate working days excluding weekends
-    const getWorkingDays = (start, end) => {
-      let count = 0;
-      let cur = new Date(start);
-      while (cur <= end && cur <= now) {
-        const day = getNairobiWeekdayIndex(cur);
-        if (day !== 0 && day !== 6) count++;
-        cur.setDate(cur.getDate() + 1);
-      }
-      return count || 1;
-    };
-
-    const processStats = (filteredRecords, totalExpectedDays) => {
+    const processStats = (filteredRecords, totalExpectedDays, workingDateSet) => {
       const dailyMap = {};
 
       filteredRecords.forEach(rec => {
         const dateKey = getNairobiDateKey(rec.clock_in);
+        if (workingDateSet && !workingDateSet.has(dateKey)) return;
         if (!dailyMap[dateKey]) {
           dailyMap[dateKey] = { hours: 0, isLateAny: false, isEarlyAny: false, clockings: 0, missedClockOut: false };
         }
@@ -4020,14 +4694,19 @@ app.get(`${BASE_ROUTE}/user/attendance/stats`, async (req, res) => {
       };
     };
 
+    const weeklyWorkingDateKeys = await getWorkingDateKeysInRange(startOfWeek, now);
+    const monthlyWorkingDateKeys = await getWorkingDateKeysInRange(startOfMonth, now);
+
     const weeklyStats = processStats(
       records.filter(r => new Date(r.clock_in) >= startOfWeek),
-      getWorkingDays(startOfWeek, now)
+      Math.max(weeklyWorkingDateKeys.length, 1),
+      new Set(weeklyWorkingDateKeys)
     );
 
     const monthlyStats = processStats(
       records,
-      getWorkingDays(startOfMonth, now)
+      Math.max(monthlyWorkingDateKeys.length, 1),
+      new Set(monthlyWorkingDateKeys)
     );
 
     res.status(200).json({
@@ -4119,16 +4798,21 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
       }).lean(),
     ]);
 
-    const totalEmployees = users.length;
-    const activeEmployeesToday = new Set(todayRecords.map(r => r.email)).size;
-    const onLeaveToday = new Set(leaveTodayRecords.map(r => r.email)).size;
-    const presentToday = activeEmployeesToday;
-    const absentToday = Math.max(totalEmployees - activeEmployeesToday - onLeaveToday, 0);
+    const workingDateKeys = await getWorkingDateKeysInRange(start, end);
+    const workingDateSet = new Set(workingDateKeys);
+    const todayIsWorkingDay = (await getWorkingDateKeysInRange(startToday, endToday)).includes(today);
+    const workingRecords = records.filter((record) => workingDateSet.has(getNairobiDateKey(record.clock_in)));
 
-    // Attendance rate: present days / total working days in period
-    const workingDays = countWeekdays(start, end); // helper to count weekdays
+    const totalEmployees = users.length;
+    const activeEmployeesToday = todayIsWorkingDay ? new Set(todayRecords.map(r => r.email)).size : 0;
+    const onLeaveToday = todayIsWorkingDay ? new Set(leaveTodayRecords.map(r => r.email)).size : 0;
+    const presentToday = activeEmployeesToday;
+    const absentToday = todayIsWorkingDay ? Math.max(totalEmployees - activeEmployeesToday - onLeaveToday, 0) : 0;
+
+    // Attendance rate: present days / total configured working days in period
+    const workingDays = Math.max(workingDateKeys.length, 1);
     const presentDaysMap = {};
-    records.forEach(r => {
+    workingRecords.forEach(r => {
       if (!presentDaysMap[r.email]) presentDaysMap[r.email] = new Set();
       presentDaysMap[r.email].add(getNairobiDateKey(r.clock_in));
     });
@@ -4137,7 +4821,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 
     // Punctuality: early vs late (based on isLate flag)
     let earlyCount = 0, lateCount = 0;
-    records.forEach(r => {
+    workingRecords.forEach(r => {
       if (r.isLate) lateCount++;
       else earlyCount++;
     });
@@ -4145,7 +4829,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 
     // Productivity index: average hours per employee (capped at 8h/day)
     let totalHours = 0;
-    records.forEach(r => {
+    workingRecords.forEach(r => {
       if (r.clock_out) {
         let hours = (r.clock_out - r.clock_in) / (1000 * 60 * 60);
         hours = Math.min(hours, 8); // cap at 8h
@@ -4159,8 +4843,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const absenteeismRate = 100 - attendanceRate;
 
     // Average working hours (for CEO)
-    const totalClockedHours = records.reduce((sum, r) => sum + (r.clock_out ? (r.clock_out - r.clock_in) / (1000 * 60 * 60) : 0), 0);
-    const averageWorkingHours = records.length > 0 ? totalClockedHours / records.length : 0;
+    const totalClockedHours = workingRecords.reduce((sum, r) => sum + (r.clock_out ? (r.clock_out - r.clock_in) / (1000 * 60 * 60) : 0), 0);
+    const averageWorkingHours = workingRecords.length > 0 ? totalClockedHours / workingRecords.length : 0;
 
     // For filters dropdown
     const config = await PlatformConfig.getSingleton();
@@ -4224,7 +4908,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
       }).lean(),
     ]);
 
-    const workingDateKeys = getWorkingDateKeysInRange(start, end);
+    const workingDateKeys = await getWorkingDateKeysInRange(start, end);
     const totalStaff = users.length;
     const dailyMap = workingDateKeys.reduce((acc, dateKey) => {
       acc[dateKey] = {
@@ -4534,6 +5218,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
       rank,
     });
 
+    await refreshAutomaticRestrictionsForUsers(userFilter);
+
     const users = await User.find(
       userFilter,
       'email department'
@@ -4568,7 +5254,10 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
     // ---------------------------------------------------------
     // TOTAL WORKING DAYS
     // ---------------------------------------------------------
-    const workingDays = countWeekdays(start, end);
+    const workingDateKeys = await getWorkingDateKeysInRange(start, end);
+    const workingDateSet = new Set(workingDateKeys);
+    const workingDays = Math.max(workingDateKeys.length, 1);
+    const workingRecords = records.filter((record) => workingDateSet.has(getNairobiDateKey(record.clock_in)));
 
     // ---------------------------------------------------------
     // PER-MONTH / DEPARTMENT DATA
@@ -4580,7 +5269,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
     // ---------------------------------------------------------
     const userPresent = {};
 
-    records.forEach(r => {
+    workingRecords.forEach(r => {
       if (!r.clock_in) return;
 
       const email = r.email;
@@ -4634,7 +5323,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
     // ---------------------------------------------------------
     const monthPresent = {};
 
-    records.forEach(r => {
+    workingRecords.forEach(r => {
       if (!r.clock_in) return;
 
       const monthKey = r.clock_in
@@ -4656,8 +5345,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
       );
     });
 
-    const monthlyAbsData = Object.keys(monthPresent)
-      .map(monthKey => {
+    const monthlyAbsData = (await Promise.all(Object.keys(monthPresent)
+      .map(async (monthKey) => {
         /*
          * monthKey is a STRING:
          * "2026-08"
@@ -4707,10 +5396,10 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
 
         const workingDaysMonth =
           effectiveStart <= effectiveEnd
-            ? countWeekdays(
+            ? (await getWorkingDateKeysInRange(
               effectiveStart,
               effectiveEnd
-            )
+            )).length
             : 0;
 
         const emailsInMonth =
@@ -4742,7 +5431,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
           month: monthKey,
           rate: parseFloat(rate.toFixed(1))
         };
-      })
+      })))
       .sort((a, b) =>
         a.month.localeCompare(b.month)
       );
@@ -4826,7 +5515,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
       }).lean(),
     ]);
 
-    const workingDateKeys = getWorkingDateKeysInRange(start, end);
+    const workingDateKeys = await getWorkingDateKeysInRange(start, end);
+    const workingDateSet = new Set(workingDateKeys);
     const workingDays = workingDateKeys.length;
     const deptStats = {};
 
@@ -4848,10 +5538,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
 
     // Process records
     records.forEach(r => {
+      const dateKey = getNairobiDateKey(r.clock_in);
+      if (!workingDateSet.has(dateKey)) return;
       const email = String(r.email || "").toLowerCase();
       const dept = deptMap[email] || 'Unassigned';
       if (!deptStats[dept]) return;
-      deptStats[dept].presentDays.add(`${email}:${getNairobiDateKey(r.clock_in)}`);
+      deptStats[dept].presentDays.add(`${email}:${dateKey}`);
       if (r.isLate) deptStats[dept].totalLate++;
     });
 
@@ -4953,7 +5645,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
     ]);
 
     // Compute working days
-    const workingDateKeys = getWorkingDateKeysInRange(start, end);
+    const workingDateKeys = await getWorkingDateKeysInRange(start, end);
+    const workingDateSet = new Set(workingDateKeys);
     const workingDays = workingDateKeys.length;
 
     // Per‑station aggregation
@@ -4976,7 +5669,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
     });
 
     // Process records
-    records.forEach(r => {
+    const workingRecords = records.filter((record) => workingDateSet.has(getNairobiDateKey(record.clock_in)));
+
+    workingRecords.forEach(r => {
       const email = String(r.email || "").toLowerCase();
       const st = emailStationMap[email] || 'Unassigned';
       if (!stationStats[st]) return; // should not happen, but guard
@@ -5025,7 +5720,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 
       // Top performers (simplified: by total hours)
       const employeeHours = {};
-      records.forEach(r => {
+      workingRecords.forEach(r => {
         const email = String(r.email || "").toLowerCase();
         if (emailStationMap[email] === st && r.clock_out) {
           const hours = (r.clock_out - r.clock_in) / (1000 * 60 * 60);
@@ -5126,23 +5821,17 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res
       if (r.clock_out) dailyMap[key].clockOut = true;
     });
 
-    // For each working day in range, check all employees
-    let current = new Date(start);
-    while (current <= end) {
-      const currentDay = getNairobiWeekdayIndex(current);
-      if (currentDay !== 0 && currentDay !== 6) {
-        const dateKey = getNairobiDateKey(current);
-        emails.forEach(email => {
-          const key = `${dateKey}|${email}`;
-          if (!dailyMap[key]) {
-            missingClockIns.push({ email, date: dateKey });
-          } else if (!dailyMap[key].clockOut) {
-            missingClockOuts.push({ email, date: dateKey });
-          }
-        });
-      }
-      current.setDate(current.getDate() + 1);
-    }
+    const workingDateKeys = await getWorkingDateKeysInRange(start, end);
+    workingDateKeys.forEach((dateKey) => {
+      emails.forEach(email => {
+        const key = `${dateKey}|${email}`;
+        if (!dailyMap[key]) {
+          missingClockIns.push({ email, date: dateKey });
+        } else if (!dailyMap[key].clockOut) {
+          missingClockOuts.push({ email, date: dateKey });
+        }
+      });
+    });
 
     res.json({
       missingClockIns: missingClockIns.slice(0, 50),
@@ -5221,7 +5910,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     const now = new Date();
     const startOfMonth = getNairobiMonthStart(now);
 
-    const workingDaysSoFar = Math.max(countWeekdays(startOfMonth, now), 1);
+    const workingDateKeys = await getWorkingDateKeysInRange(startOfMonth, now);
+    const workingDateSet = new Set(workingDateKeys);
+    const workingDaysSoFar = Math.max(workingDateKeys.length, 1);
 
     const userFilter = buildAnalyticsUserFilter(context, {
       station,
@@ -5229,6 +5920,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       role,
       rank,
     });
+
+    await refreshAutomaticRestrictionsForUsers(userFilter);
 
     const allUsers = await User.find(
       userFilter,
@@ -5314,6 +6007,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
     // -----------------------------------
 
     records.forEach(rec => {
+      const recordDateKey = getNairobiDateKey(rec.clock_in);
+      if (!workingDateSet.has(recordDateKey)) return;
+
       const email = normalizeEmailKey(rec.email);
       const user = userByEmail.get(email);
       if (!email || !user || !stats.employeeMetrics[email]) return;
@@ -5335,7 +6031,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
         }
 
         stats.employeeMetrics[email].daysPresent.add(
-          getNairobiDateKey(rec.clock_in)
+          recordDateKey
         );
       }
 
@@ -5828,23 +6524,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     // Working Days
     //---------------------------------------------------------
 
-    const workingDates = [];
-
-    const current = new Date(start);
-
-    while (current <= end) {
-
-      if (
-        !isWeekend(current) &&
-        !isPublicHoliday(current)
-      ) {
-        workingDates.push(
-          getNairobiDateKey(current)
-        );
-      }
-
-      current.setDate(current.getDate() + 1);
-    }
+    const workingDates = await getWorkingDateKeysInRange(start, end);
 
     const totalWorkingDays = workingDates.length;
 
@@ -6003,6 +6683,8 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     // -----------------------------------
     // FETCH STAFF (scoped to supervisor's own department + station)
     // -----------------------------------
+    await refreshAutomaticRestrictionsForUsers({ department, station });
+
     const staff = await User.find(
       { department, station },
       "email name department station isAccountActive role isOnLeave hasClockedIn isToClockOut canClockOutside outsideClockingDetails"
@@ -6017,7 +6699,9 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
     const now = new Date();
     const startOfMonth = getNairobiMonthStart(now);
-    const workingDaysSoFar = countWeekdays(startOfMonth, now);
+    const workingDateKeys = await getWorkingDateKeysInRange(startOfMonth, now);
+    const workingDateSet = new Set(workingDateKeys);
+    const workingDaysSoFar = Math.max(workingDateKeys.length, 1);
     const todayKey = dateKey(now);
 
     // -----------------------------------
@@ -6073,11 +6757,13 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
     // PROCESS RECORDS
     // -----------------------------------
     records.forEach((rec) => {
+      const key = dateKey(rec.clock_in);
+      if (!workingDateSet.has(key)) return;
+
       const metric = metricsMap[rec.email];
       if (!metric) return;
 
       let hoursWorked = 0;
-      const key = dateKey(rec.clock_in);
       employeesWithRecords.add(rec.email);
 
       if (!dailyMap[key]) {
@@ -6105,7 +6791,7 @@ app.get(`${BASE_ROUTE}/supervisor/department/stats`, async (req, res) => {
 
         if (hoursWorked > 9) metric.overtime += hoursWorked - 9;
 
-        metric.daysPresent.add(getNairobiDateKey(rec.clock_in));
+        metric.daysPresent.add(key);
 
         if (rec.isPresent) {
           metric.presentCount++;
@@ -6477,8 +7163,10 @@ app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
     if (!req.session.isOnline)
       return res.status(401).json({ message: "Unauthorized" });
 
-    const user = await User.findById(req.session.userID);
+    let user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
 
     const { device_name, device_os, device_browser, device_fingerprint } = req.body;
 
@@ -6796,13 +7484,27 @@ app.put(`${BASE_ROUTE}/admin/user/:id/toggle-active`, async (req, res) => {
     if (!["hr", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
-    const targetUser = await User.findById(req.params.id);
+    let targetUser = await User.findById(req.params.id);
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
+
+    targetUser = await refreshUserAutomaticRestrictions(targetUser);
 
     // Prevent admin from deactivating themselves
     if (targetUser._id.toString() === currentUser._id.toString())
       return res.status(400).json({ message: "You cannot deactivate yourself" });
+
+    const isActivatingExpiredPlacement =
+      targetUser.isAccountActive === false &&
+      TEMPORARY_ACCOUNT_ROLES.has(normalizeUserRole(targetUser.role)) &&
+      targetUser.endDate &&
+      isDateWindowEnded(targetUser.endDate);
+
+    if (isActivatingExpiredPlacement) {
+      return res.status(400).json({
+        message: `Cannot activate this ${getPlacementRoleLabel(targetUser.role)} account because its end date has been reached.`,
+      });
+    }
 
     targetUser.isAccountActive = !targetUser.isAccountActive;
     await targetUser.save();
@@ -6975,6 +7677,8 @@ app.get(`${BASE_ROUTE}/admin/users`, async (req, res) => {
     if (!["admin", "hr", "ceo", "supervisor", "auditor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
 
+    await refreshAutomaticRestrictionsForUsers();
+
     const users = await User.find().sort({ createdAt: -1 });
 
     res.json(users);
@@ -6995,6 +7699,8 @@ app.get(`${BASE_ROUTE}/supervisor/users`, async (req, res) => {
 
     if (!["supervisor", "superadmin"].includes(currentUser.rank))
       return res.status(403).json({ message: "Access denied" });
+
+    await refreshAutomaticRestrictionsForUsers({ department: currentUser.department });
 
     const users = await User.find({ department: currentUser.department }).sort({ createdAt: -1 });
 
@@ -7245,8 +7951,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-password`, async (req, res) => {
     const hashedPassword = await bcrypt.hash(resetpassword, 10);
     targetUser.password = hashedPassword;
 
-    // reset the password reset flag to false since the admin has reset it  
-    targetUser.isPasswordReset = false;
+    // Temporary admin-issued password must be changed by the user after login.
+    targetUser.isPasswordReset = true;
 
     // save user
     await targetUser.save();
@@ -7736,9 +8442,39 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-clock-outside`, async (req, res) =>
     }
 
     // 4. Update Target User
-    const targetUser = await User.findById(req.params.id);
+    let targetUser = await User.findById(req.params.id);
     if (!targetUser)
       return res.status(404).json({ message: "User not found" });
+
+    targetUser = await refreshUserAutomaticRestrictions(targetUser);
+
+    if (targetUser.isAccountActive === false) {
+      return res.status(400).json({
+        message: `Cannot grant outside clocking because ${targetUser.name}'s account is inactive or has reached its end date.`,
+      });
+    }
+
+    if (TEMPORARY_ACCOUNT_ROLES.has(normalizeUserRole(targetUser.role)) && targetUser.endDate) {
+      const placementEnd = getNairobiBoundaryForStoredDate(targetUser.endDate, "endDate", "end");
+      const outsideStart = getNairobiBoundaryForStoredDate(startDateValue, "startDate", "start");
+      const outsideEnd = getNairobiBoundaryForStoredDate(endDateValue, "endDate", "end");
+
+      if (outsideStart && placementEnd && outsideStart > placementEnd) {
+        return res.status(400).json({
+          message: `Outside clocking cannot start after this ${getPlacementRoleLabel(targetUser.role)} placement end date.`,
+        });
+      }
+
+      if (outsideEnd && placementEnd && outsideEnd > placementEnd) {
+        return res.status(400).json({
+          message: `Outside clocking cannot extend beyond this ${getPlacementRoleLabel(targetUser.role)} placement end date.`,
+        });
+      }
+    }
+
+    if (isDateWindowEnded(endDateValue)) {
+      return res.status(400).json({ message: "Outside clocking end date has already passed." });
+    }
 
     // Update the permission and the details
     targetUser.canClockOutside = true;
@@ -8502,9 +9238,212 @@ const ensureSuperadmin = async (req, res, allowBootstrap = false) => {
   return { allowed: true, currentUser };
 };
 
+const HOLIDAY_MANAGER_RANKS = ["hr", "admin", "superadmin"];
+
+const ensureHolidayManager = async (req, res) => {
+  if (!req.session?.isOnline || !req.session?.userID) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const currentUser = await User.findById(req.session.userID);
+  if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+
+  const rank = String(currentUser.rank || "").toLowerCase();
+  if (!HOLIDAY_MANAGER_RANKS.includes(rank)) {
+    return res.status(403).json({ message: "Holiday management is restricted to HR, admin, and superadmin users." });
+  }
+
+  return { allowed: true, currentUser };
+};
+
+const parseHolidayDate = (value) => {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+  if (!match) {
+    throw new Error("Holiday date must be provided in YYYY-MM-DD format.");
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    throw new Error("Holiday date is invalid.");
+  }
+
+  return date;
+};
+
+const normalizeHolidayInput = (body = {}) => {
+  const selectedName = String(body.name || "").trim();
+  const customName = String(body.customName || "").trim();
+  const name = selectedName.toLowerCase() === "other" ? customName : selectedName;
+
+  if (!name) {
+    throw new Error("Holiday name is required.");
+  }
+
+  return {
+    name,
+    date: parseHolidayDate(body.date),
+    recurring: body.recurring === true,
+    active: body.active !== false,
+    description: String(body.description || "").trim(),
+  };
+};
+
+const getHolidayDateKey = (date) => {
+  const target = new Date(date);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Nairobi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(target);
+};
+
+const formatHolidayLabelDate = (dateKey) =>
+  new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Nairobi",
+    weekday: "long",
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(new Date(`${dateKey}T00:00:00+03:00`));
+
+app.get(`${BASE_ROUTE}/holidays/today`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const [config, currentUser] = await Promise.all([
+      PlatformConfig.getSingleton(),
+      User.findById(req.session.userID).lean(),
+    ]);
+
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+
+    const holiday = await getHolidayForDate(new Date(), config);
+    const holidayDate = holiday ? formatHolidayLabelDate(holiday.date) : "";
+    const template = config.notificationReminders?.holidayNoticeMessage ||
+      "Dear {firstName}, today ({holidayDate}) is {holidayName}. KMFRI Attendance clocking is not required for the holiday.";
+
+    return res.status(200).json({
+      isHoliday: Boolean(holiday),
+      holiday,
+      message: holiday
+        ? formatPlatformTemplate(template, currentUser, {
+          date: holidayDate,
+          holidayDate,
+          holidayName: holiday.name,
+          reason: holiday.name,
+        })
+        : "",
+    });
+  } catch (err) {
+    console.error("Holiday today error:", err);
+    return res.status(500).json({ message: "Failed to load holiday status" });
+  }
+});
+
+app.get(`${BASE_ROUTE}/holidays`, async (req, res) => {
+  try {
+    const auth = await ensureHolidayManager(req, res);
+    if (!auth || auth.allowed !== true) return;
+
+    const cfg = await PlatformConfig.getSingleton();
+    return res.status(200).json(cfg.holidays || []);
+  } catch (err) {
+    console.error("Load holidays error:", err);
+    return res.status(500).json({ message: "Failed to load holidays" });
+  }
+});
+
+app.post(`${BASE_ROUTE}/holidays`, async (req, res) => {
+  try {
+    const auth = await ensureHolidayManager(req, res);
+    if (!auth || auth.allowed !== true) return;
+
+    const holiday = normalizeHolidayInput(req.body);
+    const cfg = await PlatformConfig.getSingleton();
+    const nextDateKey = getHolidayDateKey(holiday.date);
+    const duplicate = (cfg.holidays || []).some((item) => (
+      String(item.name || "").trim().toLowerCase() === holiday.name.toLowerCase() &&
+      getHolidayDateKey(item.date) === nextDateKey
+    ));
+
+    if (duplicate) {
+      return res.status(409).json({ message: "This holiday already exists for the selected date." });
+    }
+
+    cfg.holidays.push(holiday);
+    cfg.markModified("holidays");
+    await cfg.save();
+
+    await createAuditLog({
+      req,
+      category: "configuration",
+      action: "holiday.add",
+      description: `Added holiday ${holiday.name}`,
+      actor: auth.currentUser,
+      metadata: { holiday: { ...holiday, date: nextDateKey } },
+    });
+
+    return res.status(201).json(cfg.holidays || []);
+  } catch (err) {
+    console.error("Add holiday error:", err);
+    return res.status(400).json({ message: err.message || "Failed to add holiday" });
+  }
+});
+
+app.delete(`${BASE_ROUTE}/holidays/:id`, async (req, res) => {
+  try {
+    const auth = await ensureHolidayManager(req, res);
+    if (!auth || auth.allowed !== true) return;
+
+    const { id } = req.params;
+    const cfg = await PlatformConfig.getSingleton();
+    const beforeCount = cfg.holidays?.length || 0;
+    const holiday = (cfg.holidays || []).find((item) => item._id?.toString?.() === id);
+
+    cfg.holidays = (cfg.holidays || []).filter((item) => item._id?.toString?.() !== id);
+
+    if ((cfg.holidays?.length || 0) === beforeCount) {
+      return res.status(404).json({ message: "Holiday not found." });
+    }
+
+    cfg.markModified("holidays");
+    await cfg.save();
+
+    await createAuditLog({
+      req,
+      category: "configuration",
+      action: "holiday.remove",
+      description: `Removed holiday ${holiday?.name || id}`,
+      actor: auth.currentUser,
+      metadata: { holidayId: id, holidayName: holiday?.name || "" },
+    });
+
+    return res.status(200).json(cfg.holidays || []);
+  } catch (err) {
+    console.error("Remove holiday error:", err);
+    return res.status(400).json({ message: err.message || "Failed to remove holiday" });
+  }
+});
+
 app.get(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
   try {
-    const cfg = await PlatformConfig.getSingleton();
+    const { config: cfg } = await syncMaintenanceWindow(
+      await PlatformConfig.getSingleton(),
+      "config-read"
+    );
     return res.status(200).json(cfg);
   } catch (err) {
     console.error('Get config error:', err);
@@ -8523,7 +9462,11 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     const updates = req.body || {};
 
-    const cfg = await PlatformConfig.getSingleton();
+    const { config: cfg } = await syncMaintenanceWindow(
+      await PlatformConfig.getSingleton(),
+      "config-update"
+    );
+    const previousMaintenanceState = getMaintenanceState(cfg);
 
     // =====================================================
     // LOGO
@@ -8627,13 +9570,38 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     if (updates.masterSettings) {
 
-      cfg.masterSettings = {
+      const nextMasterSettings = sanitizeMasterSettingsPatch(
+        cfg.masterSettings,
+        updates.masterSettings
+      );
 
-        ...(cfg.masterSettings?.toObject?.() || cfg.masterSettings),
+      if (nextMasterSettings.maintenanceMode === true) {
+        const now = new Date();
+        const startAt = parseOptionalDate(nextMasterSettings.maintenanceStartAt) || now;
+        const endAt = parseOptionalDate(nextMasterSettings.maintenanceEndAt);
 
-        ...updates.masterSettings,
+        if (!endAt) {
+          throw new Error("Maintenance end date and time are required.");
+        }
 
-      };
+        if (endAt <= now) {
+          throw new Error("Maintenance end date and time must be in the future.");
+        }
+
+        if (endAt <= startAt) {
+          throw new Error("Maintenance end date and time must be after the start date and time.");
+        }
+
+        nextMasterSettings.maintenanceStartAt = startAt;
+        nextMasterSettings.maintenanceEndAt = endAt;
+      } else {
+        nextMasterSettings.maintenanceMode = false;
+        nextMasterSettings.maintenanceStartAt = null;
+        nextMasterSettings.maintenanceEndAt = null;
+        nextMasterSettings.maintenanceMessage = "";
+      }
+
+      cfg.masterSettings = nextMasterSettings;
 
       cfg.markModified("masterSettings");
 
@@ -8706,6 +9674,7 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
     }
 
     await cfg.save();
+    await handleMaintenanceConfigNotifications(cfg, previousMaintenanceState, getMaintenanceState(cfg));
     sessionTimeoutCache.expiresAt = 0;
 
 
@@ -8762,6 +9731,7 @@ app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
     const { section = 'all' } = req.body || {};
     const defaults = getDefaultPlatformConfig();
     const cfg = await PlatformConfig.getSingleton();
+    const previousMaintenanceState = getMaintenanceState(cfg);
     const resettableSections = ['branding', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations', 'holidays', 'logoUrl'];
 
     if (section === 'all') {
@@ -8791,6 +9761,9 @@ app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
     }
 
     await cfg.save();
+    if (section === 'all' || section === 'masterSettings') {
+      await handleMaintenanceConfigNotifications(cfg, previousMaintenanceState, getMaintenanceState(cfg));
+    }
     sessionTimeoutCache.expiresAt = 0;
 
     if (section === 'all' || section === 'attendancePolicy') {
@@ -9118,8 +10091,11 @@ app.get(`${BASE_ROUTE}/superadmin/dashboard/full`, async (req, res) => {
           maintenanceMode:
             cfg.masterSettings.maintenanceMode,
 
-          selfRegistration:
-            cfg.masterSettings.allowEmployeeSelfRegistration,
+          maintenanceStartAt:
+            cfg.masterSettings.maintenanceStartAt,
+
+          maintenanceEndAt:
+            cfg.masterSettings.maintenanceEndAt,
 
           maxDevicesPerUser:
             cfg.masterSettings.maxDevicesPerUser,

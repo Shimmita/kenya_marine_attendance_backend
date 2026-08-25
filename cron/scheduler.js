@@ -3,6 +3,7 @@ import cron from "node-cron";
 import PlatformConfig from "../model/PlatformConfig.js";
 import registerClockInReminder from "./clockInReminder.cron.js";
 import registerClockOutReminder from "./clockOutReminder.cron.js";
+import registerHolidayNotificationJob from "./holidayNotification.cron.js";
 import registerMidnightAttendanceJob from "./midnightAttendance.cron.js";
 
 
@@ -144,14 +145,19 @@ export const getAttendanceScheduleTimes = (policy = {}) => {
     const midnightTime =
         policy.midnightProcessingTime || "00:00";
 
+    const holidayNoticeTime =
+        offsetTime(midnightTime, 1);
+
     timeToCron(clockInReminderTime);
     timeToCron(clockOutReminderTime);
     timeToCron(midnightTime);
+    timeToCron(holidayNoticeTime);
 
     return {
         clockInReminderTime,
         clockOutReminderTime,
-        midnightTime
+        midnightTime,
+        holidayNoticeTime
     };
 
 };
@@ -181,7 +187,8 @@ export const startAttendanceScheduler = async () => {
     const {
         clockInReminderTime,
         clockOutReminderTime,
-        midnightTime
+        midnightTime,
+        holidayNoticeTime
     } = getAttendanceScheduleTimes(policy);
 
     const newScheduledTasks = [];
@@ -247,6 +254,30 @@ export const startAttendanceScheduler = async () => {
             timeToCron(midnightTime),
 
             registerMidnightAttendanceJob,
+
+            {
+
+                timezone: "Africa/Nairobi"
+
+            }
+
+        )
+
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Register Holiday Notification Job
+    |--------------------------------------------------------------------------
+    */
+
+    newScheduledTasks.push(
+
+        cron.createTask(
+
+            timeToCron(holidayNoticeTime),
+
+            registerHolidayNotificationJob,
 
             {
 

@@ -224,6 +224,14 @@ const defaultNotificationReminders = {
 
     accountDeactivatedMessage: 'Dear {firstName}, your KMFRI Attendance account has been deactivated. Please contact HR for assistance.',
 
+    accountExpiredMessage: 'Dear {firstName}, your KMFRI Attendance {role} account reached its end date ({endDate}) and has been automatically deactivated. Please contact HR for assistance.',
+
+    maintenanceModeMessage: 'Dear {firstName}, KMFRI Attendance will be under scheduled maintenance from {startDate} to {endDate}. Services may be temporarily unavailable. Thank you for your patience.',
+
+    maintenanceRestoredMessage: 'Dear {firstName}, KMFRI Attendance services have been restored. You may now continue using the platform.',
+
+    holidayNoticeMessage: 'Dear {firstName}, today ({holidayDate}) is {holidayName}. KMFRI Attendance clocking is not required for the holiday. Normal clocking resumes on the next configured working day.',
+
     leaveSubmittedMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) has been submitted for review.',
 
     leaveApprovedMessage: 'Dear {firstName}, your {type} request ({startDate}–{endDate}) has been approved.',
@@ -286,16 +294,17 @@ const defaultAttendancePolicy = {
 };
 
 const defaultMasterSettings = {
-    allowEmployeeSelfRegistration: false,
     maintenanceMode: false,
-    requirePasswordResetOnFirstLogin: false,
+    maintenanceStartAt: null,
+    maintenanceEndAt: null,
+    maintenanceMessage: '',
+    maintenanceNotifiedAt: null,
+    maintenanceRestoredNotifiedAt: null,
+    requirePasswordResetOnFirstLogin: true,
     maxDevicesPerUser: 2,
     biometricVerificationWindowMinutes: 5,
     sessionTimeoutMinutes: 1440,
     enableAuditLogging: true,
-    enableAttendanceExports: true,
-    enableLeaveManagement: true,
-    enableSupervisorManagement: true,
 
 };
 
@@ -343,6 +352,10 @@ const platformConfigSchema = new mongoose.Schema({
         clockOutsideRevokedMessage: { type: String, default: defaultNotificationReminders.clockOutsideRevokedMessage },
         accountActivatedMessage: { type: String, default: defaultNotificationReminders.accountActivatedMessage },
         accountDeactivatedMessage: { type: String, default: defaultNotificationReminders.accountDeactivatedMessage },
+        accountExpiredMessage: { type: String, default: defaultNotificationReminders.accountExpiredMessage },
+        maintenanceModeMessage: { type: String, default: defaultNotificationReminders.maintenanceModeMessage },
+        maintenanceRestoredMessage: { type: String, default: defaultNotificationReminders.maintenanceRestoredMessage },
+        holidayNoticeMessage: { type: String, default: defaultNotificationReminders.holidayNoticeMessage },
         leaveSubmittedMessage: { type: String, default: defaultNotificationReminders.leaveSubmittedMessage },
         leaveApprovedMessage: { type: String, default: defaultNotificationReminders.leaveApprovedMessage },
         leaveRejectedMessage: { type: String, default: defaultNotificationReminders.leaveRejectedMessage },
@@ -448,16 +461,17 @@ const platformConfigSchema = new mongoose.Schema({
         default: defaultDropdowns,
     },
     masterSettings: {
-        allowEmployeeSelfRegistration: { type: Boolean, default: defaultMasterSettings.allowEmployeeSelfRegistration },
         maintenanceMode: { type: Boolean, default: defaultMasterSettings.maintenanceMode },
+        maintenanceStartAt: { type: Date, default: defaultMasterSettings.maintenanceStartAt },
+        maintenanceEndAt: { type: Date, default: defaultMasterSettings.maintenanceEndAt },
+        maintenanceMessage: { type: String, default: defaultMasterSettings.maintenanceMessage },
+        maintenanceNotifiedAt: { type: Date, default: defaultMasterSettings.maintenanceNotifiedAt },
+        maintenanceRestoredNotifiedAt: { type: Date, default: defaultMasterSettings.maintenanceRestoredNotifiedAt },
         requirePasswordResetOnFirstLogin: { type: Boolean, default: defaultMasterSettings.requirePasswordResetOnFirstLogin },
         maxDevicesPerUser: { type: Number, default: defaultMasterSettings.maxDevicesPerUser },
         biometricVerificationWindowMinutes: { type: Number, default: defaultMasterSettings.biometricVerificationWindowMinutes },
         sessionTimeoutMinutes: { type: Number, default: defaultMasterSettings.sessionTimeoutMinutes },
         enableAuditLogging: { type: Boolean, default: defaultMasterSettings.enableAuditLogging },
-        enableAttendanceExports: { type: Boolean, default: defaultMasterSettings.enableAttendanceExports },
-        enableLeaveManagement: { type: Boolean, default: defaultMasterSettings.enableLeaveManagement },
-        enableSupervisorManagement: { type: Boolean, default: defaultMasterSettings.enableSupervisorManagement },
     },
 }, { timestamps: true });
 
@@ -530,6 +544,7 @@ export const getDefaultPlatformConfig = () => ({
     stations: defaultStations.map((station) => ({ ...station })),
     dropdowns: { ...defaultDropdowns },
     masterSettings: { ...defaultMasterSettings },
+    holidays: defaultHolidays.map((holiday) => ({ ...holiday })),
 });
 
 
@@ -542,6 +557,27 @@ const defaultHolidays = [
         active: true
     },
     {
+        name: "Good Friday",
+        date: new Date("2026-04-03"),
+        recurring: false,
+        active: true,
+        description: "Movable Kenya public holiday. Review yearly against the official gazette."
+    },
+    {
+        name: "Easter Monday",
+        date: new Date("2026-04-06"),
+        recurring: false,
+        active: true,
+        description: "Movable Kenya public holiday. Review yearly against the official gazette."
+    },
+    {
+        name: "Idd-ul-Fitr",
+        date: new Date("2026-03-20"),
+        recurring: false,
+        active: true,
+        description: "Movable Kenya public holiday. Review yearly against the official gazette."
+    },
+    {
         name: "Labour Day",
         date: new Date("2026-05-01"),
         recurring: true,
@@ -550,6 +586,19 @@ const defaultHolidays = [
     {
         name: "Madaraka Day",
         date: new Date("2026-06-01"),
+        recurring: true,
+        active: true
+    },
+    {
+        name: "Idd-ul-Adha",
+        date: new Date("2026-05-27"),
+        recurring: false,
+        active: true,
+        description: "Movable Kenya public holiday. Review yearly against the official gazette."
+    },
+    {
+        name: "Mazingira Day",
+        date: new Date("2026-10-10"),
         recurring: true,
         active: true
     },
@@ -626,6 +675,11 @@ platformConfigSchema.statics.getSingleton = async function () {
             cfg.themes = defaultThemes;
             changed = true;
         }
+        if (!Array.isArray(cfg.holidays) || cfg.holidays.length === 0) {
+            cfg.holidays = defaultHolidays;
+            cfg.markModified('holidays');
+            changed = true;
+        }
         for (const [key, value] of Object.entries(defaultNotificationReminders)) {
             if (typeof cfg.notificationReminders?.[key] === 'undefined') {
                 cfg.notificationReminders[key] = value;
@@ -640,6 +694,13 @@ platformConfigSchema.statics.getSingleton = async function () {
             cfg.markModified('masterSettings');
             changed = true;
         }
+        ['allowEmployeeSelfRegistration', 'enableAttendanceExports', 'enableLeaveManagement', 'enableSupervisorManagement'].forEach((key) => {
+            if (typeof cfg.masterSettings?.[key] !== 'undefined') {
+                cfg.masterSettings[key] = undefined;
+                cfg.markModified('masterSettings');
+                changed = true;
+            }
+        });
         if (!cfg.activeThemeName) {
             cfg.activeThemeName = defaultThemes[0].name;
             changed = true;
