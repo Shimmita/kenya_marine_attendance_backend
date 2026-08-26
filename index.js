@@ -309,6 +309,25 @@ const normalizeQueryValue = (value, fallback = "", preferLast = false) => {
   return normalized;
 };
 
+const normalizeClockingType = (value) => {
+  const normalized = normalizeQueryValue(value, "all").toLowerCase();
+  return ["user", "system"].includes(normalized) ? normalized : "all";
+};
+
+const buildClockingTypeRecordFilter = (clockingType) => {
+  const normalized = normalizeClockingType(clockingType);
+  if (normalized === "system") return { missedClockOut: true };
+  if (normalized === "user") return { missedClockOut: { $ne: true } };
+  return {};
+};
+
+const buildClockingRecordQuery = ({ emails = [], start, end, clockingType, extra = {} }) => ({
+  email: { $in: emails },
+  clock_in: { $gte: start, $lte: end },
+  ...buildClockingTypeRecordFilter(clockingType),
+  ...extra,
+});
+
 const normalizeAnalyticsQuery = (query = {}) => ({
   startDate: normalizeQueryValue(query.startDate, "", false),
   endDate: normalizeQueryValue(query.endDate, "", true),
@@ -316,6 +335,7 @@ const normalizeAnalyticsQuery = (query = {}) => ({
   department: normalizeQueryValue(query.department, "all"),
   role: normalizeQueryValue(query.role, "all").toLowerCase(),
   rank: normalizeQueryValue(query.rank, "all").toLowerCase(),
+  clockingType: normalizeClockingType(query.clockingType),
   limit: normalizeQueryValue(query.limit, "250", true),
 });
 
@@ -639,6 +659,7 @@ const countApprovedLeaveDaysByGroup = (leaveRecords, emailGroupMap, workingDateK
 
 const buildAnalyticsDataset = async (context, query = {}) => {
   const { startDate, endDate } = getRequestedDateRange(query);
+  const { clockingType } = normalizeAnalyticsQuery(query);
   const userFilter = buildAnalyticsUserFilter(context, query);
 
   await refreshAutomaticRestrictionsForUsers(userFilter);
@@ -652,10 +673,7 @@ const buildAnalyticsDataset = async (context, query = {}) => {
   const emails = users.map((entry) => entry.email).filter(Boolean);
 
   const [records, leaveRecords] = await Promise.all([
-    Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: startDate, $lte: endDate },
-    }).lean(),
+    Clocking.find(buildClockingRecordQuery({ emails, start: startDate, end: endDate, clockingType })).lean(),
     Leave.find({
       email: { $in: emails },
       startDate: { $lte: endDate },
@@ -995,6 +1013,8 @@ const sendLeaveSms = async (user, message) => {
   }
 };
 
+const PLATFORM_SITE_LINK = "https://clocking.kmfri.go.ke/";
+
 const formatPlatformTemplate = (template, user, values = {}) => {
   const firstName = user?.name?.split(" ")?.[0] || "User";
   const replacements = {
@@ -1004,8 +1024,11 @@ const formatPlatformTemplate = (template, user, values = {}) => {
     email: user?.email || "",
     phone: user?.phone || "",
     employeeId: user?.employeeId || "",
+    role: user?.role || "",
+    rank: user?.rank || "",
     department: user?.department || "",
     station: user?.station || "",
+    siteLink: PLATFORM_SITE_LINK,
     ...values,
   };
 
@@ -4747,6 +4770,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
       station,
       role,
       rank,
+      clockingType,
     } = normalizeAnalyticsQuery(req.query);
     const userFilter = buildAnalyticsUserFilter(context, {
       department,
@@ -4774,10 +4798,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 
 
     // Fetch all clockings in range
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end }
-    });
+    const records = await Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType }));
 
     // Today's date for present/absent counts
     const today = getNairobiDateKey(new Date());
@@ -4799,10 +4820,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 
     // Today's clockings and approved leave
     const [todayRecords, leaveTodayRecords] = await Promise.all([
-      Clocking.find({
-        email: { $in: emails },
-        clock_in: { $gte: startToday, $lte: endToday }
-      }).lean(),
+      Clocking.find(buildClockingRecordQuery({ emails, start: startToday, end: endToday, clockingType })).lean(),
       Leave.find({
         email: { $in: emails },
         status: "approved",
@@ -4892,7 +4910,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, department, station, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email');
@@ -4910,10 +4928,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
     }
 
     const [records, leaveRecords] = await Promise.all([
-      Clocking.find({
-        email: { $in: emails },
-        clock_in: { $gte: start, $lte: end }
-      }).lean(),
+      Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType })).lean(),
       Leave.find({
         email: { $in: emails },
         startDate: { $lte: end },
@@ -5033,7 +5048,7 @@ function getWeekNumber(d) {
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, department, station, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email department');
@@ -5052,19 +5067,18 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
       return res.status(400).json({ message: dateError.message });
     }
 
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end }
-    });
+    const records = await Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType }));
 
     // Employees late today
     const today = getNairobiDateKey(new Date());
     const { start: todayStart, end: todayEnd } = getSafeDateRange(today, today);
-    const lateToday = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: todayStart, $lte: todayEnd },
-      isLate: true
-    });
+    const lateToday = await Clocking.find(buildClockingRecordQuery({
+      emails,
+      start: todayStart,
+      end: todayEnd,
+      clockingType,
+      extra: { isLate: true },
+    }));
     const employeesLateToday = new Set(lateToday.map(r => r.email)).size;
 
     // Average lateness (minutes) – assume late means clock_in > 8:00 AM
@@ -5148,7 +5162,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, department, station, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email department');
@@ -5167,11 +5181,13 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (re
       return res.status(400).json({ message: dateError.message });
     }
 
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end },
-      clock_out: { $ne: null }
-    });
+    const records = await Clocking.find(buildClockingRecordQuery({
+      emails,
+      start,
+      end,
+      clockingType,
+      extra: { clock_out: { $ne: null } },
+    }));
 
     // Count early departures (clock_out < 17:00)
     let earlyCount = 0;
@@ -5222,7 +5238,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/early-departures`, async (re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, department, station, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, {
       department,
@@ -5256,13 +5272,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
       return res.status(400).json({ message: dateError.message });
     }
 
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: {
-        $gte: start,
-        $lte: end
-      }
-    });
+    const records = await Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType }));
 
     // ---------------------------------------------------------
     // TOTAL WORKING DAYS
@@ -5494,7 +5504,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/absenteeism`, async (req, re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, station, department, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, station, department, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { station, department, role, rank });
     const users = await User.find(userFilter, 'email department');
@@ -5517,10 +5527,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
     }
 
     const [records, leaveRecords] = await Promise.all([
-      Clocking.find({
-        email: { $in: emails },
-        clock_in: { $gte: start, $lte: end }
-      }).lean(),
+      Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType })).lean(),
       Leave.find({
         email: { $in: emails },
         startDate: { $lte: end },
@@ -5597,7 +5604,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, department, station, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     // Build user filter – includes department if provided
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
@@ -5646,10 +5653,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 
     // Fetch all clockings in range for these users
     const [records, leaveRecords] = await Promise.all([
-      Clocking.find({
-        email: { $in: allEmails },
-        clock_in: { $gte: start, $lte: end }
-      }).lean(),
+      Clocking.find(buildClockingRecordQuery({ emails: allEmails, start, end, clockingType })).lean(),
       Leave.find({
         email: { $in: allEmails },
         startDate: { $lte: end },
@@ -5793,7 +5797,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res) => {
   try {
     const context = await getAnalyticsContext(req);
-    const { startDate, endDate, department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const { startDate, endDate, department, station, role, rank, clockingType } = normalizeAnalyticsQuery(req.query);
 
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
     const users = await User.find(userFilter, 'email');
@@ -5814,10 +5818,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/compliance`, async (req, res
     }
 
     // Find all clockings in range
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: start, $lte: end }
-    });
+    const records = await Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType }));
 
     // For each day, check if user clocked in and out
     const missingClockIns = [];
@@ -5915,6 +5916,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       department,
       role,
       rank,
+      clockingType,
     } = normalizeAnalyticsQuery(req.query);
 
     // get config for stations and depart from platform config
@@ -5943,10 +5945,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
     const emails = allUsers.map((u) => u.email);
 
-    const records = await Clocking.find({
-      email: { $in: emails },
-      clock_in: { $gte: startOfMonth, $lte: now },
-    }).lean();
+    const records = await Clocking.find(buildClockingRecordQuery({
+      emails,
+      start: startOfMonth,
+      end: now,
+      clockingType,
+    })).lean();
 
     const totalStaff = allUsers.length;
 
@@ -6388,6 +6392,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       department,
       role,
       rank,
+      clockingType,
       startDate,
       endDate,
     } = normalizeAnalyticsQuery(req.query);
@@ -6452,7 +6457,10 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
     // Fetch Attendance Records
     //----------------------------------------------------
 
-    const records = await Clocking.find(attendanceQuery)
+    const records = await Clocking.find({
+      ...attendanceQuery,
+      ...buildClockingTypeRecordFilter(clockingType),
+    })
       .sort({ name: 1, clock_in: -1 })
       .lean();
 
@@ -6514,6 +6522,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       department,
       role,
       rank,
+      clockingType,
     } = normalizeAnalyticsQuery(req.query);
 
     //---------------------------------------------------------
@@ -6573,18 +6582,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     // Attendance Records
     //---------------------------------------------------------
 
-    const attendanceRecords = await Clocking.find({
-
-      email: {
-        $in: users.map(u => u.email)
-      },
-
-      clock_in: {
-        $gte: start,
-        $lte: end
-      }
-
-    }).lean();
+    const attendanceRecords = await Clocking.find(buildClockingRecordQuery({
+      emails: users.map(u => u.email),
+      start,
+      end,
+      clockingType,
+    })).lean();
 
     //---------------------------------------------------------
     // Present Days
@@ -6611,7 +6614,11 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
     // Summary
     //---------------------------------------------------------
 
-    const summary = users.map(user => {
+    const summaryUsers = clockingType === "all"
+      ? users
+      : users.filter((user) => attendanceMap[user.email]?.size > 0);
+
+    const summary = summaryUsers.map(user => {
 
       // attendance rate
       const presentDays =

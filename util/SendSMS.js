@@ -3,6 +3,8 @@ import axios from 'axios';
 import "dotenv/config";
 import PlatformConfig from "../model/PlatformConfig.js";
 
+const PLATFORM_SITE_LINK = "https://clocking.kmfri.go.ke/";
+
 const formatReminderTemplate = (template, user, password = '') => {
   const firstName = user?.name?.split(' ')[0] || 'User';
   const fullName = user?.name || firstName;
@@ -18,6 +20,7 @@ const formatReminderTemplate = (template, user, password = '') => {
     .replace(/{employeeId}/gi, user?.employeeId || '')
     .replace(/{station}/gi, user?.station || '')
     .replace(/{department}/gi, user?.department || '')
+    .replace(/{siteLink}/gi, PLATFORM_SITE_LINK)
     .replace(/{password}/gi, password);
 };
 
@@ -71,4 +74,3 @@ export const SendMessageNow = async (
     }
   });
 };
-

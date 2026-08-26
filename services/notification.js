@@ -2,6 +2,8 @@ import PlatformConfig from "../model/PlatformConfig.js";
 import MessageUser from "../model/MessageUser.js";
 import { SendMessageNow } from "../util/SendSMS.js";
 
+const PLATFORM_SITE_LINK = "https://clocking.kmfri.go.ke/";
+
 /*
 |--------------------------------------------------------------------------
 | Format Message
@@ -24,6 +26,7 @@ export const formatMessage = (template, user, values = {}) => {
         rank: user?.rank || "",
         department: user?.department || "",
         station: user?.station || "",
+        siteLink: PLATFORM_SITE_LINK,
         ...values,
     };
 
