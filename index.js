@@ -4778,8 +4778,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
       role,
       rank,
     });
-    const users = await User.find(userFilter, 'email isAccountActive isOnLeave');
+    const users = await User.find(userFilter, 'email name employeeId department station role isAccountActive isOnLeave');
     const emails = users.map(u => u.email);
+    const userByEmail = new Map(users.map((user) => [String(user.email || "").toLowerCase(), user]));
 
     let start;
     let end;
@@ -4839,6 +4840,38 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const onLeaveToday = todayIsWorkingDay ? new Set(leaveTodayRecords.map(r => r.email)).size : 0;
     const presentToday = activeEmployeesToday;
     const absentToday = todayIsWorkingDay ? Math.max(totalEmployees - activeEmployeesToday - onLeaveToday, 0) : 0;
+    const todayPresentEmails = new Set(todayRecords.map((record) => String(record.email || "").toLowerCase()).filter(Boolean));
+    const todayLeaveEmails = new Set(leaveTodayRecords.map((leave) => String(leave.email || "").toLowerCase()).filter(Boolean));
+    const formatTodayUser = (user, extra = {}) => ({
+      name: user?.name || user?.email || "Unknown",
+      email: user?.email || "",
+      employeeId: user?.employeeId || "",
+      station: user?.station || "Unassigned",
+      department: user?.department || "Unassigned",
+      role: user?.role || "",
+      ...extra,
+    });
+    const todayDetails = {
+      present: todayRecords.map((record) => {
+        const user = userByEmail.get(String(record.email || "").toLowerCase()) || {};
+        return formatTodayUser(user, {
+          clockIn: record.clock_in,
+          clockOut: record.clock_out,
+          isLate: Boolean(record.isLate),
+        });
+      }),
+      absent: users
+        .filter((user) => !todayPresentEmails.has(String(user.email || "").toLowerCase()) && !todayLeaveEmails.has(String(user.email || "").toLowerCase()))
+        .map((user) => formatTodayUser(user)),
+      onLeave: leaveTodayRecords.map((leave) => {
+        const user = userByEmail.get(String(leave.email || "").toLowerCase()) || {};
+        return formatTodayUser(user, {
+          leaveType: leave.type || "Approved Leave",
+          leaveStart: leave.startDate,
+          leaveEnd: leave.endDate,
+        });
+      }),
+    };
 
     // Attendance rate: present days / total configured working days in period
     const workingDays = Math.max(workingDateKeys.length, 1);
@@ -4895,6 +4928,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
       employeesOnLeave: onLeaveToday,
       workforceSize: totalEmployees,
       absenteeismRate: parseFloat(absenteeismRate.toFixed(1)),
+      todayDetails,
       departments: allDepartments,
       stations: allStations
     });
@@ -6237,59 +6271,33 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 // GET /overall/attendance/analytics/biometric
 app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res) => {
   try {
-    // --- 1. Admin-only access ---
     const context = await getAnalyticsContext(req);
-    if (!['admin', 'superadmin'].includes(context.user?.rank)) {
-      return res.status(403).json({ message: 'Admin access required' });
-    }
+    const { department, station, role, rank } = normalizeAnalyticsQuery(req.query);
+    const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
 
-    // --- 2. Date range (optional) – filters users & devices by creation ---
-    const { startDate, endDate } = normalizeAnalyticsQuery(req.query);
-    let start;
-    let end;
+    const users = await User.find(
+      userFilter,
+      "email doneBiometric authenticators deviceLost"
+    ).lean();
+    const emails = users.map((user) => user.email).filter(Boolean);
+    const deviceScope = emails.length ? { user_email: { $in: emails } } : { user_email: "__NO_ANALYTICS_USERS__" };
 
-    try {
-      const range = getSafeDateRange(startDate || new Date(0), endDate || new Date());
-      start = range.start;
-      end = range.end;
-    } catch (dateError) {
-      return res.status(400).json({ message: dateError.message });
-    }
+    const usersWithBiometric = users.filter((user) => user.doneBiometric).length;
+    const totalAuthenticators = users.reduce((sum, user) => sum + (Array.isArray(user.authenticators) ? user.authenticators.length : 0), 0);
+    const totalSuccessfulVerifications = users.reduce(
+      (sum, user) => sum + (Array.isArray(user.authenticators)
+        ? user.authenticators.reduce((authSum, auth) => authSum + Number(auth.counter || 0), 0)
+        : 0),
+      0
+    );
 
-    // --- 3. Biometric enrollment stats from User ---
-    const usersWithBiometric = await User.countDocuments({
-      doneBiometric: true,
-      createdAt: { $gte: start, $lte: end }
-    });
-
-    // --- 4. Authenticators & successful verifications ---
-    // Unwind the authenticators array to count credentials and sum counters
-    const [authAgg] = await User.aggregate([
-      { $match: { createdAt: { $gte: start, $lte: end } } },
-      { $project: { authenticators: 1 } },
-      { $unwind: { path: '$authenticators', preserveNullAndEmptyArrays: false } },
-      {
-        $group: {
-          _id: null,
-          totalAuthenticators: { $sum: 1 },
-          totalSuccessfulVerifications: { $sum: '$authenticators.counter' }
-        }
-      }
-    ]);
-
-    const totalAuthenticators = authAgg?.totalAuthenticators || 0;
-    const totalSuccessfulVerifications = authAgg?.totalSuccessfulVerifications || 0;
-
-    // --- 5. Device stats ---
-    const totalDevices = await Devices.countDocuments({
-      createdAt: { $gte: start, $lte: end }
-    });
+    const totalDevices = await Devices.countDocuments(deviceScope);
 
     // Active = updated in the last 7 days
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const activeDevices = await Devices.countDocuments({
       updatedAt: { $gte: sevenDaysAgo },
-      createdAt: { $gte: start, $lte: end }
+      ...deviceScope,
     });
 
     const inactiveDevices = totalDevices - activeDevices;
@@ -6300,7 +6308,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res)
       const inactiveDocs = await Devices.find(
         {
           updatedAt: { $lt: sevenDaysAgo },
-          createdAt: { $gte: start, $lte: end }
+          ...deviceScope,
         },
         'updatedAt'
       );
@@ -6313,38 +6321,33 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/biometric`, async (req, res)
     // --- 6. Lost devices (from Device collection) ---
     const lostDevices = await Devices.countDocuments({
       device_lost: true,
-      createdAt: { $gte: start, $lte: end }
+      ...deviceScope,
     });
 
     // --- 7. Users who reported a lost device ---
-    const usersWithLostDevice = await User.countDocuments({
-      deviceLost: true,
-      createdAt: { $gte: start, $lte: end }
-    });
+    const usersWithLostDevice = users.filter((user) => user.deviceLost).length;
 
     // --- 8. Primary devices ---
     const primaryDevices = await Devices.countDocuments({
       device_primary: true,
-      createdAt: { $gte: start, $lte: end }
+      ...deviceScope,
     });
 
     // --- 9. OS & Browser distribution (for extra insight) ---
     const osDistribution = await Devices.aggregate([
-      { $match: { createdAt: { $gte: start, $lte: end } } },
+      { $match: deviceScope },
       { $group: { _id: '$device_os', count: { $sum: 1 } } },
       { $sort: { count: -1 } }
     ]);
 
     const browserDistribution = await Devices.aggregate([
-      { $match: { createdAt: { $gte: start, $lte: end } } },
+      { $match: deviceScope },
       { $group: { _id: '$device_browser', count: { $sum: 1 } } },
       { $sort: { count: -1 } }
     ]);
 
     // --- 10. Enrollment rate (users with biometric / total users) ---
-    const totalUsers = await User.countDocuments({
-      createdAt: { $gte: start, $lte: end }
-    });
+    const totalUsers = users.length;
     const enrollmentRate = totalUsers > 0 ? (usersWithBiometric / totalUsers) * 100 : 0;
 
     // --- 11. Response ---
@@ -6436,7 +6439,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       email
       employeeId
       role
-      rank
       name
       department
       station
@@ -6479,7 +6481,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
         employeeId: user.employeeId || "",
 
         role: user.role || "",
-        rank: user.rank || "",
 
         name: user.name || record.name,
 
@@ -6572,7 +6573,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       email
       employeeId
       role
-      rank
       station
       department
       `
@@ -6634,10 +6634,11 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
 
         employeeId: user.employeeId || "",
 
+        email: user.email || "",
+
         name: user.name || "",
 
         role: user.role || "",
-        rank: user.rank || "",
 
         station: user.station || "",
 
