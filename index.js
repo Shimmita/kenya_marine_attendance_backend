@@ -2506,7 +2506,7 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     ) {
 
       message =
-        "Invalid credentials. Please check your Staff Number and Password.";
+        "Invalid credentials. Please check your login details!";
 
       statusCode = 401;
 
@@ -7655,8 +7655,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-role`, async (req, res) => {
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
 
-    if (!["admin", "hr", "ceo", "superadmin"].includes(currentUser.rank))
-      return res.status(403).json({ message: "Access denied" });
+    if (!["hr", "superadmin"].includes(String(currentUser.rank || "").toLowerCase()))
+      return res.status(403).json({ message: "Only HR or superadmin can update user role" });
 
     const targetUser = await User.findById(req.params.id);
     if (!targetUser)
