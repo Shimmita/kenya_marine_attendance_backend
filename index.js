@@ -942,6 +942,8 @@ const sanitizeUserResponse = (user) => {
   delete safeUser.password;
   delete safeUser.authenticator;
   delete safeUser.authenticators;
+  delete safeUser.activeSessionId;
+  delete safeUser.activeSessionIssuedAt;
   return safeUser;
 };
 
@@ -1632,6 +1634,95 @@ const saveSession = (req) =>
     });
   });
 
+const regenerateSession = (req) =>
+  new Promise((resolve, reject) => {
+    if (!req.session?.regenerate) {
+      resolve();
+      return;
+    }
+
+    req.session.regenerate((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+
+const destroyStoredSession = (sessionId) =>
+  new Promise((resolve) => {
+    if (!sessionId || !store?.destroy) {
+      resolve();
+      return;
+    }
+
+    store.destroy(sessionId, (error) => {
+      if (error) {
+        console.warn("Unable to destroy previous user session:", error?.message || error);
+      }
+      resolve();
+    });
+  });
+
+const destroyRequestSession = (req, res) =>
+  new Promise((resolve) => {
+    if (!req.session?.destroy) {
+      res.clearCookie(process.env.SESSION_NAME);
+      resolve();
+      return;
+    }
+
+    req.session.destroy((error) => {
+      if (error) {
+        console.warn("Unable to destroy request session:", error?.message || error);
+      }
+      res.clearCookie(process.env.SESSION_NAME);
+      resolve();
+    });
+  });
+
+const startAuthenticatedSession = async (req, user) => {
+  const previousSessionId = user?.activeSessionId || "";
+
+  await regenerateSession(req);
+
+  req.session.isOnline = true;
+  req.session.userID = user._id.toString();
+  req.session.loginAt = Date.now();
+  req.session.lastActivityAt = Date.now();
+
+  if (req.session.cookie) {
+    req.session.cookie.maxAge = await getConfiguredSessionMaxAgeMs();
+  }
+
+  await saveSession(req);
+
+  await User.updateOne(
+    { _id: user._id },
+    {
+      $set: {
+        activeSessionId: req.sessionID,
+        activeSessionIssuedAt: new Date(),
+      },
+    }
+  );
+
+  if (previousSessionId && previousSessionId !== req.sessionID) {
+    await destroyStoredSession(previousSessionId);
+  }
+};
+
+const ensureUserOwnsCurrentSession = async (req, user) => {
+  if (!user || !req.sessionID) return false;
+
+  if (!user.activeSessionId) {
+    user.activeSessionId = req.sessionID;
+    user.activeSessionIssuedAt = user.activeSessionIssuedAt || new Date();
+    await user.save();
+    return true;
+  }
+
+  return user.activeSessionId === req.sessionID;
+};
+
 app.use(async (req, res, next) => {
   try {
     if (req.session?.cookie) {
@@ -1699,9 +1790,10 @@ app.post(`${BASE_ROUTE}/notifications/trigger-reminders`, async (req, res) => {
 app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
   try {
     const { state } = await syncMaintenanceWindow(null, "valid");
+    const sessionTimeoutMs = await getConfiguredSessionMaxAgeMs();
 
     if (!req.session?.isOnline || !req.session?.userID) {
-      return res.status(200).json({ valid: false, maintenance: state });
+      return res.status(200).json({ valid: false, maintenance: state, sessionTimeoutMs });
     }
 
     const user = await refreshUserAutomaticRestrictions(
@@ -1711,7 +1803,17 @@ app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
     if (!user || user.isAccountActive === false) {
       req.session.isOnline = false;
       await saveSession(req);
-      return res.status(200).json({ valid: false, reason: "account_inactive" });
+      return res.status(200).json({ valid: false, reason: "account_inactive", sessionTimeoutMs });
+    }
+
+    if (!(await ensureUserOwnsCurrentSession(req, user))) {
+      await destroyRequestSession(req, res);
+      return res.status(200).json({
+        valid: false,
+        reason: "session_replaced",
+        code: "SESSION_REPLACED",
+        sessionTimeoutMs,
+      });
     }
 
     if (state.active && !isSuperadminUser(user)) {
@@ -1720,11 +1822,12 @@ app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
       return res.status(200).json({
         valid: false,
         reason: "maintenance_mode",
+        sessionTimeoutMs,
         ...buildMaintenanceResponse(state),
       });
     }
 
-    return res.status(200).json({ valid: true });
+    return res.status(200).json({ valid: true, sessionTimeoutMs });
   } catch (error) {
     console.error("Session validity check failed:", error);
     return res.status(200).json({ valid: false });
@@ -1732,6 +1835,8 @@ app.use(`${BASE_ROUTE}/valid`, async (req, res) => {
 });
 
 app.use(BASE_ROUTE, enforceMaintenanceModeForRequests);
+
+app.use(BASE_ROUTE, enforceSingleActiveSessionForAuthenticatedRequests);
 
 app.use(BASE_ROUTE, enforceRequiredPasswordResetForAuthenticatedRequests);
 
@@ -2283,9 +2388,9 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
       return sendMaintenanceModeResponse(res, maintenanceState);
     }
 
-    // init user session
-    req.session.isOnline = true;
-    req.session.userID = user._id.toString();
+    const refreshedUser = await finalizeStaleClocking(user);
+
+    await startAuthenticatedSession(req, refreshedUser);
 
     await createAuditLog({
       req,
@@ -2295,8 +2400,6 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
       actor: user,
       metadata: { signInMethod: "password" },
     });
-
-    const refreshedUser = await finalizeStaleClocking(user);
 
     return res.status(200).json(sanitizeUserResponse(refreshedUser));
   } catch (error) {
@@ -2400,31 +2503,13 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     }
 
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // 4. Create session for currently logged-in user
-    // ─────────────────────────────────────────────────────────────────────────
+    const refreshedUser = await finalizeStaleClocking(user);
 
-    req.session.isOnline = true;
-    req.session.userID = user._id.toString();
+    await startAuthenticatedSession(req, refreshedUser);
 
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 5. Save session
-    // ─────────────────────────────────────────────────────────────────────────
-
-    await new Promise((resolve, reject) => {
-      req.session.save((err) => {
-        if (err) {
-          return reject(err);
-        }
-
-        resolve();
-      });
-    });
-
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // 6. Audit login
+    // 4. Audit login
     // ─────────────────────────────────────────────────────────────────────────
 
     await createAuditLog({
@@ -2440,10 +2525,8 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
 
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 7. Return sanitized user
+    // 5. Return sanitized user
     // ─────────────────────────────────────────────────────────────────────────
-
-    const refreshedUser = await finalizeStaleClocking(user);
 
     return res
       .status(200)
@@ -3385,6 +3468,20 @@ const isMaintenanceAllowedPath = (req) => {
   return false;
 };
 
+const isSingleSessionAllowedPath = (req) => {
+  const path = req.path || "";
+  if (path === "/maintenance/status") return true;
+  if (path === "/valid") return true;
+  if (path === "/auth/signin") return true;
+  if (path === "/auth/signin-staff") return true;
+  if (path === "/auth/request-password-reset") return true;
+  if (path === "/notifications/trigger-reminders") return true;
+  if (path === "/user/signout") return true;
+  if (req.method === "GET" && /^\/verify\/[^/]+$/.test(path)) return true;
+  if (req.method === "GET" && path === "/superadmin/config") return true;
+  return false;
+};
+
 async function enforceMaintenanceModeForRequests(req, res, next) {
   try {
     if (isMaintenanceAllowedPath(req)) return next();
@@ -3403,6 +3500,24 @@ async function enforceMaintenanceModeForRequests(req, res, next) {
     }
 
     return sendMaintenanceModeResponse(res, state);
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function enforceSingleActiveSessionForAuthenticatedRequests(req, res, next) {
+  try {
+    if (isSingleSessionAllowedPath(req)) return next();
+    if (!req.session?.isOnline || !req.session?.userID) return next();
+
+    const user = await User.findById(req.session.userID);
+    if (await ensureUserOwnsCurrentSession(req, user)) return next();
+
+    await destroyRequestSession(req, res);
+    return res.status(401).json({
+      message: "This session was signed out because your account was opened on another device.",
+      code: "SESSION_REPLACED",
+    });
   } catch (error) {
     return next(error);
   }
@@ -7437,12 +7552,17 @@ app.post(`${BASE_ROUTE}/user/signout`, async (req, res) => {
         description: "User signed out",
         actor: currentUser,
       });
+
+      if (currentUser.activeSessionId === req.sessionID) {
+        currentUser.activeSessionId = "";
+        currentUser.activeSessionIssuedAt = null;
+        await currentUser.save();
+      }
     }
 
     // destroy the session
-    req.session.destroy();
+    await destroyRequestSession(req, res);
     // clear cookie if any
-    res.clearCookie(process.env.SESSION_NAME);
     res.status(200).send("logged out successfully");
   } catch (error) {
     res.status(400).send(error.message);
