@@ -67,6 +67,7 @@ const userSchema = new mongoose.Schema(
     isPasswordReset: { type: Boolean, default: true },
     activeSessionId: { type: String, default: "" },
     activeSessionIssuedAt: { type: Date, default: null },
+    dataPrivacyAcceptedAt: { type: Date, default: null },
 
     // Legacy single biometric credential. Kept for migration of already-enrolled users.
     authenticator: authenticatorSchema,

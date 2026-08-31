@@ -2877,6 +2877,45 @@ app.put(`${BASE_ROUTE}/user/password/required-reset`, async (req, res) => {
   }
 });
 
+app.post(`${BASE_ROUTE}/user/privacy/accept`, async (req, res) => {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    let user = await refreshUserAutomaticRestrictions(
+      await User.findById(req.session.userID)
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (user.isAccountActive === false) {
+      return res.status(403).json({ message: "Your account is inactive. Please contact HR." });
+    }
+
+    user.dataPrivacyAcceptedAt = new Date();
+    await user.save();
+
+    await createAuditLog({
+      req,
+      category: "profile",
+      action: "profile.data_privacy_accepted",
+      description: "User accepted the data privacy notice",
+      actor: user,
+    });
+
+    return res.status(200).json({
+      message: "Data privacy notice accepted.",
+      user: sanitizeUserResponse(user),
+    });
+  } catch (error) {
+    console.error("Data privacy acceptance error:", error);
+    return res.status(500).json({ message: error.message || "Failed to accept data privacy notice." });
+  }
+});
+
 
 
 // ─── Biometrics ───────────────────────────────────────────────────────────────
@@ -3452,6 +3491,7 @@ const isRequiredPasswordResetAllowedPath = (req) => {
   if (path === "/auth/signin-staff") return true;
   if (path === "/auth/request-password-reset") return true;
   if (path === "/user/signout") return true;
+  if (path === "/user/privacy/accept") return true;
   if (path === "/user/password/required-reset") return true;
   if (req.method === "GET" && path === "/user/profile") return true;
   return false;
