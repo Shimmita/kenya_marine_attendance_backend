@@ -697,6 +697,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
   const totalStaff = users.length;
   const today = new Date();
   const todayKey = getNairobiDateKey(today);
+  const attendancePolicy = await getAttendancePolicy();
 
   const employeeByEmail = new Map(users.map((user) => [user.email, user]));
 
@@ -722,7 +723,9 @@ const buildAnalyticsView = async (view, context, query = {}) => {
   const presentCount = todayPresent.size;
   const absentCount = Math.max(totalStaff - presentCount - onLeaveCount, 0);
 
-  const lateRecords = records.filter((record) => record?.isLate);
+  const lateRecords = records.filter((record) => record?.clock_in && !isClockInOnTimeByPolicy(record.clock_in, attendancePolicy));
+  const clockInCount = records.filter((record) => record?.clock_in).length;
+  const onTimeClockIns = records.filter((record) => record?.clock_in && isClockInOnTimeByPolicy(record.clock_in, attendancePolicy)).length;
   const earlyDepartureRecords = records.filter((record) => record?.clock_out && record?.clock_in && (new Date(record.clock_out) - new Date(record.clock_in)) / (1000 * 60 * 60) < 8);
   const outsideClockingRecords = records.filter((record) => record?.clockedOutSide || record?.outsideLocation);
   const missingClockOut = records.filter((record) => !record.clock_out);
@@ -737,7 +740,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
     const userRecords = recordGroups[user.email] || [];
     const uniqueDays = new Set(userRecords.map((entry) => getNairobiDateKey(entry.clock_in)).filter(Boolean));
     acc[key].present += uniqueDays.size;
-    acc[key].late += userRecords.filter((entry) => entry.isLate).length;
+    acc[key].late += userRecords.filter((entry) => entry.clock_in && !isClockInOnTimeByPolicy(entry.clock_in, attendancePolicy)).length;
     acc[key].hours += userRecords.reduce((sum, entry) => {
       if (!entry.clock_out) return sum;
       return sum + (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60);
@@ -765,7 +768,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
         if (!entry.clock_out) return sum;
         return sum + (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60);
       }, 0);
-      const lateCount = userRecords.filter((entry) => entry.isLate).length;
+      const lateCount = userRecords.filter((entry) => entry.clock_in && !isClockInOnTimeByPolicy(entry.clock_in, attendancePolicy)).length;
       return {
         name: user.name,
         email: user.email,
@@ -805,7 +808,7 @@ const buildAnalyticsView = async (view, context, query = {}) => {
       absentToday: absentCount,
       onLeave: onLeaveCount,
       attendanceRate: totalStaff ? Number((presentCount / totalStaff) * 100).toFixed(1) : 0,
-      punctualityRate: totalStaff ? Number(((presentCount - lateRecords.length) / Math.max(presentCount, 1)) * 100).toFixed(1) : 0,
+      punctualityRate: clockInCount ? Number((onTimeClockIns / clockInCount) * 100).toFixed(1) : 0,
       averageWorkingHours: records.length ? Number(records.reduce((sum, entry) => sum + (entry.clock_out ? (new Date(entry.clock_out) - new Date(entry.clock_in)) / (1000 * 60 * 60) : 0), 0) / records.length).toFixed(1) : 0,
       totalOvertime: Number(records.reduce((sum, entry) => {
         if (!entry.clock_out) return sum;
@@ -3318,6 +3321,37 @@ const parseAttendanceTime = (timeString, referenceDate = new Date()) => {
   return new Date(referenceDate.getFullYear(), referenceDate.getMonth(), referenceDate.getDate(), hours, minutes, 0, 0);
 };
 
+const getAttendanceDeadlineForClockIn = (clockIn, attendancePolicy = {}) => {
+  if (!clockIn) return null;
+  const clockInDate = new Date(clockIn);
+  if (Number.isNaN(clockInDate.getTime())) return null;
+
+  const [hoursValue, minutesValue] = String(attendancePolicy.standardClockIn || "08:00")
+    .split(":")
+    .map((value) => Number(value));
+  const hours = Number.isFinite(hoursValue) ? hoursValue : 8;
+  const minutes = Number.isFinite(minutesValue) ? minutesValue : 0;
+  const graceMinutes = Number(attendancePolicy.gracePeriodMinutes ?? 15);
+  const parts = getNairobiDateParts(clockInDate);
+  const standardClockIn = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, hours - EAT_UTC_OFFSET_HOURS, minutes, 0, 0));
+
+  return new Date(standardClockIn.getTime() + (Number.isFinite(graceMinutes) ? graceMinutes : 15) * 60 * 1000);
+};
+
+const isClockInOnTimeByPolicy = (clockIn, attendancePolicy = {}) => {
+  const clockInDate = new Date(clockIn);
+  const deadline = getAttendanceDeadlineForClockIn(clockInDate, attendancePolicy);
+  if (!deadline || Number.isNaN(clockInDate.getTime())) return false;
+  return clockInDate <= deadline;
+};
+
+const getLateMinutesByPolicy = (clockIn, attendancePolicy = {}) => {
+  const clockInDate = new Date(clockIn);
+  const deadline = getAttendanceDeadlineForClockIn(clockInDate, attendancePolicy);
+  if (!deadline || Number.isNaN(clockInDate.getTime())) return 0;
+  return Math.max(0, (clockInDate - deadline) / (1000 * 60));
+};
+
 const getAttendancePolicy = async () => {
   const cfg = await PlatformConfig.getSingleton();
   return cfg.attendancePolicy || {};
@@ -4989,6 +5023,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const workingDateSet = new Set(workingDateKeys);
     const todayIsWorkingDay = (await getWorkingDateKeysInRange(startToday, endToday)).includes(today);
     const workingRecords = records.filter((record) => workingDateSet.has(getNairobiDateKey(record.clock_in)));
+    const config = await PlatformConfig.getSingleton();
+    const attendancePolicy = config.attendancePolicy || {};
 
     const totalEmployees = users.length;
     const activeEmployeesToday = todayIsWorkingDay ? new Set(todayRecords.map(r => r.email)).size : 0;
@@ -5012,7 +5048,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
         return formatTodayUser(user, {
           clockIn: record.clock_in,
           clockOut: record.clock_out,
-          isLate: Boolean(record.isLate),
+          isLate: !isClockInOnTimeByPolicy(record.clock_in, attendancePolicy),
         });
       }),
       absent: users
@@ -5038,13 +5074,9 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const totalPresentDays = Object.values(presentDaysMap).reduce((sum, set) => sum + set.size, 0);
     const attendanceRate = totalEmployees > 0 ? (totalPresentDays / (totalEmployees * workingDays)) * 100 : 0;
 
-    // Punctuality: early vs late (based on isLate flag)
-    let earlyCount = 0, lateCount = 0;
-    workingRecords.forEach(r => {
-      if (r.isLate) lateCount++;
-      else earlyCount++;
-    });
-    const punctualityRate = (earlyCount + lateCount) > 0 ? (earlyCount / (earlyCount + lateCount)) * 100 : 0;
+    // Punctuality: clock-in time against configured start time and grace period.
+    const onTimeClockIns = workingRecords.filter((record) => isClockInOnTimeByPolicy(record.clock_in, attendancePolicy)).length;
+    const punctualityRate = workingRecords.length > 0 ? (onTimeClockIns / workingRecords.length) * 100 : 0;
 
     // Productivity index: average hours per employee (capped at 8h/day)
     let totalHours = 0;
@@ -5066,7 +5098,6 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
     const averageWorkingHours = workingRecords.length > 0 ? totalClockedHours / workingRecords.length : 0;
 
     // For filters dropdown
-    const config = await PlatformConfig.getSingleton();
     const allDepartments = config.departments || [];
     const allStations = config.stations.filter(s => s.active).map(s => s.name);
 
@@ -5126,6 +5157,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
     ]);
 
     const workingDateKeys = await getWorkingDateKeysInRange(start, end);
+    const attendancePolicy = await getAttendancePolicy();
     const totalStaff = users.length;
     const dailyMap = workingDateKeys.reduce((acc, dateKey) => {
       acc[dateKey] = {
@@ -5141,7 +5173,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/trends`, async (req, res) =>
       const key = getNairobiDateKey(record.clock_in);
       if (!dailyMap[key]) return;
       if (record.email) dailyMap[key].presentEmails.add(record.email);
-      if (record.isLate && record.email) dailyMap[key].lateEmails.add(record.email);
+      if (!isClockInOnTimeByPolicy(record.clock_in, attendancePolicy) && record.email) dailyMap[key].lateEmails.add(record.email);
     });
 
     leaveRecords.forEach((leave) => {
@@ -5257,25 +5289,25 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     }
 
     const records = await Clocking.find(buildClockingRecordQuery({ emails, start, end, clockingType }));
+    const attendancePolicy = await getAttendancePolicy();
 
     // Employees late today
     const today = getNairobiDateKey(new Date());
     const { start: todayStart, end: todayEnd } = getSafeDateRange(today, today);
-    const lateToday = await Clocking.find(buildClockingRecordQuery({
+    const todayRecords = await Clocking.find(buildClockingRecordQuery({
       emails,
       start: todayStart,
       end: todayEnd,
       clockingType,
-      extra: { isLate: true },
     }));
+    const lateToday = todayRecords.filter((record) => !isClockInOnTimeByPolicy(record.clock_in, attendancePolicy));
     const employeesLateToday = new Set(lateToday.map(r => r.email)).size;
 
-    // Average lateness (minutes) – assume late means clock_in > 8:00 AM
+    // Average lateness from actual clock-in time against configured policy.
     let totalLateMinutes = 0, lateCount = 0;
     records.forEach(r => {
-      if (r.isLate) {
-        const hours = getNairobiHourDecimal(r.clock_in);
-        const lateMins = Math.max(0, (hours - 8) * 60);
+      const lateMins = getLateMinutesByPolicy(r.clock_in, attendancePolicy);
+      if (lateMins > 0) {
         totalLateMinutes += lateMins;
         lateCount++;
       }
@@ -5287,9 +5319,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     records.forEach(r => {
       const dept = userDeptMap[r.email] || 'Unknown';
       if (!deptLateMap[dept]) deptLateMap[dept] = { total: 0, count: 0 };
-      if (r.isLate) {
-        const hours = getNairobiHourDecimal(r.clock_in);
-        const mins = Math.max(0, (hours - 8) * 60);
+      const mins = getLateMinutesByPolicy(r.clock_in, attendancePolicy);
+      if (mins > 0) {
         deptLateMap[dept].total += mins;
         deptLateMap[dept].count++;
       }
@@ -5304,7 +5335,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     // Late by weekday
     const weekdayMap = { Mon: 0, Tue: 0, Wed: 0, Thu: 0, Fri: 0 };
     records.forEach(r => {
-      if (r.isLate) {
+      if (!isClockInOnTimeByPolicy(r.clock_in, attendancePolicy)) {
         const day = getNairobiWeekdayName(r.clock_in);
         if (weekdayMap[day] !== undefined) weekdayMap[day]++;
       }
@@ -5314,7 +5345,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/late-arrivals`, async (req, 
     // Late by department
     const deptLateCount = {};
     records.forEach(r => {
-      if (r.isLate) {
+      if (!isClockInOnTimeByPolicy(r.clock_in, attendancePolicy)) {
         const dept = userDeptMap[r.email] || 'Unknown';
         deptLateCount[dept] = (deptLateCount[dept] || 0) + 1;
       }
@@ -5727,6 +5758,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
     const workingDateKeys = await getWorkingDateKeysInRange(start, end);
     const workingDateSet = new Set(workingDateKeys);
     const workingDays = workingDateKeys.length;
+    const attendancePolicy = await getAttendancePolicy();
     const deptStats = {};
 
     // Initialize departments from all users
@@ -5736,6 +5768,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
         staffCount: 0,
         presentDays: new Set(),
         totalLate: 0,
+        totalOnTime: 0,
+        totalClockIns: 0,
       };
     });
 
@@ -5753,7 +5787,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
       const dept = deptMap[email] || 'Unassigned';
       if (!deptStats[dept]) return;
       deptStats[dept].presentDays.add(`${email}:${dateKey}`);
-      if (r.isLate) deptStats[dept].totalLate++;
+      deptStats[dept].totalClockIns++;
+      if (isClockInOnTimeByPolicy(r.clock_in, attendancePolicy)) {
+        deptStats[dept].totalOnTime++;
+      } else {
+        deptStats[dept].totalLate++;
+      }
     });
 
     const leaveDaysByDept = countApprovedLeaveDaysByGroup(leaveRecords, deptMap, workingDateKeys);
@@ -5766,7 +5805,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
       const maxPossibleDays = staff * workingDays;
       const absentDays = Math.max(maxPossibleDays - presentDays - onLeaveDays, 0);
       const attendanceRate = maxPossibleDays > 0 ? (presentDays / maxPossibleDays) * 100 : 0;
-      const latenessRate = staff > 0 ? (deptStats[dept].totalLate / staff) : 0; // average late per staff
+      const punctualityRate = deptStats[dept].totalClockIns > 0 ? (deptStats[dept].totalOnTime / deptStats[dept].totalClockIns) * 100 : 0;
+      const latenessRate = deptStats[dept].totalClockIns > 0 ? (deptStats[dept].totalLate / deptStats[dept].totalClockIns) * 100 : 0;
       const absenteeismRate = maxPossibleDays > 0 ? (absentDays / maxPossibleDays) * 100 : 0;
       return {
         department: dept,
@@ -5776,6 +5816,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
         onLeaveDays,
         totalLateCount: deptStats[dept].totalLate,
         attendanceRate: parseFloat(attendanceRate.toFixed(1)),
+        punctualityRate: parseFloat(punctualityRate.toFixed(1)),
         latenessRate: parseFloat(latenessRate.toFixed(1)),
         absenteeismRate: parseFloat(absenteeismRate.toFixed(1))
       };
@@ -5797,7 +5838,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
 
     // Build user filter – includes department if provided
     const userFilter = buildAnalyticsUserFilter(context, { department, station, role, rank });
-    const users = await User.find(userFilter, 'email name station department');
+    const users = await User.find(userFilter, 'email name employeeId station department');
     const emailStationMap = {};
     users.forEach((user) => {
       emailStationMap[String(user.email || "").toLowerCase()] = user.station || "Unassigned";
@@ -5854,6 +5895,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
     const workingDateKeys = await getWorkingDateKeysInRange(start, end);
     const workingDateSet = new Set(workingDateKeys);
     const workingDays = workingDateKeys.length;
+    const attendancePolicy = await getAttendancePolicy();
 
     // Per‑station aggregation
     const stationStats = {};
@@ -5865,6 +5907,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
         totalHours: 0,
         totalOvertime: 0,
         lateCount: 0,
+        onTimeCount: 0,
+        totalClockIns: 0,
         presentDays: new Set(),
         employeeMetrics: {},
       };
@@ -5897,8 +5941,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
         if (hours > 9) metric.totalOvertime += (hours - 9);
       }
 
-      // Late count
-      if (r.isLate) metric.lateCount++;
+      metric.totalClockIns++;
+      if (isClockInOnTimeByPolicy(r.clock_in, attendancePolicy)) {
+        metric.onTimeCount++;
+      } else {
+        metric.lateCount++;
+      }
     });
 
     const leaveDaysByStation = countApprovedLeaveDaysByGroup(leaveRecords, emailStationMap, workingDateKeys);
@@ -5919,8 +5967,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
       // Overtime per employee
       const avgOvertime = staffCount > 0 ? stats.totalOvertime / staffCount : 0;
 
-      // Lateness rate: average late per employee
-      const latenessRate = staffCount > 0 ? (stats.lateCount / staffCount) : 0;
+      const punctualityRate = stats.totalClockIns > 0 ? (stats.onTimeCount / stats.totalClockIns) * 100 : 0;
+      const latenessRate = stats.totalClockIns > 0 ? (stats.lateCount / stats.totalClockIns) * 100 : 0;
 
       const absenteeismRate = maxPossibleDays > 0 ? (absentDays / maxPossibleDays) * 100 : 0;
 
@@ -5941,6 +5989,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
           return {
             name: employee.name || employee.email,
             email: employee.email,
+            employeeId: employee.employeeId || "",
             station: st,
             department: employee.department || "Unassigned",
             presentDays,
@@ -5951,7 +6000,11 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
         .sort((a, b) => {
           const rateDiff = Number(b.attendanceRate || 0) - Number(a.attendanceRate || 0);
           if (rateDiff !== 0) return rateDiff;
-          return Number(b.hours || 0) - Number(a.hours || 0);
+          const hoursDiff = Number(b.hours || 0) - Number(a.hours || 0);
+          if (hoursDiff !== 0) return hoursDiff;
+          const nameDiff = String(a.name || "").localeCompare(String(b.name || ""), undefined, { numeric: true, sensitivity: "base" });
+          if (nameDiff !== 0) return nameDiff;
+          return String(a.employeeId || "").localeCompare(String(b.employeeId || ""), undefined, { numeric: true, sensitivity: "base" });
         })
         .slice(0, 5);
 
@@ -5963,6 +6016,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
         absentDays,
         onLeaveDays,
         attendanceRate: parseFloat(attendanceRate.toFixed(1)),
+        punctualityRate: parseFloat(punctualityRate.toFixed(1)),
         latenessRate: parseFloat(latenessRate.toFixed(1)),
         absenteeismRate: parseFloat(absenteeismRate.toFixed(1)),
         averageWorkingHours: parseFloat(avgHours.toFixed(1)),
@@ -6110,6 +6164,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
     // get config for stations and depart from platform config
     const config = await PlatformConfig.getSingleton();
+    const attendancePolicy = config.attendancePolicy || {};
 
     const now = new Date();
     const startOfMonth = getNairobiMonthStart(now);
@@ -6241,7 +6296,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
         );
       }
 
-      if (rec.isLate) stats.employeeMetrics[email].lateCount++;
+      const isLateByTime = !isClockInOnTimeByPolicy(rec.clock_in, attendancePolicy);
+      if (isLateByTime) stats.employeeMetrics[email].lateCount++;
       else stats.employeeMetrics[email].earlyCount++;
 
       // -----------------------------------
@@ -6253,7 +6309,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
       stationObj.totalHours += hoursWorked;
       stationObj.totalCheckins++;
       stationObj.staffSet.add(email);
-      if (rec.isLate) stationObj.lateCount++;
+      if (isLateByTime) stationObj.lateCount++;
 
       if (hoursWorked > 9) {
         stationObj.totalOvertime += hoursWorked - 9;
@@ -6267,7 +6323,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/stats`, async (req, res) => {
 
       deptObj.totalHours += hoursWorked;
       deptObj.staffSet.add(email);
-      if (rec.isLate) deptObj.lateCount++;
+      if (isLateByTime) deptObj.lateCount++;
 
       if (hoursWorked > 9) {
         deptObj.totalOvertime += hoursWorked - 9;
@@ -6609,6 +6665,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
     attendanceQuery.email = {
       $in: users.map((u) => u.email)
     };
+    const attendancePolicy = await getAttendancePolicy();
 
     //----------------------------------------------------
     // Fetch Attendance Records
@@ -6618,7 +6675,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       ...attendanceQuery,
       ...buildClockingTypeRecordFilter(clockingType),
     })
-      .sort({ name: 1, clock_in: -1 })
+      .sort({ name: 1, employeeId: 1, clock_in: -1 })
       .lean();
 
     //----------------------------------------------------
@@ -6635,6 +6692,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 
         employeeId: user.employeeId || "",
 
+        isLate: !isClockInOnTimeByPolicy(record.clock_in, attendancePolicy),
+
         role: user.role || "",
 
         name: user.name || record.name,
@@ -6647,6 +6706,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 
       };
 
+    }).sort((a, b) => {
+      const nameDiff = String(a.name || "").localeCompare(String(b.name || ""), undefined, { numeric: true, sensitivity: "base" });
+      if (nameDiff !== 0) return nameDiff;
+      const idDiff = String(a.employeeId || "").localeCompare(String(b.employeeId || ""), undefined, { numeric: true, sensitivity: "base" });
+      if (idDiff !== 0) return idDiff;
+      return new Date(b.clock_in || 0) - new Date(a.clock_in || 0);
     })
 
     res.status(200).json(mergedRecords);
@@ -6731,7 +6796,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/summary`, async (req, res) => {
       station
       department
       `
-    ).lean().sort({ name: 1, clock_in: -1 });
+    ).sort({ name: 1, employeeId: 1 }).lean();
 
     //---------------------------------------------------------
     // Attendance Records
