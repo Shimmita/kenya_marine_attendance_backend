@@ -1441,7 +1441,13 @@ const syncUserDeviceFlags = async (user) => {
 
 const ensureSinglePrimaryDevice = async (email) => {
   const activeDevices = await getActiveUserDevices(email);
-  if (!activeDevices.length) return [];
+  if (!activeDevices.length) {
+    await Devices.updateMany(
+      { user_email: email },
+      { $set: { device_primary: false } }
+    );
+    return [];
+  }
 
   const primaryDevice =
     activeDevices.find((device) => device.device_primary) || activeDevices[0];
@@ -1456,6 +1462,84 @@ const ensureSinglePrimaryDevice = async (email) => {
   );
 
   return getActiveUserDevices(email);
+};
+
+const removeDeviceAuthenticator = (user, deviceFingerprint = "", removeUnscopedAuthenticator = false) => {
+  const fingerprint = String(deviceFingerprint || "");
+  if (!fingerprint) return;
+
+  user.authenticators = getUserAuthenticators(user).filter(
+    (authenticator) => {
+      const authenticatorFingerprint =
+        getAuthenticatorDeviceFingerprint(authenticator);
+
+      if (authenticatorFingerprint === fingerprint) return false;
+      if (removeUnscopedAuthenticator && !authenticatorFingerprint) return false;
+
+      return true;
+    }
+  );
+  user.authenticator = undefined;
+};
+
+const ensureLostDeviceRequestIndexes = async () => {
+  try {
+    const indexes = await DeviceLost.collection.indexes();
+    const deviceFingerprintIndex = indexes.find(
+      (index) =>
+        index.unique &&
+        index.key &&
+        Object.keys(index.key).length === 1 &&
+        index.key.device_fingerprint === 1
+    );
+
+    if (deviceFingerprintIndex?.name) {
+      await DeviceLost.collection.dropIndex(deviceFingerprintIndex.name);
+      console.log(`Dropped legacy unique lost-device index: ${deviceFingerprintIndex.name}`);
+    }
+  } catch (err) {
+    console.warn("Lost-device index cleanup skipped:", err.message);
+  }
+};
+
+const attachLostDeviceRequestDeviceInfo = async (requests = []) => {
+  if (!requests.length) return requests;
+
+  const deviceFingerprints = [
+    ...new Set(requests.map((request) => request.device_fingerprint).filter(Boolean)),
+  ];
+  const userEmails = [
+    ...new Set(requests.map((request) => request.user_email).filter(Boolean)),
+  ];
+
+  if (!deviceFingerprints.length || !userEmails.length) {
+    return requests;
+  }
+
+  const devices = await Devices.find({
+    user_email: { $in: userEmails },
+    device_fingerprint: { $in: deviceFingerprints },
+  })
+    .select("device_name device_os device_browser device_primary device_lost device_fingerprint user_email")
+    .lean();
+
+  const deviceByOwnerAndFingerprint = new Map(
+    devices.map((device) => [
+      `${device.user_email}|${device.device_fingerprint}`,
+      device,
+    ])
+  );
+
+  return requests.map((request) => {
+    const device = deviceByOwnerAndFingerprint.get(
+      `${request.user_email}|${request.device_fingerprint}`
+    );
+
+    return {
+      ...request,
+      device: device || null,
+    };
+  });
 };
 
 const getCurrentTime = () => new Date();
@@ -1507,6 +1591,8 @@ mongoose
     console.log(
       `Connected to MongoDB (${environment === "SANDBOX" ? "LOCAL" : "CLOUD"})`
     );
+
+    await ensureLostDeviceRequestIndexes();
 
     /*
     |--------------------------------------------------------------------------
@@ -2977,6 +3063,16 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     const maxUserDevices = await getMaxUserDevices();
 
     if (deviceFingerprint) {
+      const existingLostDevice = await Devices.findOne({
+        user_email: user.email,
+        device_fingerprint: deviceFingerprint,
+        device_lost: true,
+      });
+
+      if (existingLostDevice) {
+        throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
+      }
+
       const existingOtherDevice = await Devices.findOne({
         device_fingerprint: deviceFingerprint,
         user_email: { $ne: user.email },
@@ -3086,9 +3182,14 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
 
     if (!verification.verified) return res.status(400).json({ registered: false });
 
-    const { credential } = verification.registrationInfo;
-    const activeDevices = await getActiveUserDevices(user.email);
-    const maxUserDevices = await getMaxUserDevices();
+	    const { credential } = verification.registrationInfo;
+	    const activeDevices = await getActiveUserDevices(user.email);
+	    const maxUserDevices = await getMaxUserDevices();
+    const existingLostDevice = await Devices.findOne({
+      user_email: user.email,
+      device_fingerprint,
+      device_lost: true,
+    });
     const existingOwnDevice = activeDevices.find(
       (deviceRecord) => deviceRecord.device_fingerprint === device_fingerprint
     );
@@ -3099,6 +3200,10 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
 
     if (existingOtherDevice) {
       throw new Error("This device is already enrolled by another account.");
+    }
+
+    if (existingLostDevice) {
+      throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
     }
 
     if (!existingOwnDevice && activeDevices.length >= maxUserDevices) {
@@ -7227,7 +7332,7 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
 
     const { description, startDate, endDate, device_fingerprint } = req.body;
 
-    if (!description || !startDate || !endDate)
+    if (!description || !startDate || !endDate || !device_fingerprint)
       throw new Error("All fields are required");
 
 
@@ -7251,8 +7356,8 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
     const formattedRole = role.charAt(0).toUpperCase() + role.slice(1);
 
 
-    const message = `Hello Admin Team, ${formattedRole} ${name} (Phone: ${phone} and Email: ${email}) from ${stationName} - ${department} department has reported a lost device. 
-Please navigate to the lost device section to review this case and resolve the issue by deregistering the stolen device from the system for security reasons.`;
+    const message = `Hello Admin Team, ${formattedRole} ${name} (Phone: ${phone} and Email: ${email}) from ${stationName} - ${department} department has reported a lost device.
+Please navigate to the lost device section to review this case. Approval will mark the reported device as lost, block it from clocking, and free one active device slot for replacement enrollment.`;
 
     const userDevices = await Devices.find({ user_email: user.email })
 
@@ -7270,6 +7375,10 @@ Please navigate to the lost device section to review this case and resolve the i
     );
     if (!reportedDevice) {
       throw new Error("Selected device is not enrolled on your profile.");
+    }
+
+    if (reportedDevice.device_lost) {
+      throw new Error("This device is already marked as lost.");
     }
 
     const lostRequest = await DeviceLost.create({
@@ -7335,9 +7444,10 @@ app.get(`${BASE_ROUTE}/device/lost/all`, async (req, res) => {
       return res.status(403).json({ message: "Access denied" });
 
     const requests = await DeviceLost.find()
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
-    res.json(requests);
+    res.json(await attachLostDeviceRequestDeviceInfo(requests));
 
   } catch (err) {
     console.error("Fetch lost requests error:", err);
@@ -7361,8 +7471,9 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
       return res.status(403).json({ message: "Access denied" });
 
     const { requestId, action } = req.body;
+    const normalizedAction = action === "success" ? "granted" : action;
 
-    if (!["granted", "rejected", "success"].includes(action))
+    if (!["granted", "rejected"].includes(normalizedAction))
       throw new Error("Invalid action");
 
     const request = await DeviceLost.findById(requestId);
@@ -7371,31 +7482,33 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     if (request.status !== "pending")
       throw new Error("Request already processed");
 
-    request.status = action;
+    request.status = normalizedAction;
     request.responded = responder.rank;
-    await request.save();
 
     const affectedUser = await User.findOne({ email: request.user_email });
     if (!affectedUser) throw new Error("User not found");
 
-    if (action === "granted" || action === "success") {
+    if (normalizedAction === "granted") {
       const reportedDevice = await Devices.findOne({
         user_email: affectedUser.email,
         device_fingerprint: request.device_fingerprint,
       });
 
-      await Devices.deleteOne({
-        user_email: affectedUser.email,
-        device_fingerprint: request.device_fingerprint,
-      });
+      if (!reportedDevice) {
+        throw new Error("Reported device is no longer enrolled on this user profile.");
+      }
 
-      const authenticators = getUserAuthenticators(affectedUser).filter(
-        (authenticator) =>
-          authenticator.deviceFingerprint !== request.device_fingerprint &&
-          !(reportedDevice?.device_primary && !authenticator.deviceFingerprint)
+      const reportedDeviceWasPrimary = reportedDevice.device_primary;
+
+      reportedDevice.device_lost = true;
+      reportedDevice.device_primary = false;
+      await reportedDevice.save();
+
+      removeDeviceAuthenticator(
+        affectedUser,
+        request.device_fingerprint,
+        reportedDeviceWasPrimary
       );
-      affectedUser.authenticators = authenticators;
-      affectedUser.authenticator = undefined;
       affectedUser.deviceLost = false;
 
       await ensureSinglePrimaryDevice(affectedUser.email);
@@ -7405,23 +7518,25 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
       await affectedUser.save();
     }
 
+    await request.save();
+
     // update the admin message
     const messageAdmin = await MessageAdmin.findOne({ device_fingerprint: request.device_fingerprint })
     if (messageAdmin) {
-      messageAdmin.status = action
+      messageAdmin.status = normalizedAction
       messageAdmin.responded = responder.rank
       messageAdmin.respondedName = responder.name
       await messageAdmin.save()
     }
 
-    const message = generateAdminResponse(affectedUser, responder, action)
+    const message = generateAdminResponse(affectedUser, responder, normalizedAction)
 
     // send message notification to the user (specific email)
     await MessageUser.create({
       label: 'none',
       message,
       title: "Lost Device Request",
-      status: action,
+      status: normalizedAction,
       user_email: affectedUser.email
     })
 
@@ -7434,13 +7549,13 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
       target: affectedUser,
       metadata: {
         requestId: request._id.toString(),
-        response: action,
+        response: normalizedAction,
         deviceFingerprint: request.device_fingerprint,
       },
     });
 
     res.json({
-      message: `Request ${action} successfully`,
+      message: `Request ${normalizedAction} successfully`,
       data: request
     });
 
@@ -7471,34 +7586,38 @@ app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
     }
 
 
-    const existingDevice = await Devices.findOne({
-      device_fingerprint
-    });
+	    const existingDevice = await Devices.findOne({
+	      device_fingerprint
+	    });
 
 
-    if (existingDevice)
-      throw new Error("device alreday registered in the system!");
+	    if (existingDevice) {
+	      if (existingDevice.user_email === user.email && existingDevice.device_lost) {
+	        throw new Error("This device is marked as lost and cannot be added again. Please use your replacement device.");
+	      }
 
-    const newDevice = await Devices.create({
-      device_name,
-      user_email: user.email,
-      device_os,
-      device_browser,
-      device_primary: true,
-      device_lost: false,
-      device_fingerprint
-    });
+	      throw new Error("Device already registered in the system.");
+	    }
 
-    // list devices linked to the email, if two or more then user has multiple devices
-    const currentUserDevices = await Devices.find({
-      user_email: user.email
-    }).sort({ createdAt: -1 });
+	    const activeDevices = await getActiveUserDevices(user.email);
+	    const maxUserDevices = await getMaxUserDevices();
 
-    // user has mu
-    if (currentUserDevices.length > 1) {
-      user.hasDevices = true;
-      await user.save();
-    }
+	    if (activeDevices.length >= maxUserDevices) {
+	      throw new Error(`You can only enroll up to ${maxUserDevices} devices. Report a lost device or contact admin to clear one.`);
+	    }
+
+	    const newDevice = await Devices.create({
+	      device_name,
+	      user_email: user.email,
+	      device_os,
+	      device_browser,
+	      device_primary: activeDevices.length === 0,
+	      device_lost: false,
+	      device_fingerprint
+	    });
+
+	    await ensureSinglePrimaryDevice(user.email);
+	    await syncUserDeviceFlags(user);
 
     res.json({
       message: "New device added successfully",
@@ -7546,9 +7665,9 @@ app.get(`${BASE_ROUTE}/device/lost/my-requests`, async (req, res) => {
 
     const requests = await DeviceLost.find({
       user_email: user.email
-    }).sort({ createdAt: -1 });
+    }).sort({ createdAt: -1 }).lean();
 
-    res.json(requests);
+    res.json(await attachLostDeviceRequestDeviceInfo(requests));
 
   } catch (err) {
     console.error("Fetch my lost requests error:", err);
@@ -7735,12 +7854,14 @@ app.post(`${BASE_ROUTE}/user/signout`, async (req, res) => {
 function generateAdminResponse(userTo, responder, action) {
   const adminSignature = `${responder?.name} | ${responder?.rank}`;
 
-  if (action === "granted" || action === "success") {
-    return `Dear ${userTo?.name},
+	  if (action === "granted" || action === "success") {
+	    return `Dear ${userTo?.name},
 
-Your request regarding the lost device has been successfully processed and the device has been deregistered from the system for security purposes.
+	Your lost-device request has been approved. The reported device has been marked as lost and blocked from clocking for security purposes.
 
-If you find the device, please contact the IT department immediately.
+	You may now enrol a replacement device if you have an available active-device slot.
+
+	If you find the device, please contact the IT department immediately.
 
 Best regards, 
 ${adminSignature} 
