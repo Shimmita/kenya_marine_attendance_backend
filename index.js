@@ -3314,6 +3314,61 @@ const parseOptionalBoolean = (value) => {
   return null;
 };
 
+const IN_PREMISE_LOCATION_LABEL = "In Premise";
+const GENERIC_OUTSIDE_LOCATION_LABELS = new Set([
+  "off premise",
+  "off-premise",
+  "outside premise",
+  "outside premises",
+  "unknown",
+]);
+
+const normalizeClockingLocationName = (value) => {
+  const locationName = String(value || "").trim();
+  if (!locationName) return "";
+
+  const normalized = locationName.toLowerCase().replace(/\s+/g, " ");
+  if (GENERIC_OUTSIDE_LOCATION_LABELS.has(normalized)) return "";
+
+  return locationName;
+};
+
+const isInPremiseLocationName = (value) =>
+  /^in[-\s]?premise$/i.test(String(value || "").trim());
+
+const resolveClockingLocationName = ({
+  locationName,
+  withinPremise,
+  outsideLocation,
+} = {}) => {
+  if (withinPremise === true) return IN_PREMISE_LOCATION_LABEL;
+
+  const primaryName = normalizeClockingLocationName(locationName);
+
+  if (withinPremise === false) {
+    if (primaryName && !isInPremiseLocationName(primaryName)) return primaryName;
+    return normalizeClockingLocationName(outsideLocation);
+  }
+
+  if (primaryName) return primaryName;
+
+  return String(locationName || "").trim();
+};
+
+const normalizeClockingLocationFields = (record = {}) => ({
+  ...record,
+  clockInLocationName: resolveClockingLocationName({
+    locationName: record.clockInLocationName,
+    withinPremise: record.clockInWithinPremise,
+    outsideLocation: record.outsideLocation,
+  }),
+  clockOutLocationName: resolveClockingLocationName({
+    locationName: record.clockOutLocationName,
+    withinPremise: record.clockOutWithinPremise,
+    outsideLocation: record.outsideLocation,
+  }),
+});
+
 const parseAttendanceTime = (timeString, referenceDate = new Date()) => {
   if (!timeString || typeof timeString !== 'string') return null;
   const [hours, minutes] = timeString.split(':').map((value) => Number(value));
@@ -4280,16 +4335,29 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           ? Boolean(outsideLocation)
           : !withinPremiseFromClient;
 
+      const outsidePlaceName =
+        normalizeClockingLocationName(outsideLocation);
+
       clockingData.clockInWithinPremise =
         !clockInOutsidePremise;
 
-      if (canClockOutsideNow && clockInOutsidePremise) {
+      if (!clockInOutsidePremise) {
+        clockingData.clockInLocationName =
+          IN_PREMISE_LOCATION_LABEL;
+      }
+      else if (!canClockOutsideNow) {
+        throw new Error("You are outside the station premises and are not currently authorized to clock outside.");
+      }
+      else {
+        if (!outsidePlaceName) {
+          throw new Error("Outside clocking place could not be resolved. Please refresh your location and try again.");
+        }
 
         clockingData.outsideLocation =
-          outsideLocation || "";
+          outsidePlaceName;
 
         clockingData.clockInLocationName =
-          outsideLocation || "";
+          outsidePlaceName;
 
         clockingData.clockedOutSide =
           true;
@@ -4302,22 +4370,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           true;
 
         verifyResultMeta.outsideLocation =
-          outsideLocation || null;
-      }
-      else if (outsideLocation) {
-
-        console.debug(
-          "outsideLocation provided but user not authorized",
-          {
-            email: user.email,
-
-            canClockOutside:
-              user.canClockOutside,
-
-            outsideClockingDetails:
-              user.outsideClockingDetails,
-          }
-        );
+          outsidePlaceName;
       }
 
 
@@ -4498,19 +4551,31 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           ? Boolean(outsideLocation)
           : !withinPremiseFromClient;
 
+      const outsidePlaceName =
+        normalizeClockingLocationName(outsideLocation);
+
       latestClocking.clockOutWithinPremise =
         !clockOutOutsidePremise;
 
 
-      if (canClockOutsideNow && clockOutOutsidePremise) {
+      if (!clockOutOutsidePremise) {
+        latestClocking.clockOutLocationName =
+          IN_PREMISE_LOCATION_LABEL;
+      }
+      else if (!canClockOutsideNow) {
+        throw new Error("You are outside the station premises and are not currently authorized to clock outside.");
+      }
+      else {
+        if (!outsidePlaceName) {
+          throw new Error("Outside clocking place could not be resolved. Please refresh your location and try again.");
+        }
 
         latestClocking.clockOutLocationName =
-          outsideLocation || "";
+          outsidePlaceName;
 
         latestClocking.outsideLocation =
           latestClocking.outsideLocation ||
-          outsideLocation ||
-          "";
+          outsidePlaceName;
 
         latestClocking.clockedOutSide =
           true;
@@ -4524,23 +4589,8 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
           true;
 
         verifyResultMeta.outsideLocation =
-          outsideLocation || null;
+          outsidePlaceName;
 
-      }
-      else if (outsideLocation) {
-
-        console.debug(
-          "outsideLocation provided at clock-out but user not authorized",
-          {
-            email: user.email,
-
-            canClockOutside:
-              user.canClockOutside,
-
-            outsideClockingDetails:
-              user.outsideClockingDetails,
-          }
-        );
       }
 
 
@@ -4811,11 +4861,13 @@ app.get(`${BASE_ROUTE}/user/attendance/history`, async (req, res) => {
 
     const limit = parseInt(req.query.limit) || 0;
     if (limit == 0) {
-      const clockingData = await Clocking.find({ email: user.email }).sort({ clock_in: -1 });
+      const clockingData = (await Clocking.find({ email: user.email }).sort({ clock_in: -1 }).lean())
+        .map(normalizeClockingLocationFields);
       res.json(clockingData);
       return;
     } else {
-      const clockingData = await Clocking.find({ email: user.email }).sort({ clock_in: -1 }).limit(limit);
+      const clockingData = (await Clocking.find({ email: user.email }).sort({ clock_in: -1 }).limit(limit).lean())
+        .map(normalizeClockingLocationFields);
       res.json(clockingData);
     }
   } catch (err) {
@@ -6684,11 +6736,13 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
 
     const mergedRecords = records.map((record) => {
 
+      const normalizedRecord = normalizeClockingLocationFields(record);
+
       const user = userLookup[record.email] || {};
 
       return {
 
-        ...record,
+        ...normalizedRecord,
 
         employeeId: user.employeeId || "",
 
