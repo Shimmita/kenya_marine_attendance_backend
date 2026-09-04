@@ -3397,12 +3397,21 @@ const resetOutsideClockingFields = (user) => {
 };
 
 const isOutsideClockingAuthorizedNow = (user, now = new Date()) => {
-  if (!user?.canClockOutside || !user?.outsideClockingDetails) return false;
+  if (!user?.canClockOutside) return false;
 
   try {
-    const start = getNairobiBoundaryForStoredDate(user.outsideClockingDetails.startDate, "startDate", "start");
-    const end = getNairobiBoundaryForStoredDate(user.outsideClockingDetails.endDate, "endDate", "end");
-    return Boolean(start && end && now >= start && now <= end);
+    const details = user.outsideClockingDetails || {};
+    const start = details.startDate
+      ? getNairobiBoundaryForStoredDate(details.startDate, "startDate", "start")
+      : null;
+    const end = details.endDate
+      ? getNairobiBoundaryForStoredDate(details.endDate, "endDate", "end")
+      : null;
+
+    if (start && now < start) return false;
+    if (end && now > end) return false;
+
+    return true;
   } catch (e) {
     console.warn('Outside clocking date validation failed:', e.message);
     return false;
@@ -4429,7 +4438,6 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // ─────────────────────────────────────────────────────────────────────
 
       const canClockOutsideNow =
-        attendancePolicy.allowClockOutsideStation !== false &&
         isOutsideClockingAuthorizedNow(
           user,
           clockingTime
@@ -4645,7 +4653,6 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       // ─────────────────────────────────────────────────────────────────────
 
       const canClockOutsideNow =
-        attendancePolicy.allowClockOutsideStation !== false &&
         isOutsideClockingAuthorizedNow(
           user,
           clockOutTime
