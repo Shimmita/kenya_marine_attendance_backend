@@ -148,7 +148,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-KMFRI-User-Activity"],
   })
 );
 
@@ -1668,9 +1668,10 @@ const SESSION_COOKIE_SAME_SITE = normalizeSameSite(
 );
 const SESSION_TIMEOUT_MINUTES = parsePositiveNumberEnv(
   process.env.SESSION_TIMEOUT_MINUTES,
-  24 * 60
+  20
 );
 const DEFAULT_SESSION_MAX_AGE_MS = SESSION_TIMEOUT_MINUTES * 60 * 1000;
+const SESSION_ACTIVITY_HEADER = "x-kmfri-user-activity";
 const TRUST_PROXY = parsePositiveNumberEnv(process.env.TRUST_PROXY, 1);
 
 app.set("trust proxy", TRUST_PROXY);
@@ -1768,6 +1769,34 @@ const destroyRequestSession = (req, res) =>
     });
   });
 
+const clearActiveSessionForRequest = async (req) => {
+  if (!req.session?.userID) return;
+
+  const user = await User.findById(req.session.userID);
+  if (!user) return;
+
+  if (user.activeSessionId === req.sessionID) {
+    user.activeSessionId = "";
+    user.activeSessionIssuedAt = null;
+    await user.save();
+  }
+};
+
+const parseSessionTimestamp = (value) => {
+  const parsed = value instanceof Date ? value.getTime() : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+};
+
+const requestHasUserActivity = (req) => {
+  const value = String(req.get(SESSION_ACTIVITY_HEADER) || "").trim().toLowerCase();
+  return ["1", "true", "yes"].includes(value);
+};
+
+const setSessionCookieMaxAge = (req, maxAgeMs) => {
+  if (!req.session?.cookie) return;
+  req.session.cookie.maxAge = Math.max(1, Math.ceil(maxAgeMs));
+};
+
 const startAuthenticatedSession = async (req, user) => {
   const previousSessionId = user?.activeSessionId || "";
 
@@ -1801,15 +1830,7 @@ const startAuthenticatedSession = async (req, user) => {
 
 const ensureUserOwnsCurrentSession = async (req, user) => {
   if (!user || !req.sessionID) return false;
-
-  if (!user.activeSessionId) {
-    user.activeSessionId = req.sessionID;
-    user.activeSessionIssuedAt = user.activeSessionIssuedAt || new Date();
-    await user.save();
-    return true;
-  }
-
-  return user.activeSessionId === req.sessionID;
+  return Boolean(user.activeSessionId && user.activeSessionId === req.sessionID);
 };
 
 app.use(async (req, res, next) => {
@@ -1844,6 +1865,8 @@ app.get(`${BASE_ROUTE}/maintenance/status`, async (req, res) => {
     return res.status(500).json({ message: "Failed to load maintenance status." });
   }
 });
+
+app.use(BASE_ROUTE, enforceIdleSessionForAuthenticatedRequests);
 
 app.use(BASE_ROUTE, clearExpiredTemporaryAccountForSession);
 
@@ -3724,6 +3747,75 @@ const isSingleSessionAllowedPath = (req) => {
   if (req.method === "GET" && path === "/superadmin/config") return true;
   return false;
 };
+
+const isIdleSessionPassthroughPath = (req) => {
+  const path = req.path || "";
+  if (path === "/maintenance/status") return true;
+  if (path === "/auth/signin") return true;
+  if (path === "/auth/signin-staff") return true;
+  if (path === "/auth/request-password-reset") return true;
+  if (path === "/notifications/trigger-reminders") return true;
+  if (path === "/user/signout") return true;
+  if (req.method === "GET" && /^\/verify\/[^/]+$/.test(path)) return true;
+  if (req.method === "GET" && path === "/superadmin/config") return true;
+  return false;
+};
+
+async function enforceIdleSessionForAuthenticatedRequests(req, res, next) {
+  try {
+    if (!req.session?.isOnline || !req.session?.userID) return next();
+
+    const sessionTimeoutMs = await getConfiguredSessionMaxAgeMs();
+    const now = Date.now();
+    const lastActivityAt =
+      parseSessionTimestamp(req.session.lastActivityAt) ||
+      parseSessionTimestamp(req.session.loginAt);
+    const isExpired = lastActivityAt > 0 && now - lastActivityAt >= sessionTimeoutMs;
+
+    if (isExpired) {
+      await clearActiveSessionForRequest(req);
+      await destroyRequestSession(req, res);
+
+      if (req.path === "/valid") {
+        return res.status(200).json({
+          valid: false,
+          reason: "session_timeout",
+          code: "SESSION_TIMEOUT",
+          sessionTimeoutMs,
+        });
+      }
+
+      if (isIdleSessionPassthroughPath(req)) {
+        return next();
+      }
+
+      return res.status(401).json({
+        message: "Session expired due to inactivity. Please sign in again.",
+        code: "SESSION_TIMEOUT",
+        sessionTimeoutMs,
+      });
+    }
+
+    if (isIdleSessionPassthroughPath(req)) {
+      if (lastActivityAt > 0) {
+        setSessionCookieMaxAge(req, sessionTimeoutMs - (now - lastActivityAt));
+      }
+      return next();
+    }
+
+    if (requestHasUserActivity(req) || lastActivityAt <= 0) {
+      req.session.lastActivityAt = now;
+      setSessionCookieMaxAge(req, sessionTimeoutMs);
+      await saveSession(req);
+      return next();
+    }
+
+    setSessionCookieMaxAge(req, sessionTimeoutMs - (now - lastActivityAt));
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
 
 async function enforceMaintenanceModeForRequests(req, res, next) {
   try {

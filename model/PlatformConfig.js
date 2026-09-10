@@ -303,7 +303,7 @@ const defaultMasterSettings = {
     requirePasswordResetOnFirstLogin: true,
     maxDevicesPerUser: 2,
     biometricVerificationWindowMinutes: 5,
-    sessionTimeoutMinutes: 1440,
+    sessionTimeoutMinutes: 20,
     enableAuditLogging: true,
 
 };
@@ -691,6 +691,11 @@ platformConfigSchema.statics.getSingleton = async function () {
             changed = true;
         }
         if (applyNestedDefaults(cfg.masterSettings, defaultMasterSettings)) {
+            cfg.markModified('masterSettings');
+            changed = true;
+        }
+        if (Number(cfg.masterSettings?.sessionTimeoutMinutes) === 1440) {
+            cfg.masterSettings.sessionTimeoutMinutes = defaultMasterSettings.sessionTimeoutMinutes;
             cfg.markModified('masterSettings');
             changed = true;
         }
