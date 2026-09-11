@@ -76,6 +76,7 @@ const userSchema = new mongoose.Schema(
 
     // will be set to true if user is allowed to clock out outside the station premises (e.g. for field work)
     canClockOutside: { type: Boolean, default: false },
+    clockingpointActive: { type: Boolean, default: false },
     outsideClockingDetails: {
       startDate: { type: Date, default: null },
       endDate: { type: Date, default: null },

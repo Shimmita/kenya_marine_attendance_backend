@@ -21,6 +21,8 @@ import startAttendanceScheduler, { getAttendanceScheduleTimes, refreshAttendance
 import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
 import Clocking from "./model/Clocking.js";
+import ClockingPoint from "./model/ClockingPoint.js";
+import ClockingPointChallenge from "./model/ClockingPointChallenge.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
 import ExportDocument from "./model/ExportDocument.js";
@@ -1849,7 +1851,7 @@ app.use(async (req, res, next) => {
 
 app.get(`${BASE_ROUTE}/maintenance/status`, async (req, res) => {
   try {
-    const { state } = await syncMaintenanceWindow(null, "status");
+    const { config, state } = await syncMaintenanceWindow(null, "status");
     return res.status(200).json({
       enabled: state.enabled,
       active: state.active,
@@ -1859,6 +1861,13 @@ app.get(`${BASE_ROUTE}/maintenance/status`, async (req, res) => {
       startLabel: state.startLabel,
       endLabel: state.endLabel,
       message: state.message,
+      branding: {
+        organizationName: config?.branding?.organizationName || "Kenya Marine and Fisheries Research Institute",
+        shortName: config?.branding?.shortName || "KMFRI",
+        supportEmail: config?.branding?.supportEmail || "",
+        supportPhone: config?.branding?.supportPhone || "",
+        logoUrl: config?.logoUrl || "",
+      },
     });
   } catch (error) {
     console.error("Maintenance status check failed:", error);
@@ -3683,6 +3692,464 @@ const assertAccountCanClock = (user) => {
   }
 };
 
+const CLOCKING_POINT_AUTH_RANKS = new Set(["admin", "hr", "superadmin"]);
+const CLOCKING_POINT_ALLOWED_ACCOUNT_TYPES = new Set(["staff", "intern", "attachee"]);
+const DEFAULT_CLOCKING_POINT_OTP_LENGTH = Math.min(
+  8,
+  Math.max(4, Number(process.env.CLOCKING_POINT_OTP_LENGTH || 4))
+);
+const DEFAULT_CLOCKING_POINT_OTP_EXPIRY_SECONDS = Math.max(
+  15,
+  Number(process.env.CLOCKING_POINT_OTP_EXPIRY_SECONDS || 30)
+);
+const DEFAULT_CLOCKING_POINT_OTP_MAX_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.CLOCKING_POINT_OTP_MAX_ATTEMPTS || 3)
+);
+const DEFAULT_CLOCKING_POINT_OTP_RESEND_SECONDS = Math.max(
+  10,
+  Number(process.env.CLOCKING_POINT_OTP_RESEND_SECONDS || 30)
+);
+const DEFAULT_CLOCKING_POINT_OTP_MAX_RESENDS = Math.max(
+  0,
+  Number(process.env.CLOCKING_POINT_OTP_MAX_RESENDS || 2)
+);
+
+const clampInteger = (value, fallback, min, max) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+};
+
+const sanitizeClockingPointSettings = (settings = {}) => ({
+  otpLength: clampInteger(settings.otpLength, DEFAULT_CLOCKING_POINT_OTP_LENGTH, 4, 8),
+  otpExpirySeconds: clampInteger(settings.otpExpirySeconds, DEFAULT_CLOCKING_POINT_OTP_EXPIRY_SECONDS, 15, 300),
+  otpMaxAttempts: clampInteger(settings.otpMaxAttempts, DEFAULT_CLOCKING_POINT_OTP_MAX_ATTEMPTS, 1, 10),
+  otpResendSeconds: clampInteger(settings.otpResendSeconds, DEFAULT_CLOCKING_POINT_OTP_RESEND_SECONDS, 10, 300),
+  otpMaxResends: clampInteger(settings.otpMaxResends, DEFAULT_CLOCKING_POINT_OTP_MAX_RESENDS, 0, 10),
+});
+
+const getClockingPointSettings = async () => {
+  const cfg = await PlatformConfig.getSingleton();
+  return sanitizeClockingPointSettings(cfg.clockingPoint || {});
+};
+
+const normalizeClockingPointAccountType = (value) => {
+  const type = String(value || "").trim().toLowerCase();
+  if (type === "employee") return "staff";
+  if (type === "attache") return "attachee";
+  return type;
+};
+
+const accountTypeMatchesUser = (accountType, user) => {
+  const normalizedType = normalizeClockingPointAccountType(accountType);
+  const role = normalizeUserRole(user?.role);
+  if (normalizedType === "staff") return role === "employee";
+  return normalizedType === role;
+};
+
+const hashDeviceFingerprint = (deviceFingerprint = "") => {
+  const fingerprint = String(deviceFingerprint || "").trim();
+  if (!fingerprint) throw new Error("Device fingerprint unavailable.");
+
+  const pepper = String(process.env.DEVICE_FINGERPRINT_PEPPER || "").trim();
+  if (pepper) {
+    return crypto.createHmac("sha256", pepper).update(fingerprint).digest("hex");
+  }
+
+  return crypto.createHash("sha256").update(fingerprint).digest("hex");
+};
+
+const normalizeStationRecord = (station = {}) => ({
+  name: typeof station === "string" ? station : String(station?.name || "").trim(),
+  active: typeof station === "string" ? true : station?.active !== false,
+  allowClockingPoint: typeof station === "string" ? false : station?.allowClockingPoint === true,
+});
+
+const findConfiguredStation = async (stationName) => {
+  const cfg = await PlatformConfig.getSingleton();
+  const target = normalizeStationAccessName(stationName);
+  const station = (cfg.stations || [])
+    .map(normalizeStationRecord)
+    .find((item) => normalizeStationAccessName(item.name) === target);
+
+  return station || null;
+};
+
+const assertClockingPointOfficer = (user) => {
+  const rank = String(user?.rank || "").toLowerCase();
+  if (!CLOCKING_POINT_AUTH_RANKS.has(rank)) {
+    throw new Error("Only authorised KMFRI officers can manage Clocking Points.");
+  }
+};
+
+const getAuthenticatedUser = async (req) => {
+  if (!req.session?.isOnline || !req.session?.userID) return null;
+  return User.findById(req.session.userID);
+};
+
+const resolveClockingPointFromFingerprint = async (deviceFingerprint, { requireUsable = false } = {}) => {
+  const deviceFingerprintHash = hashDeviceFingerprint(deviceFingerprint);
+  const clockingPoint = await ClockingPoint.findOne({ deviceFingerprintHash });
+
+  if (!clockingPoint) {
+    const error = new Error("DEVICE_NOT_ENROLLED");
+    error.status = 404;
+    throw error;
+  }
+
+  if (clockingPoint.revokedAt) {
+    const error = new Error("CLOCKING_POINT_REVOKED");
+    error.status = 403;
+    throw error;
+  }
+
+  if (requireUsable && clockingPoint.isActive === false) {
+    const error = new Error("CLOCKING_POINT_DISABLED");
+    error.status = 403;
+    throw error;
+  }
+
+  const station = await findConfiguredStation(clockingPoint.station);
+  if (!station || station.active === false) {
+    const error = new Error("CLOCKING_POINT_STATION_UNAVAILABLE");
+    error.status = 403;
+    throw error;
+  }
+
+  clockingPoint.lastSeenAt = new Date();
+  await clockingPoint.save();
+
+  return { clockingPoint, station };
+};
+
+const verifyClockingPointAccess = (user, station) => {
+  const canUseClockingPoint =
+    station?.allowClockingPoint === true ||
+    user?.clockingpointActive === true;
+
+  if (!canUseClockingPoint) {
+    const error = new Error("CLOCKING_POINT_ACCESS_NOT_AVAILABLE");
+    error.status = 403;
+    throw error;
+  }
+};
+
+const maskPhoneLastFour = (phone = "") => {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits ? `••••${digits.slice(-4)}` : "";
+};
+
+const generateNumericOtp = (length = DEFAULT_CLOCKING_POINT_OTP_LENGTH) => {
+  const digits = [];
+  for (let index = 0; index < length; index += 1) {
+    digits.push(crypto.randomInt(0, 10));
+  }
+  return digits.join("");
+};
+
+const hashOtp = (otp) =>
+  crypto.createHash("sha256").update(String(otp || "")).digest("hex");
+
+const determineClockingActionForUser = async (user) => {
+  const latestClocking = await Clocking
+    .findOne({ email: user.email })
+    .sort({ clock_in: -1 });
+
+  return {
+    latestClocking,
+    action: latestClocking && !latestClocking.clock_out ? "clock_out" : "clock_in",
+  };
+};
+
+const resolveClockingPointUser = async ({ accountType, identifier }) => {
+  const normalizedType = normalizeClockingPointAccountType(accountType);
+  const lookup = String(identifier || "").trim();
+
+  if (!CLOCKING_POINT_ALLOWED_ACCOUNT_TYPES.has(normalizedType)) {
+    throw new Error("Invalid account type.");
+  }
+
+  if (!lookup) {
+    throw new Error(normalizedType === "staff" ? "Staff Number is required." : "ID Number is required.");
+  }
+
+  const query = normalizedType === "staff"
+    ? { employeeId: lookup }
+    : { employeeId: lookup, role: normalizedType };
+
+  const user = await User.findOne(query);
+  if (!user || !accountTypeMatchesUser(normalizedType, user)) {
+    const error = new Error("User not found or account type is incorrect.");
+    error.status = 404;
+    throw error;
+  }
+
+  return user;
+};
+
+const formatClockingPointError = (error) => {
+  const code = error?.message;
+  const messages = {
+    DEVICE_NOT_ENROLLED: "This device is not registered as an active KMFRI Clocking Point.",
+    CLOCKING_POINT_REVOKED: "This Clocking Point enrollment has been revoked.",
+    CLOCKING_POINT_DISABLED: "This Clocking Point is currently disabled.",
+    CLOCKING_POINT_STATION_UNAVAILABLE: "This Clocking Point station is not currently available.",
+    CLOCKING_POINT_ACCESS_NOT_AVAILABLE: "Your account is not currently enabled for Clocking Point attendance. Please use your normal clocking method or contact HR/Administration.",
+  };
+
+  return {
+    code: messages[code] ? code : "CLOCKING_POINT_ERROR",
+    message: messages[code] || error?.message || "Clocking Point request failed.",
+  };
+};
+
+const performVerifiedAttendance = async ({
+  req,
+  user,
+  attendancePolicy,
+  selectedStation,
+  userCoords,
+  outsideLocation,
+  withinPremiseFromClient,
+  expectedAction,
+  source = "standard",
+  clockingPoint = null,
+}) => {
+  const staleClockingResult = await finalizeStaleClockingWithInfo(user);
+  user = staleClockingResult.user;
+
+  const clockingTime = getCurrentTime();
+  const { formattedDate, formattedTime } = formatEATDateTime(clockingTime);
+
+  const { latestClocking, action: databaseAction } =
+    await determineClockingActionForUser(user);
+
+  if (
+    ["clock_in", "clock_out"].includes(expectedAction) &&
+    expectedAction !== databaseAction
+  ) {
+    const staleMessage =
+      staleClockingResult.closedCount > 0
+        ? "Your previous missed clock-out was closed by the system. Please start again."
+        : "Your attendance status has changed. Please start again.";
+
+    const error = new Error(staleMessage);
+    error.status = 409;
+    error.meta = {
+      actionRequired: databaseAction,
+      staleClockOutClosed: staleClockingResult.closedCount > 0,
+      closedCount: staleClockingResult.closedCount,
+    };
+    throw error;
+  }
+
+  const isClockingIn = databaseAction === "clock_in";
+  const method = source === "clocking-point" ? "clocking-point" : "standard";
+  const verifyResultMeta = {
+    action: isClockingIn ? "clock_in" : "clock_out",
+    clockedOutside: false,
+    outsideLocation: null,
+    date: formattedDate,
+    time: formattedTime,
+    timezone: EAT_TIMEZONE,
+    clockingPoint: clockingPoint
+      ? {
+          id: clockingPoint._id,
+          name: clockingPoint.name,
+          station: clockingPoint.station,
+        }
+      : null,
+  };
+
+  if (isClockingIn) {
+    const targetClockIn =
+      parseAttendanceTime(attendancePolicy.standardClockIn || "08:00", clockingTime) ||
+      clockingTime;
+    const graceMinutes = Number(attendancePolicy.gracePeriodMinutes ?? 15);
+    const graceDeadline = new Date(
+      targetClockIn.getTime() +
+      (Number.isFinite(graceMinutes) ? graceMinutes : 15) * 60 * 1000
+    );
+    const isLate = clockingTime > graceDeadline;
+    const isEmployee = user.role === "employee";
+
+    const clockingData = {
+      name: user.name,
+      email: user.email,
+      department: user.department,
+      supervisor: isEmployee ? "" : user.supervisor,
+      station: selectedStation || user.station || "",
+      phone: user.phone,
+      clock_in: clockingTime,
+      clock_out: null,
+      isLate,
+      isPresent: false,
+      clockInMethod: method,
+      clockInClockingPoint: clockingPoint?._id || null,
+      userLocation: {
+        latitude: userCoords?.latitude ?? null,
+        longitude: userCoords?.longitude ?? null,
+      },
+    };
+
+    if (source === "clocking-point") {
+      clockingData.clockInWithinPremise = true;
+      clockingData.clockInLocationName = clockingPoint?.name || IN_PREMISE_LOCATION_LABEL;
+    } else {
+      const canClockOutsideNow = isOutsideClockingAuthorizedNow(user, clockingTime);
+      const clockInOutsidePremise =
+        withinPremiseFromClient === null ? Boolean(outsideLocation) : !withinPremiseFromClient;
+      const outsidePlaceName = normalizeClockingLocationName(outsideLocation);
+
+      clockingData.clockInWithinPremise = !clockInOutsidePremise;
+
+      if (!clockInOutsidePremise) {
+        clockingData.clockInLocationName = IN_PREMISE_LOCATION_LABEL;
+      } else if (!canClockOutsideNow) {
+        throw new Error("You are outside the station premises and are not currently authorized to clock outside.");
+      } else {
+        if (!outsidePlaceName) {
+          throw new Error("Outside clocking place could not be resolved. Please refresh your location and try again.");
+        }
+
+        clockingData.outsideLocation = outsidePlaceName;
+        clockingData.clockInLocationName = outsidePlaceName;
+        clockingData.clockedOutSide = true;
+        clockingData.outSideReason = user.outsideClockingDetails?.reason || "";
+        verifyResultMeta.clockedOutside = true;
+        verifyResultMeta.outsideLocation = outsidePlaceName;
+      }
+    }
+
+    const createdClocking = await Clocking.create(clockingData);
+
+    user.hasClockedIn = true;
+    user.isToClockOut = true;
+    await user.save();
+
+    const messageConfig = await PlatformConfig.getSingleton();
+    await SendMessageNow(
+      user,
+      getConfiguredMessage(
+        messageConfig,
+        "clockInSuccessMessage",
+        `Dear ${user.name}, you have successfully checked in at ${clockingData.station} on ${formattedDate} at ${formattedTime} EAT.`,
+        user,
+        { station: clockingData.station, date: formattedDate, time: formattedTime }
+      )
+    );
+
+    await createAuditLog({
+      req,
+      category: "attendance",
+      action: method === "clocking-point" ? "CLOCKING_POINT_CLOCK_IN" : "attendance.clock_in",
+      description: method === "clocking-point" ? "User clocked in at Clocking Point" : "User clocked in",
+      actor: user,
+      metadata: {
+        clockingId: createdClocking._id,
+        station: clockingData.station,
+        clockIn: clockingTime.toISOString(),
+        clockedOutside: verifyResultMeta.clockedOutside,
+        outsideLocation: verifyResultMeta.outsideLocation,
+        userLocation: clockingData.userLocation,
+        isLate,
+        clockingPointId: clockingPoint?._id || null,
+        clockingPointName: clockingPoint?.name || "",
+      },
+    });
+  } else {
+    const clockOutTime = getCurrentTime();
+    const {
+      formattedDate: clockOutDate,
+      formattedTime: clockOutFormattedTime,
+    } = formatEATDateTime(clockOutTime);
+    const clockInTime = latestClocking.clock_in;
+    const diffMs = clockOutTime.getTime() - clockInTime.getTime();
+    const safeDiffHours = Math.max(0, diffMs / (1000 * 60 * 60));
+
+    latestClocking.isPresent = safeDiffHours >= 5;
+    latestClocking.clock_out = clockOutTime;
+    latestClocking.clockOutMethod = method;
+    latestClocking.clockOutClockingPoint = clockingPoint?._id || null;
+
+    if (source === "clocking-point") {
+      latestClocking.clockOutWithinPremise = true;
+      latestClocking.clockOutLocationName = clockingPoint?.name || IN_PREMISE_LOCATION_LABEL;
+    } else {
+      const canClockOutsideNow = isOutsideClockingAuthorizedNow(user, clockOutTime);
+      const clockOutOutsidePremise =
+        withinPremiseFromClient === null ? Boolean(outsideLocation) : !withinPremiseFromClient;
+      const outsidePlaceName = normalizeClockingLocationName(outsideLocation);
+
+      latestClocking.clockOutWithinPremise = !clockOutOutsidePremise;
+
+      if (!clockOutOutsidePremise) {
+        latestClocking.clockOutLocationName = IN_PREMISE_LOCATION_LABEL;
+      } else if (!canClockOutsideNow) {
+        throw new Error("You are outside the station premises and are not currently authorized to clock outside.");
+      } else {
+        if (!outsidePlaceName) {
+          throw new Error("Outside clocking place could not be resolved. Please refresh your location and try again.");
+        }
+
+        latestClocking.clockOutLocationName = outsidePlaceName;
+        latestClocking.outsideLocation = latestClocking.outsideLocation || outsidePlaceName;
+        latestClocking.clockedOutSide = true;
+        latestClocking.outSideReason =
+          user.outsideClockingDetails?.reason ||
+          latestClocking.outSideReason ||
+          "";
+        verifyResultMeta.clockedOutside = true;
+        verifyResultMeta.outsideLocation = outsidePlaceName;
+      }
+    }
+
+    await latestClocking.save();
+
+    user.hasClockedIn = false;
+    user.isToClockOut = false;
+    await user.save();
+
+    const messageConfig = await PlatformConfig.getSingleton();
+    await SendMessageNow(
+      user,
+      getConfiguredMessage(
+        messageConfig,
+        "clockOutSuccessMessage",
+        `Dear ${user.name}, you have successfully checked out from ${latestClocking.station} on ${clockOutDate} at ${clockOutFormattedTime} EAT.`,
+        user,
+        { station: latestClocking.station, date: clockOutDate, time: clockOutFormattedTime }
+      )
+    );
+
+    await createAuditLog({
+      req,
+      category: "attendance",
+      action: method === "clocking-point" ? "CLOCKING_POINT_CLOCK_OUT" : "attendance.clock_out",
+      description: method === "clocking-point" ? "User clocked out at Clocking Point" : "User clocked out",
+      actor: user,
+      metadata: {
+        clockingId: latestClocking._id,
+        station: latestClocking.station,
+        clockIn: clockInTime.toISOString(),
+        clockOut: clockOutTime.toISOString(),
+        workedHours: Number(safeDiffHours.toFixed(2)),
+        isPresent: latestClocking.isPresent,
+        clockedOutside: verifyResultMeta.clockedOutside,
+        outsideLocation: verifyResultMeta.outsideLocation,
+        clockingPointId: clockingPoint?._id || null,
+        clockingPointName: clockingPoint?.name || "",
+      },
+    });
+
+    verifyResultMeta.date = clockOutDate;
+    verifyResultMeta.time = clockOutFormattedTime;
+  }
+
+  return verifyResultMeta;
+};
+
 const AUTOMATIC_RESTRICTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 let automaticRestrictionSweepTimer = null;
 
@@ -4963,6 +5430,482 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
 });
 
 
+
+// ─── Clocking Point ──────────────
+
+app.get(`${BASE_ROUTE}/clocking-point/enrollment-options`, async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+
+    assertClockingPointOfficer(currentUser);
+
+    const cfg = await PlatformConfig.getSingleton();
+    return res.json({
+      officer: {
+        name: currentUser.name,
+        rank: currentUser.rank,
+        station: currentUser.station,
+      },
+      stations: (cfg.stations || [])
+        .map(normalizeStationRecord)
+        .filter((station) => station.name && station.active !== false),
+    });
+  } catch (error) {
+    return res.status(error.status || 403).json({ message: error.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/clocking-point/enroll`, async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+    assertClockingPointOfficer(currentUser);
+
+    const { deviceFingerprint, name, station } = req.body || {};
+    const pointName = String(name || "").trim();
+    const stationName = String(station || "").trim();
+
+    if (!pointName) throw new Error("Clocking Point name is required.");
+
+    const stationConfig = await findConfiguredStation(stationName);
+    if (!stationConfig || stationConfig.active === false) {
+      return res.status(400).json({ message: "Select an active configured station." });
+    }
+
+    const deviceFingerprintHash = hashDeviceFingerprint(deviceFingerprint);
+    const existing = await ClockingPoint.findOne({ deviceFingerprintHash });
+
+    if (existing && !existing.revokedAt) {
+      return res.status(409).json({
+        message: "This device is already enrolled as a Clocking Point.",
+        clockingPoint: {
+          id: existing._id,
+          name: existing.name,
+          station: existing.station,
+          isActive: existing.isActive,
+        },
+      });
+    }
+
+    if (existing?.revokedAt) {
+      return res.status(409).json({
+        message: "This device has a revoked Clocking Point enrollment. Re-enrollment requires administrative review.",
+      });
+    }
+
+    const clockingPoint = await ClockingPoint.create({
+      name: pointName,
+      station: stationConfig.name,
+      deviceFingerprintHash,
+      enrolledBy: currentUser._id,
+      isActive: true,
+    });
+
+    await createAuditLog({
+      req,
+      category: "superadmin",
+      action: "CLOCKING_POINT_ENROLLED",
+      description: `Enrolled Clocking Point ${clockingPoint.name}`,
+      actor: currentUser,
+      metadata: {
+        clockingPointId: clockingPoint._id,
+        clockingPointName: clockingPoint.name,
+        station: clockingPoint.station,
+      },
+    });
+
+    return res.status(201).json({
+      message: "Clocking Point enrolled successfully.",
+      clockingPoint: {
+        id: clockingPoint._id,
+        name: clockingPoint.name,
+        station: clockingPoint.station,
+        isActive: clockingPoint.isActive,
+      },
+    });
+  } catch (error) {
+    console.error("Clocking Point enroll error:", error);
+    return res.status(error.status || 400).json({ message: error.message || "Enrollment failed." });
+  }
+});
+
+app.get(`${BASE_ROUTE}/clocking-points`, async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+    assertClockingPointOfficer(currentUser);
+
+    const clockingPoints = await ClockingPoint.find()
+      .populate("enrolledBy", "name email rank")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    return res.json(
+      clockingPoints.map((point) => ({
+        id: point._id,
+        name: point.name,
+        station: point.station,
+        isActive: point.isActive,
+        revokedAt: point.revokedAt,
+        enrolledAt: point.enrolledAt || point.createdAt,
+        lastSeenAt: point.lastSeenAt,
+        enrolledBy: point.enrolledBy
+          ? {
+              name: point.enrolledBy.name,
+              email: point.enrolledBy.email,
+              rank: point.enrolledBy.rank,
+            }
+          : null,
+      }))
+    );
+  } catch (error) {
+    return res.status(error.status || 403).json({ message: error.message });
+  }
+});
+
+app.patch(`${BASE_ROUTE}/clocking-points/:id`, async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    if (!currentUser) return res.status(401).json({ message: "Unauthorized" });
+    assertClockingPointOfficer(currentUser);
+
+    const { action, name } = req.body || {};
+    const clockingPoint = await ClockingPoint.findById(req.params.id);
+    if (!clockingPoint) return res.status(404).json({ message: "Clocking Point not found." });
+
+    const previous = {
+      name: clockingPoint.name,
+      isActive: clockingPoint.isActive,
+      revokedAt: clockingPoint.revokedAt,
+    };
+
+    let auditAction = "";
+    let description = "";
+
+    if (action === "enable") {
+      if (clockingPoint.revokedAt) {
+        return res.status(400).json({ message: "A revoked Clocking Point cannot be enabled." });
+      }
+      clockingPoint.isActive = true;
+      auditAction = "CLOCKING_POINT_ENABLED";
+      description = "Clocking Point enabled";
+    } else if (action === "disable") {
+      clockingPoint.isActive = false;
+      auditAction = "CLOCKING_POINT_DISABLED";
+      description = "Clocking Point disabled";
+    } else if (action === "revoke") {
+      clockingPoint.isActive = false;
+      clockingPoint.revokedAt = clockingPoint.revokedAt || new Date();
+      auditAction = "CLOCKING_POINT_REVOKED";
+      description = "Clocking Point revoked";
+    } else if (action === "rename") {
+      const nextName = String(name || "").trim();
+      if (!nextName) return res.status(400).json({ message: "Clocking Point name is required." });
+      clockingPoint.name = nextName;
+      auditAction = "CLOCKING_POINT_RENAMED";
+      description = "Clocking Point renamed";
+    } else {
+      return res.status(400).json({ message: "Unsupported Clocking Point action." });
+    }
+
+    await clockingPoint.save();
+
+    await createAuditLog({
+      req,
+      category: "superadmin",
+      action: auditAction,
+      description,
+      actor: currentUser,
+      metadata: {
+        clockingPointId: clockingPoint._id,
+        clockingPointName: clockingPoint.name,
+        station: clockingPoint.station,
+        previous,
+        next: {
+          name: clockingPoint.name,
+          isActive: clockingPoint.isActive,
+          revokedAt: clockingPoint.revokedAt,
+        },
+      },
+    });
+
+    return res.json({ message: description, clockingPoint });
+  } catch (error) {
+    return res.status(error.status || 400).json({ message: error.message });
+  }
+});
+
+app.post(`${BASE_ROUTE}/clocking-point/status`, async (req, res) => {
+  try {
+    const { clockingPoint, station } = await resolveClockingPointFromFingerprint(
+      req.body?.deviceFingerprint,
+      { requireUsable: true }
+    );
+
+    return res.json({
+      enrolled: true,
+      clockingPoint: {
+        id: clockingPoint._id,
+        name: clockingPoint.name,
+        station: station.name,
+      },
+    });
+  } catch (error) {
+    const payload = formatClockingPointError(error);
+    return res.status(error.status || 400).json(payload);
+  }
+});
+
+app.post(`${BASE_ROUTE}/clocking-point/challenge/request`, async (req, res) => {
+  try {
+    const { deviceFingerprint, accountType, identifier, resendChallengeId } = req.body || {};
+    const clockingPointSettings = await getClockingPointSettings();
+    const { clockingPoint, station } = await resolveClockingPointFromFingerprint(
+      deviceFingerprint,
+      { requireUsable: true }
+    );
+
+    let user = await resolveClockingPointUser({ accountType, identifier });
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
+
+    if (!normalizeKenyaPhone(user.phone)) {
+      return res.status(400).json({ message: "No valid registered phone number is available for this account." });
+    }
+
+    verifyClockingPointAccess(user, station);
+
+    const todayHoliday = await getHolidayForDate(new Date());
+    if (todayHoliday) {
+      return res.status(403).json({
+        code: "HOLIDAY_CLOCKING_DISABLED",
+        message: `Clocking is disabled today because it is ${todayHoliday.name}. Please resume clocking on the next configured working day.`,
+      });
+    }
+
+    await finalizeStaleClocking(user);
+    user = await User.findById(user._id);
+    const { action } = await determineClockingActionForUser(user);
+
+    const previousChallenge = resendChallengeId
+      ? await ClockingPointChallenge.findOne({
+          _id: resendChallengeId,
+          user: user._id,
+          clockingPoint: clockingPoint._id,
+          used: false,
+        })
+      : await ClockingPointChallenge.findOne({
+          user: user._id,
+          clockingPoint: clockingPoint._id,
+          used: false,
+          expiresAt: { $gt: new Date() },
+        }).sort({ createdAt: -1 });
+
+    let resendCount = 0;
+    if (previousChallenge) {
+      const secondsSinceCreated =
+        (Date.now() - new Date(previousChallenge.createdAt).getTime()) / 1000;
+      if (resendChallengeId && secondsSinceCreated < clockingPointSettings.otpResendSeconds) {
+        return res.status(429).json({
+          message: `Please wait ${clockingPointSettings.otpResendSeconds} seconds before requesting another code.`,
+        });
+      }
+
+      resendCount = Number(previousChallenge.resendCount || 0) + (resendChallengeId ? 1 : 0);
+      if (resendCount > clockingPointSettings.otpMaxResends) {
+        previousChallenge.used = true;
+        await previousChallenge.save();
+        return res.status(429).json({ message: "OTP resend limit reached. Please start again." });
+      }
+    }
+
+    await ClockingPointChallenge.updateMany(
+      { user: user._id, used: false },
+      { $set: { used: true } }
+    );
+
+    const otp = generateNumericOtp(clockingPointSettings.otpLength);
+    const challenge = await ClockingPointChallenge.create({
+      user: user._id,
+      clockingPoint: clockingPoint._id,
+      action,
+      otpHash: hashOtp(otp),
+      expiresAt: new Date(Date.now() + clockingPointSettings.otpExpirySeconds * 1000),
+      attempts: 0,
+      resendCount,
+      used: false,
+    });
+
+    const label = action === "clock_in" ? "CLOCK-IN" : "CLOCK-OUT";
+    await SendMessageNow(
+      user,
+      `KMFRI ${label} CODE: ${otp}. Valid for ${clockingPointSettings.otpExpirySeconds} seconds. Do not share this code.`
+    );
+
+    await createAuditLog({
+      req,
+      category: "attendance",
+      action: "CLOCKING_POINT_OTP_REQUESTED",
+      description: "Clocking Point OTP requested",
+      actor: user,
+      metadata: {
+        clockingPointId: clockingPoint._id,
+        clockingPointName: clockingPoint.name,
+        station: clockingPoint.station,
+        action,
+        resendCount,
+      },
+    });
+
+    return res.json({
+      challengeId: challenge._id,
+      action,
+      expiresAt: challenge.expiresAt,
+      expiresInSeconds: clockingPointSettings.otpExpirySeconds,
+      resendAfterSeconds: clockingPointSettings.otpResendSeconds,
+      maxResends: clockingPointSettings.otpMaxResends,
+      resendCount,
+      phoneMasked: maskPhoneLastFour(user.phone),
+      user: { name: user.name },
+    });
+  } catch (error) {
+    const payload = formatClockingPointError(error);
+    await createAuditLog({
+      req,
+      category: "attendance",
+      action: "CLOCKING_POINT_OTP_FAILED",
+      description: "Clocking Point OTP request failed",
+      actor: { name: "Clocking Point", email: "", rank: "", role: "" },
+      metadata: { reason: payload.code },
+      status: "failed",
+    });
+    return res.status(error.status || 400).json(payload);
+  }
+});
+
+app.post(`${BASE_ROUTE}/clocking-point/challenge/verify`, async (req, res) => {
+  try {
+    const { deviceFingerprint, challengeId, otp } = req.body || {};
+    const clockingPointSettings = await getClockingPointSettings();
+    const { clockingPoint, station } = await resolveClockingPointFromFingerprint(
+      deviceFingerprint,
+      { requireUsable: true }
+    );
+
+    const challenge = await ClockingPointChallenge.findOne({
+      _id: challengeId,
+      clockingPoint: clockingPoint._id,
+      used: false,
+    });
+
+    if (!challenge) {
+      return res.status(400).json({ message: "Code expired or no longer valid. Please start again." });
+    }
+
+    if (challenge.expiresAt <= new Date()) {
+      challenge.used = true;
+      await challenge.save();
+      return res.status(400).json({ message: "Code expired. Please start again." });
+    }
+
+    if (challenge.attempts >= clockingPointSettings.otpMaxAttempts) {
+      challenge.used = true;
+      await challenge.save();
+      return res.status(429).json({ message: "OTP attempt limit reached. Please start again." });
+    }
+
+    challenge.attempts += 1;
+
+    if (hashOtp(otp) !== challenge.otpHash) {
+      if (challenge.attempts >= clockingPointSettings.otpMaxAttempts) {
+        challenge.used = true;
+      }
+      await challenge.save();
+
+      await createAuditLog({
+        req,
+        category: "attendance",
+        action: "CLOCKING_POINT_OTP_FAILED",
+        description: "Clocking Point OTP verification failed",
+        actor: { name: "Clocking Point", email: "", rank: "", role: "" },
+        metadata: {
+          clockingPointId: clockingPoint._id,
+          clockingPointName: clockingPoint.name,
+          attempts: challenge.attempts,
+        },
+        status: "failed",
+      });
+
+      return res.status(400).json({ message: "Incorrect code. Please try again." });
+    }
+
+    let user = await User.findById(challenge.user);
+    if (!user) throw new Error("User not found.");
+    user = await refreshUserAutomaticRestrictions(user);
+    assertAccountCanClock(user);
+    verifyClockingPointAccess(user, station);
+
+    const todayHoliday = await getHolidayForDate(new Date());
+    if (todayHoliday) {
+      throw new Error(`Clocking is disabled today because it is ${todayHoliday.name}. Please resume clocking on the next configured working day.`);
+    }
+
+    const { action: latestAction } = await determineClockingActionForUser(user);
+    if (latestAction !== challenge.action) {
+      challenge.used = true;
+      await challenge.save();
+      return res.status(409).json({ message: "Your attendance status has changed. Please start again." });
+    }
+
+    const attendancePolicy = await getAttendancePolicy();
+    const meta = await performVerifiedAttendance({
+      req,
+      user,
+      attendancePolicy,
+      selectedStation: clockingPoint.station,
+      userCoords: null,
+      outsideLocation: "",
+      withinPremiseFromClient: true,
+      expectedAction: challenge.action,
+      source: "clocking-point",
+      clockingPoint,
+    });
+
+    challenge.used = true;
+    await challenge.save();
+
+    await createAuditLog({
+      req,
+      category: "attendance",
+      action: "CLOCKING_POINT_OTP_VERIFIED",
+      description: "Clocking Point OTP verified",
+      actor: user,
+      metadata: {
+        clockingPointId: clockingPoint._id,
+        clockingPointName: clockingPoint.name,
+        station: clockingPoint.station,
+        action: challenge.action,
+        attemptCount: challenge.attempts,
+      },
+    });
+
+    return res.json({
+      verified: true,
+      meta,
+      user: { name: user.name },
+      timestamp: {
+        utc: new Date().toISOString(),
+        date: meta.date,
+        time: meta.time,
+        timezone: EAT_TIMEZONE,
+      },
+    });
+  } catch (error) {
+    const payload = formatClockingPointError(error);
+    return res.status(error.status || 400).json(payload);
+  }
+});
 
 // ─── Attendance ──────────────
 
@@ -9145,6 +10088,53 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-clock-outside`, async (req, res) =>
   }
 });
 
+app.put(`${BASE_ROUTE}/admin/user/:id/update-clocking-point-access`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!["admin", "hr", "superadmin"].includes(currentUser?.rank))
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    if (!canAccessManagedUser(currentUser, targetUser))
+      return res.status(403).json({ message: "HR access is limited to users in your station" });
+
+    const previousValue = targetUser.clockingpointActive === true;
+    const nextValue =
+      req.body?.clockingpointActive === true ||
+      String(req.body?.clockingpointActive || "").toLowerCase() === "true" ||
+      String(req.body?.clockingpointActive || "").toLowerCase() === "yes";
+
+    targetUser.clockingpointActive = nextValue;
+    await targetUser.save();
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "CLOCKING_POINT_USER_ACCESS_CHANGED",
+      description: "Clocking Point user access changed",
+      actor: currentUser,
+      target: targetUser,
+      metadata: {
+        previousValue,
+        newValue: nextValue,
+      },
+    });
+
+    res.json({
+      message: `Clocking Point Access ${nextValue ? "enabled" : "disabled"} for ${targetUser.name}`,
+      user: targetUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 
 
 // leave update by supervisor and hr and superadmin
@@ -10009,10 +10999,18 @@ app.delete(`${BASE_ROUTE}/holidays/:id`, async (req, res) => {
 
 app.get(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
   try {
-    const { config: cfg } = await syncMaintenanceWindow(
+    const { config: cfg, state } = await syncMaintenanceWindow(
       await PlatformConfig.getSingleton(),
       "config-read"
     );
+
+    if (state.active) {
+      const user = req.session?.userID ? await User.findById(req.session.userID) : null;
+      if (!isSuperadminUser(user)) {
+        return sendMaintenanceModeResponse(res, state);
+      }
+    }
+
     return res.status(200).json(cfg);
   } catch (err) {
     console.error('Get config error:', err);
@@ -10036,6 +11034,7 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
       "config-update"
     );
     const previousMaintenanceState = getMaintenanceState(cfg);
+    const previousStations = (cfg.stations || []).map(normalizeStationRecord);
 
     // =====================================================
     // LOGO
@@ -10134,6 +11133,21 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
     }
 
     // =====================================================
+    // CLOCKING POINT SETTINGS
+    // =====================================================
+
+    if (updates.clockingPoint) {
+
+      cfg.clockingPoint = sanitizeClockingPointSettings({
+        ...(cfg.clockingPoint?.toObject?.() || cfg.clockingPoint || {}),
+        ...updates.clockingPoint,
+      });
+
+      cfg.markModified("clockingPoint");
+
+    }
+
+    // =====================================================
     // MASTER SETTINGS
     // =====================================================
 
@@ -10224,7 +11238,14 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     if (updates.stations) {
 
-      cfg.stations = updates.stations;
+      const nextStations = updates.stations.map((station) => ({
+        ...normalizeStationRecord(station),
+        lat: Number(station?.lat ?? 0),
+        lng: Number(station?.lng ?? 0),
+        radiusMeters: Number(station?.radiusMeters ?? cfg.geofence?.radiusMeters ?? 500),
+      }));
+
+      cfg.stations = nextStations;
 
       cfg.markModified("stations");
 
@@ -10271,6 +11292,33 @@ app.post(`${BASE_ROUTE}/superadmin/config`, async (req, res) => {
 
     });
 
+    if (updates.stations) {
+      const previousByName = new Map(
+        previousStations.map((station) => [normalizeStationAccessName(station.name), station])
+      );
+
+      for (const station of (cfg.stations || []).map(normalizeStationRecord)) {
+        const previous = previousByName.get(normalizeStationAccessName(station.name));
+        const previousValue = previous?.allowClockingPoint === true;
+        const newValue = station.allowClockingPoint === true;
+
+        if (previous && previousValue !== newValue) {
+          await createAuditLog({
+            req,
+            category: "superadmin",
+            action: "CLOCKING_POINT_STATION_ACCESS_CHANGED",
+            description: "Clocking Point station access changed",
+            actor: auth.currentUser,
+            metadata: {
+              station: station.name,
+              previousValue,
+              newValue,
+            },
+          });
+        }
+      }
+    }
+
     return res.status(200).json(cfg);
 
 
@@ -10301,7 +11349,7 @@ app.post(`${BASE_ROUTE}/superadmin/config/reset`, async (req, res) => {
     const defaults = getDefaultPlatformConfig();
     const cfg = await PlatformConfig.getSingleton();
     const previousMaintenanceState = getMaintenanceState(cfg);
-    const resettableSections = ['branding', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'masterSettings', 'dropdowns', 'departments', 'stations', 'holidays', 'logoUrl'];
+    const resettableSections = ['branding', 'themes', 'notificationReminders', 'geofence', 'attendancePolicy', 'clockingPoint', 'masterSettings', 'dropdowns', 'departments', 'stations', 'holidays', 'logoUrl'];
 
     if (section === 'all') {
       Object.entries(defaults).forEach(([key, value]) => {
@@ -10393,7 +11441,7 @@ app.post(`${BASE_ROUTE}/superadmin/stations/add`, async (req, res) => {
   try {
     const auth = await ensureSuperadmin(req, res, true);
     if (!auth || auth.allowed !== true) return;
-    const { name, lat = 0, lng = 0, radiusMeters, active = true } = req.body;
+    const { name, lat = 0, lng = 0, radiusMeters, active = true, allowClockingPoint = false } = req.body;
     if (!name || !name.trim()) throw new Error('Station name required');
     const cfg = await PlatformConfig.getSingleton();
     const station = {
@@ -10402,6 +11450,7 @@ app.post(`${BASE_ROUTE}/superadmin/stations/add`, async (req, res) => {
       lng: Number(lng || 0),
       radiusMeters: Number(radiusMeters || cfg.geofence?.radiusMeters || 100),
       active: active !== false,
+      allowClockingPoint: allowClockingPoint === true,
     };
     const existingIndex = cfg.stations.findIndex((s) => (typeof s === 'string' ? s : s.name) === station.name);
     if (existingIndex >= 0) {

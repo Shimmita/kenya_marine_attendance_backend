@@ -293,6 +293,14 @@ const defaultAttendancePolicy = {
 
 };
 
+const defaultClockingPoint = {
+    otpLength: 4,
+    otpExpirySeconds: 30,
+    otpMaxAttempts: 3,
+    otpResendSeconds: 30,
+    otpMaxResends: 2,
+};
+
 const defaultMasterSettings = {
     maintenanceMode: false,
     maintenanceStartAt: null,
@@ -314,6 +322,7 @@ const stationSchema = new mongoose.Schema({
     lng: { type: Number, default: 0 },
     radiusMeters: { type: Number, default: 500 },
     active: { type: Boolean, default: true },
+    allowClockingPoint: { type: Boolean, default: false },
 }, { _id: false });
 
 const themeSchema = new mongoose.Schema({
@@ -453,6 +462,13 @@ const platformConfigSchema = new mongoose.Schema({
         }
 
     },
+    clockingPoint: {
+        otpLength: { type: Number, default: defaultClockingPoint.otpLength },
+        otpExpirySeconds: { type: Number, default: defaultClockingPoint.otpExpirySeconds },
+        otpMaxAttempts: { type: Number, default: defaultClockingPoint.otpMaxAttempts },
+        otpResendSeconds: { type: Number, default: defaultClockingPoint.otpResendSeconds },
+        otpMaxResends: { type: Number, default: defaultClockingPoint.otpMaxResends },
+    },
     departments: { type: [String], default: defaultDepartments },
     stations: { type: [stationSchema], default: defaultStations },
     dropdowns: {
@@ -508,7 +524,7 @@ const holidaySchema = new mongoose.Schema({
 
 const normalizeStation = (station) => {
     if (typeof station === 'string') {
-        return { name: station, lat: 0, lng: 0, radiusMeters: 500, active: true };
+        return { name: station, lat: 0, lng: 0, radiusMeters: 500, active: true, allowClockingPoint: false };
     }
     return {
         name: station?.name || '',
@@ -516,6 +532,7 @@ const normalizeStation = (station) => {
         lng: Number(station?.lng ?? 0),
         radiusMeters: Number(station?.radiusMeters ?? 500),
         active: station?.active !== false,
+        allowClockingPoint: station?.allowClockingPoint === true,
     };
 };
 
@@ -540,6 +557,7 @@ export const getDefaultPlatformConfig = () => ({
     notificationReminders: { ...defaultNotificationReminders, channels: [...defaultNotificationReminders.channels] },
     geofence: { ...defaultGeofence },
     attendancePolicy: { ...defaultAttendancePolicy },
+    clockingPoint: { ...defaultClockingPoint },
     departments: [...defaultDepartments],
     stations: defaultStations.map((station) => ({ ...station })),
     dropdowns: { ...defaultDropdowns },
@@ -667,6 +685,10 @@ platformConfigSchema.statics.getSingleton = async function () {
             cfg.attendancePolicy = { ...defaultAttendancePolicy };
             changed = true;
         }
+        if (!cfg.clockingPoint) {
+            cfg.clockingPoint = { ...defaultClockingPoint };
+            changed = true;
+        }
         if (!cfg.masterSettings) {
             cfg.masterSettings = { ...defaultMasterSettings };
             changed = true;
@@ -688,6 +710,10 @@ platformConfigSchema.statics.getSingleton = async function () {
         }
         if (applyNestedDefaults(cfg.attendancePolicy, defaultAttendancePolicy)) {
             cfg.markModified('attendancePolicy');
+            changed = true;
+        }
+        if (applyNestedDefaults(cfg.clockingPoint, defaultClockingPoint)) {
+            cfg.markModified('clockingPoint');
             changed = true;
         }
         if (applyNestedDefaults(cfg.masterSettings, defaultMasterSettings)) {

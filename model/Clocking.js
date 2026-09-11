@@ -27,6 +27,26 @@ const clockingSchema = new mongoose.Schema(
         clockOutLocationName: { type: String, default: "" },
         clockInWithinPremise: { type: Boolean, required: false },
         clockOutWithinPremise: { type: Boolean, required: false },
+        clockInMethod: {
+            type: String,
+            enum: ["standard", "clocking-point"],
+            default: "standard",
+        },
+        clockOutMethod: {
+            type: String,
+            enum: ["standard", "clocking-point"],
+            default: null,
+        },
+        clockInClockingPoint: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "ClockingPoint",
+            default: null,
+        },
+        clockOutClockingPoint: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "ClockingPoint",
+            default: null,
+        },
         userLocation: {
             latitude: { type: Number, required: false },
             longitude: { type: Number, required: false },

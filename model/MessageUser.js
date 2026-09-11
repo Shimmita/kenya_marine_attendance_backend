@@ -13,7 +13,7 @@ const messageUser = new mongoose.Schema(
         title: { type: String, required: true },
         label: {
             type: String,
-            enum: ["urgent", "none"],
+            enum: ["urgent", "none", "system"],
             // Todo: make this required
             default: "none",
         },
