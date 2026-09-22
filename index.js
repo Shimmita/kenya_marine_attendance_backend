@@ -17,6 +17,7 @@ import sharp from "sharp";
 import validator from "validator";
 import registerClockInReminder from "./cron/clockInReminder.cron.js";
 import registerClockOutReminder from "./cron/clockOutReminder.cron.js";
+import startBackupScheduler from "./cron/backup.cron.js";
 import startAttendanceScheduler, { getAttendanceScheduleTimes, refreshAttendanceScheduler } from "./cron/scheduler.js";
 import uploadAvatar from "./middleware/UploadFile.js";
 import AuditLog from "./model/AuditLog.js";
@@ -35,6 +36,7 @@ import PlatformConfig, { getDefaultPlatformConfig } from "./model/PlatformConfig
 import Supervisor from "./model/Supervisor.js";
 import User from "./model/User.js";
 import Verification from "./model/VerifyReport.js";
+import createBackupRouter from "./routes/backup.routes.js";
 import {
   getHolidayForDate,
   getWorkingDateKeysInRange as getConfiguredWorkingDateKeysInRange
@@ -1605,10 +1607,11 @@ mongoose
     try {
 
       await startAttendanceScheduler();
+      startBackupScheduler();
 
     } catch (err) {
 
-      console.error("Attendance scheduler failed to start:", err);
+      console.error("Scheduler failed to start:", err);
 
     }
 
@@ -10796,6 +10799,8 @@ const ensureSuperadmin = async (req, res, allowBootstrap = false) => {
 
   return { allowed: true, currentUser };
 };
+
+app.use(`${BASE_ROUTE}/superadmin/backups`, createBackupRouter({ ensureSuperadmin }));
 
 const HOLIDAY_MANAGER_RANKS = ["hr", "admin", "superadmin"];
 
