@@ -51,10 +51,25 @@ const clockingSchema = new mongoose.Schema(
             latitude: { type: Number, required: false },
             longitude: { type: Number, required: false },
         },
+        mobileDeviceId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "MobileApp",
+            required: false,
+        },
+        mobileClockInRecordId: { type: String, required: false },
+        mobileClockOutRecordId: { type: String, required: false },
 
     },
     { timestamps: true }
 );
 
+clockingSchema.index(
+    { mobileClockInRecordId: 1 },
+    { unique: true, sparse: true }
+);
+clockingSchema.index(
+    { mobileClockOutRecordId: 1 },
+    { unique: true, sparse: true }
+);
 
 export default mongoose.model("Clocking", clockingSchema);

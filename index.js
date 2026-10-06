@@ -26,6 +26,7 @@ import ClockingPoint from "./model/ClockingPoint.js";
 import ClockingPointChallenge from "./model/ClockingPointChallenge.js";
 import DeviceLost from "./model/deviceLost.js";
 import Devices from "./model/Devices.js";
+import MobileApp from "./model/MobileApp.js";
 import ExportDocument from "./model/ExportDocument.js";
 import Feedback from "./model/Feedback.js";
 import Leave from "./model/Leave.js";
@@ -1596,6 +1597,8 @@ mongoose
       `Connected to MongoDB (${environment === "SANDBOX" ? "LOCAL" : "CLOUD"})`
     );
 
+    await MobileApp.createIndexes();
+    await Clocking.createIndexes();
     await ensureLostDeviceRequestIndexes();
 
     /*
@@ -2505,7 +2508,25 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     if (!user.email_verified) throw new Error("Email not verified. Contact admin.");
 
     user = await refreshUserAutomaticRestrictions(user);
-    assertAccountCanSignIn(user);
+    if (user.isAccountActive === false) {
+      return res.status(403).json({
+        code: "ACCOUNT_INACTIVE",
+        message: "This account is inactive. Contact KMFRI Human Resources.",
+      });
+    }
+    if (req.body?.installationId && user.deviceLost) {
+      return res.status(403).json({
+        code: "DEVICE_LOST",
+        message:
+          "This account is blocked because its registered device was reported lost.",
+      });
+    }
+    if (req.body?.installationId) {
+      await assertMobileInstallationCanAuthenticate(
+        user,
+        req.body.installationId
+      );
+    }
 
     const { state: maintenanceState } = await syncMaintenanceWindow(null, "signin");
     if (maintenanceState.active && !isSuperadminUser(user)) {
@@ -2528,7 +2549,10 @@ app.post(`${BASE_ROUTE}/auth/signin`, async (req, res) => {
     return res.status(200).json(sanitizeUserResponse(refreshedUser));
   } catch (error) {
     console.error("Signin error:", error);
-    return res.status(400).json({ message: error.message });
+    return res.status(error.statusCode || 400).json({
+      ...(error.code ? { code: error.code } : {}),
+      message: error.message,
+    });
   }
 });
 
@@ -2620,6 +2644,20 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
 
     user = await refreshUserAutomaticRestrictions(user);
     assertAccountCanSignIn(user);
+    if (req.body?.installationId && user.deviceLost) {
+      const error = new Error(
+        "This account is blocked because its registered device was reported lost."
+      );
+      error.statusCode = 403;
+      error.code = "DEVICE_LOST";
+      throw error;
+    }
+    if (req.body?.installationId) {
+      await assertMobileInstallationCanAuthenticate(
+        user,
+        req.body.installationId
+      );
+    }
 
     const { state: maintenanceState } = await syncMaintenanceWindow(null, "signin-staff");
     if (maintenanceState.active && !isSuperadminUser(user)) {
@@ -2666,7 +2704,7 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
     let message =
       error.message || "Authentication failed";
 
-    let statusCode = 400;
+    let statusCode = error.statusCode || 400;
 
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2711,7 +2749,6 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
       message?.includes("Invalid credentials") ||
       message?.includes("User not found")
     ) {
-
       message =
         "Invalid credentials. Please check your login details!";
 
@@ -2724,10 +2761,13 @@ app.post(`${BASE_ROUTE}/auth/signin-staff`, async (req, res) => {
       statusCode = 403;
     }
 
+   
+
 
     return res
       .status(statusCode)
       .json({
+        ...(error.code ? { code: error.code } : {}),
         message,
       });
   }
@@ -3918,11 +3958,19 @@ const performVerifiedAttendance = async ({
   expectedAction,
   source = "standard",
   clockingPoint = null,
+  eventAt = null,
+  mobileDeviceId = null,
+  mobileRecordId = null,
+  staleCheckAt = null,
+  suppressNotifications = false,
 }) => {
-  const staleClockingResult = await finalizeStaleClockingWithInfo(user);
+  const staleClockingResult = await finalizeStaleClockingWithInfo(
+    user,
+    staleCheckAt || new Date()
+  );
   user = staleClockingResult.user;
 
-  const clockingTime = getCurrentTime();
+  const clockingTime = eventAt || getCurrentTime();
   const { formattedDate, formattedTime } = formatEATDateTime(clockingTime);
 
   const { latestClocking, action: databaseAction } =
@@ -3994,6 +4042,12 @@ const performVerifiedAttendance = async ({
         latitude: userCoords?.latitude ?? null,
         longitude: userCoords?.longitude ?? null,
       },
+      ...(mobileDeviceId
+        ? {
+            mobileDeviceId,
+            mobileClockInRecordId: mobileRecordId,
+          }
+        : {}),
     };
 
     if (source === "clocking-point") {
@@ -4031,17 +4085,19 @@ const performVerifiedAttendance = async ({
     user.isToClockOut = true;
     await user.save();
 
-    const messageConfig = await PlatformConfig.getSingleton();
-    await SendMessageNow(
-      user,
-      getConfiguredMessage(
-        messageConfig,
-        "clockInSuccessMessage",
-        `Dear ${user.name}, you have successfully checked in at ${clockingData.station} on ${formattedDate} at ${formattedTime} EAT.`,
+    if (!suppressNotifications) {
+      const messageConfig = await PlatformConfig.getSingleton();
+      await SendMessageNow(
         user,
-        { station: clockingData.station, date: formattedDate, time: formattedTime }
-      )
-    );
+        getConfiguredMessage(
+          messageConfig,
+          "clockInSuccessMessage",
+          `Dear ${user.name}, you have successfully checked in at ${clockingData.station} on ${formattedDate} at ${formattedTime} EAT.`,
+          user,
+          { station: clockingData.station, date: formattedDate, time: formattedTime }
+        )
+      );
+    }
 
     await createAuditLog({
       req,
@@ -4062,7 +4118,7 @@ const performVerifiedAttendance = async ({
       },
     });
   } else {
-    const clockOutTime = getCurrentTime();
+    const clockOutTime = eventAt || getCurrentTime();
     const {
       formattedDate: clockOutDate,
       formattedTime: clockOutFormattedTime,
@@ -4075,6 +4131,10 @@ const performVerifiedAttendance = async ({
     latestClocking.clock_out = clockOutTime;
     latestClocking.clockOutMethod = method;
     latestClocking.clockOutClockingPoint = clockingPoint?._id || null;
+    if (mobileDeviceId) {
+      latestClocking.mobileDeviceId = mobileDeviceId;
+      latestClocking.mobileClockOutRecordId = mobileRecordId;
+    }
 
     if (source === "clocking-point") {
       latestClocking.clockOutWithinPremise = true;
@@ -4114,17 +4174,19 @@ const performVerifiedAttendance = async ({
     user.isToClockOut = false;
     await user.save();
 
-    const messageConfig = await PlatformConfig.getSingleton();
-    await SendMessageNow(
-      user,
-      getConfiguredMessage(
-        messageConfig,
-        "clockOutSuccessMessage",
-        `Dear ${user.name}, you have successfully checked out from ${latestClocking.station} on ${clockOutDate} at ${clockOutFormattedTime} EAT.`,
+    if (!suppressNotifications) {
+      const messageConfig = await PlatformConfig.getSingleton();
+      await SendMessageNow(
         user,
-        { station: latestClocking.station, date: clockOutDate, time: clockOutFormattedTime }
-      )
-    );
+        getConfiguredMessage(
+          messageConfig,
+          "clockOutSuccessMessage",
+          `Dear ${user.name}, you have successfully checked out from ${latestClocking.station} on ${clockOutDate} at ${clockOutFormattedTime} EAT.`,
+          user,
+          { station: latestClocking.station, date: clockOutDate, time: clockOutFormattedTime }
+        )
+      );
+    }
 
     await createAuditLog({
       req,
@@ -8611,6 +8673,767 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
 });
 
 
+
+const mobileDeviceSummary = (device) => ({
+  id: device._id.toString(),
+  status: device.isActive ? "ACTIVE" : "REVOKED",
+  enrolledAt: device.enrolledAt,
+  lastSeenAt: device.lastSeenAt,
+});
+
+const getMobileDeviceRequestUser = async (req, res) => {
+  if (!req.session?.isOnline || !req.session?.userID) {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Unauthorized" });
+    return null;
+  }
+
+  let user = await User.findById(req.session.userID);
+  if (!user) {
+    res.status(401).json({ code: "UNAUTHORIZED", message: "Unauthorized" });
+    return null;
+  }
+
+  user = await refreshUserAutomaticRestrictions(user);
+  if (user.isAccountActive === false) {
+    res.status(403).json({
+      code: "ACCOUNT_INACTIVE",
+      message: "This account is inactive. Contact KMFRI Human Resources.",
+    });
+    return null;
+  }
+  if (user.deviceLost) {
+    res.status(403).json({
+      code: "DEVICE_LOST",
+      message: "This account is blocked because its registered device was reported lost.",
+    });
+    return null;
+  }
+
+  return user;
+};
+
+const validateMobileInstallationId = (installationId) =>
+  typeof installationId === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    installationId
+  );
+
+const assertMobileInstallationCanAuthenticate = async (user, installationId) => {
+  const normalizedInstallationId = String(installationId || "").trim();
+  if (!validateMobileInstallationId(normalizedInstallationId)) {
+    const error = new Error("A valid installation identity is required.");
+    error.statusCode = 400;
+    error.code = "INVALID_INSTALLATION_ID";
+    throw error;
+  }
+
+  const installation = await MobileApp.findOne({
+    installationId: normalizedInstallationId,
+  });
+  if (
+    installation &&
+    installation.userId.toString() !== user._id.toString()
+  ) {
+    const error = new Error(
+      "This device is already registered to another KMFRI account. Please contact the administrator if this device has been reassigned to you."
+    );
+    error.statusCode = 409;
+    error.code = "DEVICE_BOUND_TO_ANOTHER_ACCOUNT";
+    throw error;
+  }
+  if (installation && !installation.isActive) {
+    const error = new Error(
+      "This device registration has been revoked. Contact an authorized KMFRI administrator."
+    );
+    error.statusCode = 403;
+    error.code = "DEVICE_REVOKED";
+    throw error;
+  }
+
+  const activeUserDevice = await MobileApp.findOne({
+    userId: user._id,
+    isActive: true,
+  });
+  if (
+    activeUserDevice &&
+    activeUserDevice.installationId !== normalizedInstallationId
+  ) {
+    const error = new Error(
+      "Your KMFRI Clocking account is already linked to another device."
+    );
+    error.statusCode = 409;
+    error.code = "USER_DEVICE_ALREADY_ENROLLED";
+    throw error;
+  }
+};
+
+const checkMobileAppDevice = async (req, res) => {
+  try {
+    const user = await getMobileDeviceRequestUser(req, res);
+    if (!user) return;
+
+    const installationId = String(req.body?.installationId || "").trim();
+    if (!validateMobileInstallationId(installationId)) {
+      return res.status(400).json({
+        code: "INVALID_INSTALLATION_ID",
+        message: "A valid installation identity is required.",
+      });
+    }
+
+    const device = await MobileApp.findOne({ installationId });
+    if (device && device.userId.toString() !== user._id.toString()) {
+      return res.status(409).json({
+        code: "DEVICE_BOUND_TO_ANOTHER_ACCOUNT",
+        message:
+          "This device is already registered to another KMFRI account. Please contact the administrator if this device has been reassigned to you.",
+      });
+    }
+
+    if (device && !device.isActive) {
+      return res.status(403).json({
+        code: "DEVICE_REVOKED",
+        message:
+          "This device registration has been revoked. Contact an authorized KMFRI administrator.",
+      });
+    }
+
+    const currentDevice =
+      device ||
+      (await MobileApp.findOne({ userId: user._id, isActive: true }));
+    if (currentDevice && !device) {
+      return res.status(409).json({
+        code: "USER_DEVICE_ALREADY_ENROLLED",
+        message:
+          "Your KMFRI Clocking account is already linked to another device.",
+      });
+    }
+
+    if (!device) {
+      return res.status(200).json({
+        enrolled: false,
+        deviceRegistered: false,
+        status: "NOT_ENROLLED",
+      });
+    }
+
+    device.lastSeenAt = new Date();
+    device.lastAuthenticatedAt = new Date();
+    await device.save();
+
+    return res.status(200).json({
+      enrolled: true,
+      deviceRegistered: true,
+      status: "ACTIVE",
+      device: mobileDeviceSummary(device),
+    });
+  } catch (error) {
+    console.error("Mobile device status check failed:", error);
+    return res.status(error.statusCode || 500).json({
+      code: "MOBILE_DEVICE_STATUS_FAILED",
+      message: error.statusCode ? error.message : "Unable to verify this device.",
+    });
+  }
+};
+
+app.post(`${BASE_ROUTE}/mobile-app/device/status`, checkMobileAppDevice);
+app.post(`${BASE_ROUTE}/mobile-app/device/verify`, checkMobileAppDevice);
+
+app.post(`${BASE_ROUTE}/mobile-app/device/enroll`, async (req, res) => {
+  try {
+    const user = await getMobileDeviceRequestUser(req, res);
+    if (!user) return;
+
+    const {
+      installationId,
+      deviceHash,
+      deviceName,
+      deviceModel = "",
+      deviceManufacturer = "",
+      deviceOS,
+      deviceOSVersion = "",
+      platform,
+      appVersion = "",
+    } = req.body || {};
+
+    const normalizedInstallationId = String(installationId || "").trim();
+    const normalizedDeviceHash = String(deviceHash || "").trim().toLowerCase();
+    const metadata = {
+      deviceName,
+      deviceModel,
+      deviceManufacturer,
+      deviceOS,
+      deviceOSVersion,
+      platform,
+      appVersion,
+    };
+
+    if (
+      !validateMobileInstallationId(normalizedInstallationId) ||
+      !/^[a-f0-9]{64}$/.test(normalizedDeviceHash) ||
+      !["deviceName", "deviceOS", "platform"].every(
+        (field) =>
+          typeof metadata[field] === "string" &&
+          metadata[field].trim().length > 0 &&
+          metadata[field].trim().length <= 120
+      ) ||
+      !["deviceModel", "deviceManufacturer", "deviceOSVersion", "appVersion"].every(
+        (field) =>
+          typeof metadata[field] === "string" &&
+          metadata[field].trim().length <= 120
+      )
+    ) {
+      return res.status(400).json({
+        code: "INVALID_DEVICE_DETAILS",
+        message: "Valid device identity and metadata are required.",
+      });
+    }
+
+    const existingInstallation = await MobileApp.findOne({
+      installationId: normalizedInstallationId,
+    });
+    if (existingInstallation) {
+      if (existingInstallation.userId.toString() !== user._id.toString()) {
+        return res.status(409).json({
+          code: "DEVICE_BOUND_TO_ANOTHER_ACCOUNT",
+          message:
+            "This device is already registered to another KMFRI account. Please contact the administrator if this device has been reassigned to you.",
+        });
+      }
+      if (!existingInstallation.isActive) {
+        return res.status(403).json({
+          code: "DEVICE_REVOKED",
+          message:
+            "This device registration has been revoked. Contact an authorized KMFRI administrator.",
+        });
+      }
+
+      existingInstallation.lastSeenAt = new Date();
+      existingInstallation.lastAuthenticatedAt = new Date();
+      await existingInstallation.save();
+      return res.status(200).json({
+        success: true,
+        device: mobileDeviceSummary(existingInstallation),
+      });
+    }
+
+    const activeUserDevice = await MobileApp.findOne({
+      userId: user._id,
+      isActive: true,
+    });
+    if (activeUserDevice) {
+      return res.status(409).json({
+        code: "USER_DEVICE_ALREADY_ENROLLED",
+        message:
+          "Your KMFRI Clocking account is already linked to another device.",
+      });
+    }
+
+    const now = new Date();
+    const device = await MobileApp.create({
+      userId: user._id,
+      installationId: normalizedInstallationId,
+      deviceHash: normalizedDeviceHash,
+      deviceName: metadata.deviceName.trim(),
+      deviceModel: metadata.deviceModel.trim(),
+      deviceManufacturer: metadata.deviceManufacturer.trim(),
+      deviceOS: metadata.deviceOS.trim(),
+      deviceOSVersion: metadata.deviceOSVersion.trim(),
+      platform: metadata.platform.trim(),
+      appVersion: metadata.appVersion.trim(),
+      enrolledAt: now,
+      lastSeenAt: now,
+      lastAuthenticatedAt: now,
+      isActive: true,
+    });
+
+    return res.status(201).json({
+      success: true,
+      device: mobileDeviceSummary(device),
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      const field = Object.keys(error.keyPattern || {})[0];
+      const code =
+        field === "userId"
+          ? "USER_DEVICE_ALREADY_ENROLLED"
+          : "DEVICE_BOUND_TO_ANOTHER_ACCOUNT";
+      return res.status(409).json({
+        code,
+        message:
+          code === "USER_DEVICE_ALREADY_ENROLLED"
+            ? "Your KMFRI Clocking account is already linked to another device."
+            : "This device is already registered to another KMFRI account.",
+      });
+    }
+
+    console.error("Mobile device enrollment failed:", error);
+    return res.status(error.statusCode || 500).json({
+      code: "MOBILE_DEVICE_ENROLLMENT_FAILED",
+      message: error.statusCode ? error.message : "Unable to enroll this device.",
+    });
+  }
+});
+
+app.post(`${BASE_ROUTE}/mobile-app/attendance/context`, async (req, res) => {
+  try {
+    let user = await getMobileDeviceRequestUser(req, res);
+    if (!user) return;
+    assertAccountCanClock(user);
+
+    const installationId = String(req.body?.installationId || "").trim();
+    if (!validateMobileInstallationId(installationId)) {
+      return res.status(400).json({
+        code: "INVALID_INSTALLATION_ID",
+        message: "A valid installation identity is required.",
+      });
+    }
+    const device = await MobileApp.findOne({
+      installationId,
+      userId: user._id,
+      isActive: true,
+    });
+    if (!device) {
+      return res.status(403).json({
+        code: "UNAUTHORIZED_DEVICE",
+        message: "Unauthorized device.",
+      });
+    }
+
+    const config = await PlatformConfig.getSingleton();
+    const stationEntry = (config.stations || []).find(
+      (item) =>
+        normalizeStationAccessName(item?.name || item) ===
+        normalizeStationAccessName(user.station)
+    );
+    if (!stationEntry || stationEntry.active === false) {
+      return res.status(403).json({
+        code: "STATION_UNAVAILABLE",
+        message: "Your assigned clocking station is not currently available.",
+      });
+    }
+
+    user = await finalizeStaleClocking(user);
+    const { action } = await determineClockingActionForUser(user);
+    device.lastSeenAt = new Date();
+    await device.save();
+    return res.status(200).json({
+      station: {
+        name: String(stationEntry.name || user.station).trim(),
+        latitude: Number(stationEntry.lat ?? 0),
+        longitude: Number(stationEntry.lng ?? 0),
+        radiusMeters: Number(
+          stationEntry.radiusMeters ?? config.geofence?.radiusMeters ?? 500
+        ),
+      },
+      geofenceEnabled: config.geofence?.enabled === true,
+      locationRequired:
+        config.attendancePolicy?.requireLocationForClocking !== false,
+      nextAction: action,
+      canClockOutside: isOutsideClockingAuthorizedNow(user),
+      maximumSyncAgeHours: 24,
+    });
+  } catch (error) {
+    console.error("Mobile attendance context load failed:", error);
+    return res.status(error.status || 500).json({
+      code: "MOBILE_ATTENDANCE_CONTEXT_FAILED",
+      message: error.status ? error.message : "Unable to load attendance settings.",
+    });
+  }
+});
+
+const getDistanceInMeters = (latitudeA, longitudeA, latitudeB, longitudeB) => {
+  const toRadians = (value) => (value * Math.PI) / 180;
+  const earthRadiusMeters = 6371000;
+  const deltaLatitude = toRadians(latitudeB - latitudeA);
+  const deltaLongitude = toRadians(longitudeB - longitudeA);
+  const haversine = Math.min(1, Math.max(0,
+    Math.sin(deltaLatitude / 2) ** 2 +
+    Math.cos(toRadians(latitudeA)) *
+      Math.cos(toRadians(latitudeB)) *
+      Math.sin(deltaLongitude / 2) ** 2
+  ));
+  return 2 * earthRadiusMeters * Math.atan2(
+    Math.sqrt(haversine),
+    Math.sqrt(1 - haversine)
+  );
+};
+
+app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
+  try {
+    const user = await getMobileDeviceRequestUser(req, res);
+    if (!user) return;
+    assertAccountCanClock(user);
+
+    const {
+      installationId,
+      localRecordId,
+      action,
+      eventAt,
+      selectedStation,
+      userCoords,
+    } = req.body || {};
+    const normalizedInstallationId = String(installationId || "").trim();
+    const normalizedRecordId = String(localRecordId || "").trim();
+    if (
+      !validateMobileInstallationId(normalizedInstallationId) ||
+      !validateMobileInstallationId(normalizedRecordId)
+    ) {
+      return res.status(400).json({
+        code: "INVALID_MOBILE_RECORD_ID",
+        message: "Valid mobile device and clocking record identities are required.",
+      });
+    }
+    if (!["clock_in", "clock_out"].includes(action)) {
+      return res.status(400).json({
+        code: "INVALID_CLOCKING_ACTION",
+        message: "Invalid clocking action.",
+      });
+    }
+
+    const device = await MobileApp.findOne({
+      installationId: normalizedInstallationId,
+      userId: user._id,
+      isActive: true,
+    });
+    if (!device) {
+      return res.status(403).json({
+        code: "UNAUTHORIZED_DEVICE",
+        message: "Unauthorized device.",
+      });
+    }
+
+    const priorAttendance = await Clocking.findOne({
+      $or: [
+        { mobileClockInRecordId: normalizedRecordId },
+        { mobileClockOutRecordId: normalizedRecordId },
+      ],
+    });
+    if (priorAttendance) {
+      const recordedAction =
+        priorAttendance.mobileClockInRecordId === normalizedRecordId
+          ? "clock_in"
+          : "clock_out";
+      if (
+        priorAttendance.email !== user.email ||
+        priorAttendance.mobileDeviceId?.toString() !== device._id.toString() ||
+        recordedAction !== action
+      ) {
+        return res.status(409).json({
+          code: "CLOCKING_RECORD_ID_CONFLICT",
+          message: "This clocking record ID was already used for another event.",
+        });
+      }
+      const recordedAt =
+        action === "clock_in"
+          ? priorAttendance.clock_in
+          : priorAttendance.clock_out;
+      return res.status(200).json({
+        success: true,
+        synced: true,
+        alreadySynced: true,
+        localRecordId: normalizedRecordId,
+        action,
+        eventAt: recordedAt,
+      });
+    }
+
+    const parsedEventAt = new Date(eventAt);
+    const now = new Date();
+    const maximumSyncAgeMs = 24 * 60 * 60 * 1000;
+    if (
+      typeof eventAt !== "string" ||
+      Number.isNaN(parsedEventAt.getTime()) ||
+      parsedEventAt > now ||
+      now.getTime() - parsedEventAt.getTime() > maximumSyncAgeMs
+    ) {
+      return res.status(422).json({
+        code: "MOBILE_EVENT_TIME_OUT_OF_RANGE",
+        message:
+          "This offline clocking event is outside the 24-hour synchronization window.",
+      });
+    }
+
+    const rawLatitude = userCoords?.latitude;
+    const rawLongitude = userCoords?.longitude;
+    const latitude = Number(rawLatitude);
+    const longitude = Number(rawLongitude);
+    const hasValidCoordinates =
+      rawLatitude !== null &&
+      rawLatitude !== undefined &&
+      rawLongitude !== null &&
+      rawLongitude !== undefined &&
+      Number.isFinite(latitude) &&
+      Number.isFinite(longitude) &&
+      latitude >= -90 &&
+      latitude <= 90 &&
+      longitude >= -180 &&
+      longitude <= 180;
+    const attendancePolicy = await getAttendancePolicy();
+    if (
+      attendancePolicy.requireLocationForClocking !== false &&
+      !hasValidCoordinates
+    ) {
+      return res.status(400).json({
+        code: "LOCATION_REQUIRED",
+        message: "Location access is required before clocking.",
+      });
+    }
+
+    const assignedStation = String(user.station || "").trim();
+    const requestedStation = String(selectedStation || "").trim();
+    if (
+      assignedStation &&
+      requestedStation &&
+      normalizeStationAccessName(assignedStation) !==
+        normalizeStationAccessName(requestedStation)
+    ) {
+      return res.status(403).json({
+        code: "STATION_MISMATCH",
+        message: "Clocking is restricted to your assigned station.",
+      });
+    }
+    const stationName = assignedStation || requestedStation;
+    if (
+      attendancePolicy.requireStationSelection !== false &&
+      !stationName
+    ) {
+      return res.status(400).json({
+        code: "STATION_REQUIRED",
+        message: "Station selection is required before clocking.",
+      });
+    }
+    const config = await PlatformConfig.getSingleton();
+    const stationEntry = (config.stations || []).find(
+      (item) =>
+        normalizeStationAccessName(item?.name || item) ===
+        normalizeStationAccessName(stationName)
+    );
+    if (!stationEntry || stationEntry.active === false) {
+      return res.status(403).json({
+        code: "STATION_UNAVAILABLE",
+        message: "The selected clocking station is not currently available.",
+      });
+    }
+
+    const todayHoliday = await getHolidayForDate(parsedEventAt);
+    if (todayHoliday) {
+      return res.status(403).json({
+        code: "HOLIDAY_CLOCKING_DISABLED",
+        message: `Clocking is disabled because ${todayHoliday.name} is a configured holiday.`,
+      });
+    }
+
+    let withinPremise = true;
+    if (config.geofence?.enabled === true) {
+      const stationLatitude = Number(stationEntry.lat);
+      const stationLongitude = Number(stationEntry.lng);
+      const radiusMeters = Number(
+        stationEntry.radiusMeters ?? config.geofence.radiusMeters ?? 500
+      );
+      if (
+        !hasValidCoordinates ||
+        !Number.isFinite(stationLatitude) ||
+        !Number.isFinite(stationLongitude) ||
+        (stationLatitude === 0 && stationLongitude === 0) ||
+        !Number.isFinite(radiusMeters) ||
+        radiusMeters <= 0
+      ) {
+        return res.status(503).json({
+          code: "STATION_GEOFENCE_UNAVAILABLE",
+          message: "The station location is not configured for mobile clocking.",
+        });
+      }
+      withinPremise =
+        getDistanceInMeters(
+          latitude,
+          longitude,
+          stationLatitude,
+          stationLongitude
+        ) <= radiusMeters;
+      if (
+        !withinPremise &&
+        !isOutsideClockingAuthorizedNow(user, parsedEventAt)
+      ) {
+        return res.status(403).json({
+          code: "OUTSIDE_GEOFENCE",
+          message:
+            "You are outside the station premises and are not authorized to clock outside.",
+        });
+      }
+    }
+
+    const outsideLocation = withinPremise
+      ? ""
+      : `Mobile GPS (${latitude.toFixed(5)}, ${longitude.toFixed(5)})`;
+    const meta = await performVerifiedAttendance({
+      req,
+      user,
+      attendancePolicy,
+      selectedStation: stationName,
+      userCoords: hasValidCoordinates ? { latitude, longitude } : null,
+      outsideLocation,
+      withinPremiseFromClient: withinPremise,
+      expectedAction: action,
+      eventAt: parsedEventAt,
+      mobileDeviceId: device._id,
+      mobileRecordId: normalizedRecordId,
+      staleCheckAt: parsedEventAt,
+      suppressNotifications: true,
+    });
+
+    device.lastSeenAt = new Date();
+    await device.save();
+    return res.status(200).json({
+      success: true,
+      synced: true,
+      alreadySynced: false,
+      localRecordId: normalizedRecordId,
+      attendance: meta,
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      const localRecordId = String(req.body?.localRecordId || "").trim();
+      const requestedAction = req.body?.action;
+      const priorAttendance = await Clocking.findOne({
+        $or: [
+          { mobileClockInRecordId: localRecordId },
+          { mobileClockOutRecordId: localRecordId },
+        ],
+      });
+      const sessionUserId = req.session?.userID;
+      const currentUser = req.session?.isOnline && sessionUserId
+        ? await User.findById(sessionUserId)
+        : null;
+      const installationId = String(req.body?.installationId || "").trim();
+      const registeredDevice =
+        currentUser && validateMobileInstallationId(installationId)
+          ? await MobileApp.findOne({
+              installationId,
+              userId: currentUser._id,
+              isActive: true,
+            })
+          : null;
+      const recordedAction =
+        priorAttendance?.mobileClockInRecordId === localRecordId
+          ? "clock_in"
+          : priorAttendance?.mobileClockOutRecordId === localRecordId
+            ? "clock_out"
+            : null;
+      if (
+        priorAttendance &&
+        registeredDevice &&
+        priorAttendance.email === currentUser.email &&
+        priorAttendance.mobileDeviceId?.toString() ===
+          registeredDevice._id.toString() &&
+        recordedAction === requestedAction
+      ) {
+        return res.status(200).json({
+          success: true,
+          synced: true,
+          alreadySynced: true,
+          localRecordId,
+        });
+      }
+      return res.status(409).json({
+        code: "CLOCKING_RECORD_ID_CONFLICT",
+        message: "This clocking record ID was already used for another event.",
+      });
+    }
+    console.error("Mobile attendance synchronization failed:", error);
+    return res.status(error.status || error.statusCode || 400).json({
+      code: error.code || "MOBILE_ATTENDANCE_SYNC_FAILED",
+      message: error.message || "Unable to synchronize this attendance event.",
+      ...(error.meta ? { meta: error.meta } : {}),
+    });
+  }
+});
+
+app.post(
+  `${BASE_ROUTE}/mobile-app/device/:deviceId/revoke`,
+  async (req, res) => {
+    try {
+      if (!req.session?.isOnline || !req.session?.userID) {
+        return res.status(401).json({
+          code: "UNAUTHORIZED",
+          message: "Unauthorized",
+        });
+      }
+
+      const actor = await User.findById(req.session.userID);
+      if (!actor) {
+        return res.status(401).json({
+          code: "UNAUTHORIZED",
+          message: "Unauthorized",
+        });
+      }
+      if (!["admin", "hr", "superadmin"].includes(actor.rank)) {
+        return res.status(403).json({
+          code: "ACCESS_DENIED",
+          message: "Only an authorized administrator can revoke a mobile device.",
+        });
+      }
+      if (!mongoose.isValidObjectId(req.params.deviceId)) {
+        return res.status(400).json({
+          code: "INVALID_DEVICE_ID",
+          message: "Invalid mobile device ID.",
+        });
+      }
+
+      const reason = String(req.body?.reason || "").trim();
+      if (reason.length < 5 || reason.length > 500) {
+        return res.status(400).json({
+          code: "INVALID_REVOCATION_REASON",
+          message: "Provide a revocation reason between 5 and 500 characters.",
+        });
+      }
+
+      const device = await MobileApp.findOneAndUpdate(
+        { _id: req.params.deviceId, isActive: true },
+        {
+          $set: {
+            isActive: false,
+            revokedAt: new Date(),
+            revokedReason: reason,
+          },
+        },
+        { new: true }
+      );
+      if (!device) {
+        return res.status(404).json({
+          code: "ACTIVE_DEVICE_NOT_FOUND",
+          message: "No active mobile device was found.",
+        });
+      }
+
+      const affectedUser = await User.findById(device.userId)
+        .select("name email role rank")
+        .lean();
+      await createAuditLog({
+        req,
+        category: "device",
+        action: "mobile_device.revoked",
+        description: "Mobile app device registration revoked",
+        actor,
+        target: affectedUser,
+        metadata: {
+          mobileAppDeviceId: device._id,
+          reason,
+        },
+      });
+
+      return res.status(200).json({
+        success: true,
+        device: mobileDeviceSummary(device),
+      });
+    } catch (error) {
+      console.error("Mobile device revocation failed:", error);
+      return res.status(500).json({
+        code: "MOBILE_DEVICE_REVOCATION_FAILED",
+        message: "Unable to revoke this mobile device.",
+      });
+    }
+  }
+);
 
 // add device
 app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
