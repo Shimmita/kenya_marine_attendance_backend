@@ -9143,7 +9143,7 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       return res.status(422).json({
         code: "MOBILE_EVENT_TIME_OUT_OF_RANGE",
         message:
-          "A clocking event must have a valid timestamp that is not in the future.",
+          "A clocking event must have a valid timestamp no more than 5 minutes ahead of server time.",
       });
     }
 

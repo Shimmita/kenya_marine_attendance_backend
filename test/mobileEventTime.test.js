@@ -22,7 +22,13 @@ test("rejects invalid and future event timestamps", () => {
   assert.equal(parseMobileEventAt("", now), null);
   assert.equal(parseMobileEventAt(undefined, now), null);
   assert.equal(
-    parseMobileEventAt("2026-10-07T14:00:00.001Z", now),
+    parseMobileEventAt("2026-10-07T14:05:00.001Z", now),
     null,
   );
+});
+
+test("accepts a small device clock skew and preserves the submitted timestamp", () => {
+  const eventAt = "2026-10-07T14:04:59.999Z";
+
+  assert.equal(parseMobileEventAt(eventAt, now)?.toISOString(), eventAt);
 });
