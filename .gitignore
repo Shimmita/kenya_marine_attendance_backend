@@ -8,3 +8,6 @@
 .vscode/*
 
 node_modules
+
+.cache
+clocking_app.code-workspace

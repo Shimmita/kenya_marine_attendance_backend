@@ -42,6 +42,7 @@ import {
   getHolidayForDate,
   getWorkingDateKeysInRange as getConfiguredWorkingDateKeysInRange
 } from "./services/holiday.js";
+import { parseMobileEventAt } from "./util/mobileEventTime.js";
 import { SendMessageNow } from "./util/SendSMS.js";
 
 const PORT = process.env.PORT || 5000;
@@ -9030,7 +9031,7 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/context`, async (req, res) => {
         config.attendancePolicy?.requireLocationForClocking !== false,
       nextAction: action,
       canClockOutside: isOutsideClockingAuthorizedNow(user),
-      maximumSyncAgeHours: 24,
+      maximumSyncAgeHours: null,
     });
   } catch (error) {
     console.error("Mobile attendance context load failed:", error);
@@ -9137,19 +9138,12 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       });
     }
 
-    const parsedEventAt = new Date(eventAt);
-    const now = new Date();
-    const maximumSyncAgeMs = 24 * 60 * 60 * 1000;
-    if (
-      typeof eventAt !== "string" ||
-      Number.isNaN(parsedEventAt.getTime()) ||
-      parsedEventAt > now ||
-      now.getTime() - parsedEventAt.getTime() > maximumSyncAgeMs
-    ) {
+    const parsedEventAt = parseMobileEventAt(eventAt);
+    if (!parsedEventAt) {
       return res.status(422).json({
         code: "MOBILE_EVENT_TIME_OUT_OF_RANGE",
         message:
-          "This offline clocking event is outside the 24-hour synchronization window.",
+          "A clocking event must have a valid timestamp that is not in the future.",
       });
     }
 
