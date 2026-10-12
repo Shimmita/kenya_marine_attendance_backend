@@ -10232,6 +10232,46 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
 });
 
 
+app.put(`${BASE_ROUTE}/admin/user/:id/reset-mobile-app`, async (req, res) => {
+  try {
+    if (!req.session.isOnline)
+      return res.status(401).json({ message: "Unauthorized" });
+
+    const currentUser = await User.findById(req.session.userID);
+    if (!currentUser)
+      return res.status(404).json({ message: "Current user not found" });
+
+    if (String(currentUser.rank || "").toLowerCase() !== "superadmin")
+      return res.status(403).json({ message: "Access denied" });
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser)
+      return res.status(404).json({ message: "User not found" });
+
+    const { deletedCount } = await MobileApp.deleteMany({
+      userId: targetUser._id,
+    });
+
+    await createAuditLog({
+      req,
+      category: "admin_action",
+      action: "admin.user_mobile_app_reset",
+      description: "User mobile app enrollment reset",
+      actor: currentUser,
+      target: targetUser,
+      metadata: { deletedEnrollmentCount: deletedCount },
+    });
+
+    return res.json({
+      message: `Mobile app enrollment reset successfully. ${deletedCount} enrollment record(s) removed.`,
+      deletedCount,
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+
 // admin reset password of user
 app.put(`${BASE_ROUTE}/admin/user/:id/reset-password`, async (req, res) => {
   try {
