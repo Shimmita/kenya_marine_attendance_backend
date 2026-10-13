@@ -1,10 +1,11 @@
 import cron from "node-cron";
 import { getBackupConfig } from "../services/backup/backupConfig.service.js";
 import { createDatabaseBackup } from "../services/backup/backup.service.js";
+import { resolveMongoToolPath } from "../services/backup/mongoTool.service.js";
 
 let backupTask = null;
 
-export const startBackupScheduler = () => {
+export const startBackupScheduler = async () => {
   const config = getBackupConfig();
 
   if (backupTask) {
@@ -20,6 +21,13 @@ export const startBackupScheduler = () => {
 
   if (!cron.validate(config.cronSchedule)) {
     console.error("Backup scheduler not started: BACKUP_CRON_SCHEDULE is invalid.");
+    return null;
+  }
+
+  try {
+    await resolveMongoToolPath(config.mongoDumpBin);
+  } catch (error) {
+    console.error("Backup scheduler not started:", error?.safeMessage || error?.message || error);
     return null;
   }
 

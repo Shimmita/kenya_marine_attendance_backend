@@ -1611,7 +1611,7 @@ mongoose
     try {
 
       await startAttendanceScheduler();
-      startBackupScheduler();
+      await startBackupScheduler();
 
     } catch (err) {
 

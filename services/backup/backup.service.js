@@ -1,4 +1,3 @@
-import { spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
 import mongoose from "mongoose";
@@ -30,33 +29,7 @@ import {
   startLockedOperation,
   updateOperation,
 } from "./backupOperation.service.js";
-
-const runTool = (command, args, options = {}) =>
-  new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      ...options,
-    });
-
-    let stderr = "";
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-      if (stderr.length > 4000) stderr = stderr.slice(-4000);
-    });
-
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-
-      const error = new Error(`MongoDB Database Tool exited with code ${code}.`);
-      error.diagnostic = stderr;
-      reject(error);
-    });
-  });
+import { runMongoTool } from "./mongoTool.service.js";
 
 const listDumpCollections = async (dumpRoot) => {
   const collections = new Set();
@@ -169,6 +142,7 @@ export const createDatabaseBackup = async ({ trigger = "manual", actor = null, r
     phase: "Preparing",
     trigger,
   });
+  let temporaryLocalPath = null;
 
   try {
     const config = getBackupConfig();
@@ -178,7 +152,7 @@ export const createDatabaseBackup = async ({ trigger = "manual", actor = null, r
     const backupId = buildBackupId(createdAt);
     const snapshotName = toSafeTimestamp(createdAt);
     const finalLocalPath = buildSnapshotPath(localPath, period, snapshotName);
-    const temporaryLocalPath = path.join(path.dirname(finalLocalPath), `.tmp_${backupId}`);
+    temporaryLocalPath = path.join(path.dirname(finalLocalPath), `.tmp_${backupId}`);
 
     updateOperation(operation.operationId, {
       phase: "Creating local snapshot",
@@ -191,7 +165,7 @@ export const createDatabaseBackup = async ({ trigger = "manual", actor = null, r
     await fs.mkdir(temporaryLocalPath, { recursive: true });
 
     const dumpPath = path.join(temporaryLocalPath, "dump");
-    await runTool(config.mongoDumpBin, ["--uri", config.mongoUri, "--out", dumpPath]);
+    await runMongoTool(config.mongoDumpBin, ["--uri", config.mongoUri, "--out", dumpPath]);
     await validateSnapshotDirectory(temporaryLocalPath);
 
     const collections = await listDumpCollections(dumpPath);
@@ -229,6 +203,7 @@ export const createDatabaseBackup = async ({ trigger = "manual", actor = null, r
 
     await writeJsonFile(metadataPath(temporaryLocalPath), metadata);
     await atomicFinalize(temporaryLocalPath, finalLocalPath);
+    temporaryLocalPath = null;
 
     await logBackupAudit({
       req,
@@ -314,6 +289,13 @@ export const createDatabaseBackup = async ({ trigger = "manual", actor = null, r
     };
   } catch (error) {
     console.error("Database backup failed:", error?.message || error);
+    if (temporaryLocalPath) {
+      try {
+        await fs.rm(temporaryLocalPath, { recursive: true, force: true });
+      } catch (cleanupError) {
+        console.error("Failed to clean up incomplete database backup:", cleanupError?.message || cleanupError);
+      }
+    }
     await logBackupAudit({
       req,
       actor,
@@ -325,7 +307,10 @@ export const createDatabaseBackup = async ({ trigger = "manual", actor = null, r
     finishOperation(operation.operationId, "failed", {
       phase: "Failed",
       message: "Backup failed.",
-      error: { message: "Database backup failed. Check server logs for details." },
+      error: {
+        message:
+          error?.safeMessage || "Database backup failed. Check server logs for details.",
+      },
     });
     throw error;
   }
@@ -419,8 +404,17 @@ const createPreRestoreSafetyBackup = async ({ actor, req, parentOperationId }) =
   await fs.rm(temporaryPath, { recursive: true, force: true });
   await fs.mkdir(temporaryPath, { recursive: true });
 
-  await runTool(config.mongoDumpBin, ["--uri", config.mongoUri, "--out", path.join(temporaryPath, "dump")]);
-  await validateSnapshotDirectory(temporaryPath);
+  try {
+    await runMongoTool(config.mongoDumpBin, ["--uri", config.mongoUri, "--out", path.join(temporaryPath, "dump")]);
+    await validateSnapshotDirectory(temporaryPath);
+  } catch (error) {
+    try {
+      await fs.rm(temporaryPath, { recursive: true, force: true });
+    } catch (cleanupError) {
+      console.error("Failed to clean up incomplete pre-restore backup:", cleanupError?.message || cleanupError);
+    }
+    throw error;
+  }
 
   const metadata = {
     backupId,
@@ -524,7 +518,7 @@ export const restoreBackup = async ({ source, backupId, networkMode = "configure
     });
 
     const config = getBackupConfig();
-    await runTool(config.mongoRestoreBin, [
+    await runMongoTool(config.mongoRestoreBin, [
       "--uri",
       config.mongoUri,
       "--drop",

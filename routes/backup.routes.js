@@ -14,7 +14,7 @@ import {
 import { operationSnapshot, getOperation } from "../services/backup/backupOperation.service.js";
 
 const safeResponseError = (error, fallback = "Backup request failed.") => ({
-  message: error?.statusCode === 409 ? error.message : fallback,
+  message: error?.statusCode === 409 ? error.message : error?.safeMessage || fallback,
 });
 
 export const createBackupRouter = ({ ensureSuperadmin }) => {
