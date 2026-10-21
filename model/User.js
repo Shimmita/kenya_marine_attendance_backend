@@ -62,6 +62,12 @@ const userSchema = new mongoose.Schema(
     doneBiometric: { type: Boolean, default: false },
     hasClockedIn: { type: Boolean, default: false },
     isOnLeave: { type: Boolean, default: false },
+    leaveDetails: {
+      startDate: { type: Date, default: null },
+      endDate: { type: Date, default: null },
+      reason: { type: String, enum: ["", "sickness", "maternity", "paternity", "other"], default: "" },
+      otherReason: { type: String, default: "" },
+    },
     isToClockOut: { type: Boolean, default: false },
     isAccountActive: { type: Boolean, default: true },
     isPasswordReset: { type: Boolean, default: true },

@@ -10120,6 +10120,55 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-on-leave`, async (req, res) => {
     if (!isValidValue)
       return res.status(400).json({ message: "Invalid on-leave value" });
 
+    const isOnLeave =
+      normalizedIsOnLeave === true ||
+      normalizedIsOnLeave === "true" ||
+      normalizedIsOnLeave === "yes";
+    let leaveDetails = {
+      startDate: null,
+      endDate: null,
+      reason: "",
+      otherReason: "",
+    };
+
+    if (isOnLeave) {
+      const { startDate, endDate } = req.body || {};
+      const reason = typeof req.body?.reason === "string"
+        ? req.body.reason.trim().toLowerCase()
+        : "";
+      const otherReason = typeof req.body?.otherReason === "string"
+        ? req.body.otherReason.trim()
+        : "";
+
+      if (!startDate || !endDate || !reason)
+        return res.status(400).json({ message: "Start date, end date, and reason are required" });
+
+      if (!["sickness", "maternity", "paternity", "other"].includes(reason))
+        return res.status(400).json({ message: "Invalid leave reason" });
+
+      if (reason === "other" && !otherReason)
+        return res.status(400).json({ message: "Please provide the other leave reason" });
+
+      try {
+        leaveDetails.startDate = parseSafeDate(startDate, "startDate");
+        leaveDetails.endDate = parseSafeDate(endDate, "endDate");
+      } catch (dateError) {
+        return res.status(400).json({ message: dateError.message });
+      }
+
+      if (!leaveDetails.startDate || !leaveDetails.endDate)
+        return res.status(400).json({ message: "Start date and end date are required" });
+
+      if (leaveDetails.endDate < leaveDetails.startDate)
+        return res.status(400).json({ message: "End date cannot be before start date." });
+
+      if (otherReason.length > 300)
+        return res.status(400).json({ message: "Other leave reason cannot exceed 300 characters" });
+
+      leaveDetails.reason = reason;
+      leaveDetails.otherReason = reason === "other" ? otherReason : "";
+    }
+
     const currentUser = await User.findById(req.session.userID);
     if (!currentUser)
       return res.status(404).json({ message: "Current user not found" });
@@ -10135,10 +10184,8 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-on-leave`, async (req, res) => {
       return res.status(403).json({ message: "HR access is limited to users in your station" });
 
     const previousIsOnLeave = targetUser.isOnLeave;
-    targetUser.isOnLeave =
-      normalizedIsOnLeave === true ||
-      normalizedIsOnLeave === "true" ||
-      normalizedIsOnLeave === "yes";
+    targetUser.isOnLeave = isOnLeave;
+    targetUser.leaveDetails = leaveDetails;
 
     await targetUser.save();
 
@@ -10152,6 +10199,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/update-on-leave`, async (req, res) => {
       metadata: {
         previousIsOnLeave,
         isOnLeave: targetUser.isOnLeave,
+        leaveDetails: targetUser.leaveDetails,
       },
     });
 
@@ -11016,6 +11064,12 @@ app.put(`${BASE_ROUTE}/admin/user/:id/revoke-on-leave`, async (req, res) => {
 
     // Reset fields to default values
     targetUser.isOnLeave = false;
+    targetUser.leaveDetails = {
+      startDate: null,
+      endDate: null,
+      reason: "",
+      otherReason: "",
+    };
     // save changes
     await targetUser.save();
 
