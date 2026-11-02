@@ -3632,6 +3632,81 @@ const normalizeKenyaPhone = (phone) => {
   return null;
 };
 
+const isDateWindowStarted = (startDate, now = new Date()) => {
+  const start = getNairobiBoundaryForStoredDate(startDate, "startDate", "start");
+  return Boolean(start && now >= start);
+};
+
+const resetOnLeaveFields = (user) => {
+  user.isOnLeave = false;
+  user.leaveDetails = {
+    startDate: null,
+    endDate: null,
+    reason: "",
+    otherReason: "",
+  };
+};
+
+const getUserLeaveReason = (leave) => {
+  const type = String(leave?.type || "").toLowerCase();
+  if (type.includes("sick")) return { reason: "sickness", otherReason: "" };
+  if (type.includes("maternity")) return { reason: "maternity", otherReason: "" };
+  if (type.includes("paternity")) return { reason: "paternity", otherReason: "" };
+  return { reason: "other", otherReason: leave?.type || leave?.remarks || "Approved leave" };
+};
+
+const setUserLeaveDetailsFromRecord = (user, leave) => {
+  const leaveReason = getUserLeaveReason(leave);
+  user.leaveDetails = {
+    startDate: leave.startDate,
+    endDate: leave.endDate,
+    ...leaveReason,
+  };
+};
+
+const clearExpiredOnLeave = async (user, now = new Date()) => {
+  const approvedLeaves = await Leave.find({
+    email: String(user.email || "").toLowerCase(),
+    status: "approved",
+  });
+
+  const activeLeave = approvedLeaves.find((leave) =>
+    isDateWindowStarted(leave.startDate, now) && !isDateWindowEnded(leave.endDate, now)
+  );
+
+  if (activeLeave) {
+    setUserLeaveDetailsFromRecord(user, activeLeave);
+    user.isOnLeave = true;
+    await user.save();
+    return user;
+  }
+
+  if (!user?.isOnLeave) return user;
+
+  const hasFutureLeave = approvedLeaves.some((leave) =>
+    !isDateWindowStarted(leave.startDate, now) && !isDateWindowEnded(leave.endDate, now)
+  );
+  if (hasFutureLeave) return user;
+
+  const leaveEndDate = user.leaveDetails?.endDate;
+  if (!leaveEndDate || isDateWindowEnded(leaveEndDate, now)) {
+    const shouldNotify = Boolean(leaveEndDate);
+    resetOnLeaveFields(user);
+    await user.save();
+
+    if (shouldNotify) {
+      await sendConfiguredSystemMessage(
+        user,
+        "manualLeaveDisabledMessage",
+        `Dear ${user.name}, your approved leave has ended and your attendance profile has been automatically removed from on-leave status.`,
+        { endDate: formatLeaveDate(leaveEndDate) }
+      );
+    }
+  }
+
+  return user;
+};
+
 const clearExpiredOutsideClocking = async (user, now = new Date()) => {
   if (!user?.canClockOutside || !user?.outsideClockingDetails?.endDate) return user;
 
@@ -3696,6 +3771,7 @@ const refreshUserAutomaticRestrictions = async (user, now = new Date()) => {
   if (!user) return user;
   user = await clearExpiredTemporaryAccount(user, now);
   user = await clearExpiredOutsideClocking(user, now);
+  user = await clearExpiredOnLeave(user, now);
   return user;
 };
 
@@ -3704,6 +3780,8 @@ const refreshAutomaticRestrictionsForUsers = async (filter = {}, now = new Date(
     $or: [
       { role: { $in: Array.from(TEMPORARY_ACCOUNT_ROLES) }, endDate: { $nin: [null, ""] } },
       { canClockOutside: true, "outsideClockingDetails.endDate": { $ne: null } },
+      { isOnLeave: true },
+      { "leaveDetails.endDate": { $ne: null } },
     ],
   };
 
@@ -10634,7 +10712,15 @@ app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
     }
 
     if (updatedLeave.status === "approved") {
-      targetUser.isOnLeave = true;
+      const leaveIsActive =
+        isDateWindowStarted(updatedLeave.startDate) &&
+        !isDateWindowEnded(updatedLeave.endDate);
+      targetUser.isOnLeave = leaveIsActive;
+      if (isDateWindowEnded(updatedLeave.endDate)) {
+        resetOnLeaveFields(targetUser);
+      } else {
+        setUserLeaveDetailsFromRecord(targetUser, updatedLeave);
+      }
       await targetUser.save();
     }
 
@@ -10647,7 +10733,7 @@ app.put(`${BASE_ROUTE}/admin/leave/:id`, async (req, res) => {
       });
 
       if (!otherApprovedLeave) {
-        targetUser.isOnLeave = false;
+        resetOnLeaveFields(targetUser);
         await targetUser.save();
       }
     }
@@ -10724,7 +10810,7 @@ app.delete(`${BASE_ROUTE}/leave/:id`, async (req, res) => {
         });
 
         if (!otherApprovedLeave) {
-          targetUser.isOnLeave = false;
+          resetOnLeaveFields(targetUser);
           await targetUser.save();
         }
       }
