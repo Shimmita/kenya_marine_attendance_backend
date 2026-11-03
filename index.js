@@ -9150,6 +9150,7 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       eventAt,
       selectedStation,
       userCoords,
+      outsideLocation,
     } = req.body || {};
     const normalizedInstallationId = String(installationId || "").trim();
     const normalizedRecordId = String(localRecordId || "").trim();
@@ -9206,6 +9207,12 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
         action === "clock_in"
           ? priorAttendance.clock_in
           : priorAttendance.clock_out;
+      const clockedOutside = action === "clock_in"
+        ? !priorAttendance.clockInWithinPremise && Boolean(priorAttendance.clockInLocationName)
+        : !priorAttendance.clockOutWithinPremise && Boolean(priorAttendance.clockOutLocationName);
+      const locationName = action === "clock_in"
+        ? priorAttendance.clockInLocationName
+        : priorAttendance.clockOutLocationName;
       return res.status(200).json({
         success: true,
         synced: true,
@@ -9213,6 +9220,11 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
         localRecordId: normalizedRecordId,
         action,
         eventAt: recordedAt,
+        attendance: {
+          action,
+          clockedOutside,
+          outsideLocation: clockedOutside ? locationName : "",
+        },
       });
     }
 
@@ -9334,16 +9346,160 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       }
     }
 
-    const outsideLocation = withinPremise
+    const submittedOutsideLocation = normalizeClockingLocationName(outsideLocation);
+    const resolvedOutsideLocation = withinPremise
       ? ""
-      : `Mobile GPS (${latitude.toFixed(5)}, ${longitude.toFixed(5)})`;
+      : submittedOutsideLocation;
+
+    // A web/mobile event pair can represent the same attendance action when clients
+    // create it at nearly the same time. Reconcile by timestamp and immutable mobile
+    // record ID instead of allowing stale mobile replay to mutate the session state.
+    // Cross-channel replay is considered the same event only within a short
+    // clock-skew window. A larger window can merge legitimate clock actions
+    // that happen at different times and on different dates.
+    const RECONCILIATION_WINDOW_MS = 5 * 60 * 1000;
+    const reconciliationWindowStart = new Date(parsedEventAt.getTime() - RECONCILIATION_WINDOW_MS);
+    const reconciliationWindowEnd = new Date(parsedEventAt.getTime() + RECONCILIATION_WINDOW_MS);
+    let reconciledAttendance = null;
+
+    if (action === "clock_in") {
+      reconciledAttendance = await Clocking.findOne({
+        email: user.email,
+        clock_in: { $gte: reconciliationWindowStart, $lte: reconciliationWindowEnd },
+        mobileClockInRecordId: { $exists: false },
+      }).sort({ clock_in: -1 });
+
+      if (reconciledAttendance) {
+        reconciledAttendance.mobileClockInRecordId = normalizedRecordId;
+        reconciledAttendance.mobileDeviceId = device._id;
+        reconciledAttendance.clockInWithinPremise = withinPremise;
+        reconciledAttendance.clockInLocationName = withinPremise
+          ? IN_PREMISE_LOCATION_LABEL
+          : resolvedOutsideLocation;
+        if (!withinPremise && resolvedOutsideLocation) {
+          reconciledAttendance.clockedOutSide = true;
+          reconciledAttendance.outsideLocation = resolvedOutsideLocation;
+          reconciledAttendance.outSideReason = user.outsideClockingDetails?.reason || "";
+        }
+        if (hasValidCoordinates) {
+          reconciledAttendance.userLocation = { latitude, longitude };
+        }
+        await reconciledAttendance.save();
+      }
+    } else {
+      // A close timestamp from another channel can represent the same event.
+      // Attach the mobile identity only when that existing clock-out belongs to
+      // a chronologically valid session; do not merge distant actions.
+      reconciledAttendance = await Clocking.findOne({
+        email: user.email,
+        clock_in: { $lte: parsedEventAt },
+        clock_out: {
+          $gte: reconciliationWindowStart,
+          $lte: reconciliationWindowEnd,
+        },
+        mobileClockOutRecordId: { $exists: false },
+      }).sort({ clock_out: -1 });
+
+      if (reconciledAttendance) {
+        reconciledAttendance.mobileClockOutRecordId = normalizedRecordId;
+        reconciledAttendance.mobileDeviceId = device._id;
+      }
+
+      // Replay a historical mobile clock-out against the chronologically matching
+      // session, not against the latest session currently held by the server. This
+      // repairs yesterday's record even if today's web clock-in already finalized
+      // yesterday as a missed/System clock-out before this mobile sync arrived.
+      const exactClockOutMatch = Boolean(reconciledAttendance);
+      if (exactClockOutMatch) {
+        reconciledAttendance.clockOutWithinPremise = withinPremise;
+        reconciledAttendance.clockOutLocationName = withinPremise
+          ? IN_PREMISE_LOCATION_LABEL
+          : resolvedOutsideLocation;
+        if (!withinPremise && resolvedOutsideLocation) {
+          reconciledAttendance.clockedOutSide = true;
+          reconciledAttendance.outsideLocation = resolvedOutsideLocation;
+          reconciledAttendance.outSideReason = user.outsideClockingDetails?.reason || "";
+        }
+        await reconciledAttendance.save();
+      } else {
+        const chronologicalCandidates = await Clocking.find({
+          email: user.email,
+          clock_in: { $lte: parsedEventAt },
+          mobileClockOutRecordId: { $exists: false },
+          $or: [
+            { clock_out: null },
+            { missedClockOut: true, clockOutLocationName: "System" },
+          ],
+        }).sort({ clock_in: -1 });
+
+        reconciledAttendance = chronologicalCandidates[0] || null;
+        if (reconciledAttendance) {
+          reconciledAttendance.clock_out = parsedEventAt;
+          const correctedWorkedHours = Math.max(
+            0,
+            (parsedEventAt.getTime() - reconciledAttendance.clock_in.getTime()) /
+              (1000 * 60 * 60)
+          );
+          reconciledAttendance.isPresent = correctedWorkedHours >= 5;
+          reconciledAttendance.mobileClockOutRecordId = normalizedRecordId;
+          reconciledAttendance.mobileDeviceId = device._id;
+          reconciledAttendance.clockOutWithinPremise = withinPremise;
+          reconciledAttendance.clockOutLocationName = withinPremise
+            ? IN_PREMISE_LOCATION_LABEL
+            : resolvedOutsideLocation;
+          reconciledAttendance.missedClockOut = false;
+          if (!withinPremise && resolvedOutsideLocation) {
+            reconciledAttendance.clockedOutSide = true;
+            reconciledAttendance.outsideLocation = resolvedOutsideLocation;
+            reconciledAttendance.outSideReason = user.outsideClockingDetails?.reason || "";
+          }
+          await reconciledAttendance.save();
+
+          const newestOpenAttendance = await Clocking.findOne({
+            email: user.email,
+            clock_out: null,
+          }).sort({ clock_in: -1 });
+          user.hasClockedIn = Boolean(newestOpenAttendance);
+          user.isToClockOut = Boolean(newestOpenAttendance);
+          await user.save();
+        }
+      }
+    }
+
+    if (reconciledAttendance) {
+      device.lastSeenAt = new Date();
+      await device.save();
+      const clockedOutside = action === "clock_in"
+        ? !reconciledAttendance.clockInWithinPremise
+        : !reconciledAttendance.clockOutWithinPremise;
+      const reconciledLocation = action === "clock_in"
+        ? reconciledAttendance.clockInLocationName
+        : reconciledAttendance.clockOutLocationName;
+      return res.status(200).json({
+        success: true,
+        synced: true,
+        alreadySynced: false,
+        reconciled: true,
+        localRecordId: normalizedRecordId,
+        action,
+        eventAt: action === "clock_in"
+          ? reconciledAttendance.clock_in
+          : reconciledAttendance.clock_out,
+        attendance: {
+          action,
+          clockedOutside,
+          outsideLocation: clockedOutside ? reconciledLocation : "",
+        },
+      });
+    }
+
     const meta = await performVerifiedAttendance({
       req,
       user,
       attendancePolicy,
       selectedStation: stationName,
       userCoords: hasValidCoordinates ? { latitude, longitude } : null,
-      outsideLocation,
+      outsideLocation: resolvedOutsideLocation,
       withinPremiseFromClient: withinPremise,
       expectedAction: action,
       eventAt: parsedEventAt,
