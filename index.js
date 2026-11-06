@@ -9151,6 +9151,8 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       selectedStation,
       userCoords,
       outsideLocation,
+      withinPremise,
+      isWithinGeofence,
     } = req.body || {};
     const normalizedInstallationId = String(installationId || "").trim();
     const normalizedRecordId = String(localRecordId || "").trim();
@@ -9307,49 +9309,50 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       });
     }
 
-    let withinPremise = true;
-    if (config.geofence?.enabled === true) {
-      const stationLatitude = Number(stationEntry.lat);
-      const stationLongitude = Number(stationEntry.lng);
-      const radiusMeters = Number(
-        stationEntry.radiusMeters ?? config.geofence.radiusMeters ?? 500
-      );
-      if (
-        !hasValidCoordinates ||
-        !Number.isFinite(stationLatitude) ||
-        !Number.isFinite(stationLongitude) ||
-        (stationLatitude === 0 && stationLongitude === 0) ||
-        !Number.isFinite(radiusMeters) ||
-        radiusMeters <= 0
-      ) {
-        return res.status(503).json({
-          code: "STATION_GEOFENCE_UNAVAILABLE",
-          message: "The station location is not configured for mobile clocking.",
-        });
-      }
-      withinPremise =
+    const clientWithinPremise = parseOptionalBoolean(withinPremise);
+    const clientIsWithinGeofence = parseOptionalBoolean(isWithinGeofence);
+    const submittedWithinPremise =
+      clientWithinPremise === null ? clientIsWithinGeofence : clientWithinPremise;
+
+    const stationLatitude = Number(stationEntry.lat);
+    const stationLongitude = Number(stationEntry.lng);
+    const radiusMeters = Number(
+      stationEntry.radiusMeters ?? config.geofence?.radiusMeters ?? 500
+    );
+    const hasConfiguredStationLocation =
+      Number.isFinite(stationLatitude) &&
+      Number.isFinite(stationLongitude) &&
+      !(stationLatitude === 0 && stationLongitude === 0);
+    const hasConfiguredGeofenceRadius =
+      Number.isFinite(radiusMeters) && radiusMeters > 0;
+
+    let withinPremiseResult = submittedWithinPremise;
+    if (hasValidCoordinates && hasConfiguredStationLocation && hasConfiguredGeofenceRadius) {
+      withinPremiseResult =
         getDistanceInMeters(
           latitude,
           longitude,
           stationLatitude,
           stationLongitude
         ) <= radiusMeters;
-      if (
-        !withinPremise &&
-        !isOutsideClockingAuthorizedNow(user, parsedEventAt)
-      ) {
-        return res.status(403).json({
-          code: "OUTSIDE_GEOFENCE",
-          message:
-            "You are outside the station premises and are not authorized to clock outside.",
-        });
-      }
+    }
+    if (withinPremiseResult === null) withinPremiseResult = true;
+
+    if (
+      !withinPremiseResult &&
+      !isOutsideClockingAuthorizedNow(user, parsedEventAt)
+    ) {
+      return res.status(403).json({
+        code: "OUTSIDE_GEOFENCE",
+        message:
+          "You are outside the station premises and are not authorized to clock outside.",
+      });
     }
 
     const submittedOutsideLocation = normalizeClockingLocationName(outsideLocation);
-    const resolvedOutsideLocation = withinPremise
+    const resolvedOutsideLocation = withinPremiseResult
       ? ""
-      : submittedOutsideLocation;
+      : (submittedOutsideLocation || "Outside location unresolved");
 
     // A web/mobile event pair can represent the same attendance action when clients
     // create it at nearly the same time. Reconcile by timestamp and immutable mobile
@@ -9372,11 +9375,11 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       if (reconciledAttendance) {
         reconciledAttendance.mobileClockInRecordId = normalizedRecordId;
         reconciledAttendance.mobileDeviceId = device._id;
-        reconciledAttendance.clockInWithinPremise = withinPremise;
-        reconciledAttendance.clockInLocationName = withinPremise
+        reconciledAttendance.clockInWithinPremise = withinPremiseResult;
+        reconciledAttendance.clockInLocationName = withinPremiseResult
           ? IN_PREMISE_LOCATION_LABEL
           : resolvedOutsideLocation;
-        if (!withinPremise && resolvedOutsideLocation) {
+        if (!withinPremiseResult && resolvedOutsideLocation) {
           reconciledAttendance.clockedOutSide = true;
           reconciledAttendance.outsideLocation = resolvedOutsideLocation;
           reconciledAttendance.outSideReason = user.outsideClockingDetails?.reason || "";
@@ -9411,11 +9414,11 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       // yesterday as a missed/System clock-out before this mobile sync arrived.
       const exactClockOutMatch = Boolean(reconciledAttendance);
       if (exactClockOutMatch) {
-        reconciledAttendance.clockOutWithinPremise = withinPremise;
-        reconciledAttendance.clockOutLocationName = withinPremise
+        reconciledAttendance.clockOutWithinPremise = withinPremiseResult;
+        reconciledAttendance.clockOutLocationName = withinPremiseResult
           ? IN_PREMISE_LOCATION_LABEL
           : resolvedOutsideLocation;
-        if (!withinPremise && resolvedOutsideLocation) {
+        if (!withinPremiseResult && resolvedOutsideLocation) {
           reconciledAttendance.clockedOutSide = true;
           reconciledAttendance.outsideLocation = resolvedOutsideLocation;
           reconciledAttendance.outSideReason = user.outsideClockingDetails?.reason || "";
@@ -9443,12 +9446,12 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
           reconciledAttendance.isPresent = correctedWorkedHours >= 5;
           reconciledAttendance.mobileClockOutRecordId = normalizedRecordId;
           reconciledAttendance.mobileDeviceId = device._id;
-          reconciledAttendance.clockOutWithinPremise = withinPremise;
-          reconciledAttendance.clockOutLocationName = withinPremise
+          reconciledAttendance.clockOutWithinPremise = withinPremiseResult;
+          reconciledAttendance.clockOutLocationName = withinPremiseResult
             ? IN_PREMISE_LOCATION_LABEL
             : resolvedOutsideLocation;
           reconciledAttendance.missedClockOut = false;
-          if (!withinPremise && resolvedOutsideLocation) {
+          if (!withinPremiseResult && resolvedOutsideLocation) {
             reconciledAttendance.clockedOutSide = true;
             reconciledAttendance.outsideLocation = resolvedOutsideLocation;
             reconciledAttendance.outSideReason = user.outsideClockingDetails?.reason || "";
@@ -9500,7 +9503,7 @@ app.post(`${BASE_ROUTE}/mobile-app/attendance/sync`, async (req, res) => {
       selectedStation: stationName,
       userCoords: hasValidCoordinates ? { latitude, longitude } : null,
       outsideLocation: resolvedOutsideLocation,
-      withinPremiseFromClient: withinPremise,
+      withinPremiseFromClient: withinPremiseResult,
       expectedAction: action,
       eventAt: parsedEventAt,
       mobileDeviceId: device._id,
