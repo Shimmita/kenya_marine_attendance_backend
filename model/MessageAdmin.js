@@ -8,11 +8,6 @@ const messageAdmin = new mongoose.Schema(
             lowercase: true,
             trim: true,
         },
-        user_id: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "User",
-            default: null,
-        },
 
         message: { type: String, required: true },
         title: { type: String, required: true },
@@ -40,12 +35,7 @@ const messageAdmin = new mongoose.Schema(
             default: "",
         },
 
-        device_fingerprint: { type: String, required: true },
-        lost_request_id: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "lostDevice",
-            default: null,
-        },
+        device_fingerprint: { type: String, required: true, unique: true },
 
     },
     { timestamps: true }

@@ -43,10 +43,6 @@ import {
   getWorkingDateKeysInRange as getConfiguredWorkingDateKeysInRange
 } from "./services/holiday.js";
 import { parseMobileEventAt } from "./util/mobileEventTime.js";
-import {
-  isValidInstallationId,
-  resolveDeviceIdentity,
-} from "./util/deviceIdentity.js";
 import { SendMessageNow } from "./util/SendSMS.js";
 
 const PORT = process.env.PORT || 5000;
@@ -1399,27 +1395,8 @@ const getUserAuthenticators = (user) => {
   return authenticators;
 };
 
-const getDeviceOwnerQuery = (userOrEmail) => {
-  if (typeof userOrEmail === "string") {
-    return { user_email: userOrEmail };
-  }
-
-  return {
-    $or: [
-      { user_id: userOrEmail._id },
-      { user_id: null, user_email: userOrEmail.email },
-    ],
-  };
-};
-
-const getUserDevices = (userOrEmail) =>
-  Devices.find(getDeviceOwnerQuery(userOrEmail));
-
-const getActiveUserDevices = async (userOrEmail) =>
-  Devices.find({
-    ...getDeviceOwnerQuery(userOrEmail),
-    device_lost: { $ne: true },
-  }).sort({ createdAt: 1 });
+const getActiveUserDevices = async (email) =>
+  Devices.find({ user_email: email, device_lost: { $ne: true } }).sort({ createdAt: 1 });
 
 const getMaxUserDevices = async () => {
   const cfg = await PlatformConfig.getSingleton();
@@ -1430,50 +1407,23 @@ const getMaxUserDevices = async () => {
 const getAuthenticatorDeviceFingerprint = (authenticator) =>
   authenticator?.deviceFingerprint || authenticator?.device_fingerprint || "";
 
-const getAuthenticatorDeviceId = (authenticator) =>
-  authenticator?.deviceId?.toString?.() || "";
-
-const getAuthenticatorInstallationId = (authenticator) =>
-  authenticator?.installationId || "";
-
 const getAuthenticatorCredentialID = (authenticator) =>
   authenticator?.credentialID || authenticator?.credentialId || authenticator?.id || "";
 
-const getDeviceBiometricState = async (
-  user,
-  deviceFingerprint = "",
-  installationId = "",
-) => {
-  const activeDevices = await getActiveUserDevices(user);
-  const activeDeviceIds = new Set(activeDevices.map((device) => device._id.toString()));
-  const activeDeviceFingerprints = new Set(activeDevices.map((device) => device.device_fingerprint));
+const getDeviceBiometricState = async (user, deviceFingerprint = "") => {
+  const activeDevices = await getActiveUserDevices(user.email);
+  const activeDeviceFingerprints = activeDevices.map((device) => device.device_fingerprint);
   const authenticators = getUserAuthenticators(user).filter((authenticator) => {
-    const authenticatorDeviceId = getAuthenticatorDeviceId(authenticator);
-    if (authenticatorDeviceId) return activeDeviceIds.has(authenticatorDeviceId);
-
     const authDeviceFingerprint = getAuthenticatorDeviceFingerprint(authenticator);
-    return !authDeviceFingerprint || activeDeviceFingerprints.has(authDeviceFingerprint);
+    return !authDeviceFingerprint || activeDeviceFingerprints.includes(authDeviceFingerprint);
   });
 
-  const { device: currentDevice, ambiguous: identityAmbiguous } = resolveDeviceIdentity(
-    activeDevices,
-    { installationId, fingerprint: deviceFingerprint },
-  );
+  const currentDevice = deviceFingerprint
+    ? activeDevices.find((device) => device.device_fingerprint === deviceFingerprint)
+    : null;
 
-  const currentDeviceAuthenticators = currentDevice
-    ? authenticators.filter((authenticator) => {
-      const authenticatorDeviceId = getAuthenticatorDeviceId(authenticator);
-      if (authenticatorDeviceId) {
-        return authenticatorDeviceId === currentDevice._id.toString();
-      }
-
-      const authenticatorInstallationId = getAuthenticatorInstallationId(authenticator);
-      if (authenticatorInstallationId) {
-        return authenticatorInstallationId === currentDevice.installation_id;
-      }
-
-      return getAuthenticatorDeviceFingerprint(authenticator) === currentDevice.device_fingerprint;
-    })
+  const currentDeviceAuthenticators = deviceFingerprint
+    ? authenticators.filter((authenticator) => getAuthenticatorDeviceFingerprint(authenticator) === deviceFingerprint)
     : [];
 
   return {
@@ -1481,14 +1431,13 @@ const getDeviceBiometricState = async (
     authenticators,
     currentDevice,
     currentDeviceAuthenticators,
-    identityAmbiguous,
     accountRegistered: authenticators.length > 0 && activeDevices.length > 0,
     currentDeviceRegistered: Boolean(currentDevice && currentDeviceAuthenticators.length > 0),
   };
 };
 
 const syncUserDeviceFlags = async (user) => {
-  const activeDevices = await getActiveUserDevices(user);
+  const activeDevices = await getActiveUserDevices(user.email);
   user.hasDevices = activeDevices.length > 1;
   user.doneBiometric = getUserAuthenticators(user).length > 0 && activeDevices.length > 0;
   user.deviceLost = activeDevices.length === 0 && user.deviceLost;
@@ -1496,12 +1445,11 @@ const syncUserDeviceFlags = async (user) => {
   return activeDevices;
 };
 
-const ensureSinglePrimaryDevice = async (userOrEmail) => {
-  const ownerQuery = getDeviceOwnerQuery(userOrEmail);
-  const activeDevices = await getActiveUserDevices(userOrEmail);
+const ensureSinglePrimaryDevice = async (email) => {
+  const activeDevices = await getActiveUserDevices(email);
   if (!activeDevices.length) {
     await Devices.updateMany(
-      ownerQuery,
+      { user_email: email },
       { $set: { device_primary: false } }
     );
     return [];
@@ -1511,7 +1459,7 @@ const ensureSinglePrimaryDevice = async (userOrEmail) => {
     activeDevices.find((device) => device.device_primary) || activeDevices[0];
 
   await Devices.updateMany(
-    ownerQuery,
+    { user_email: email },
     { $set: { device_primary: false } }
   );
   await Devices.updateOne(
@@ -1519,30 +1467,19 @@ const ensureSinglePrimaryDevice = async (userOrEmail) => {
     { $set: { device_primary: true, device_lost: false } }
   );
 
-  return getActiveUserDevices(userOrEmail);
+  return getActiveUserDevices(email);
 };
 
-const removeDeviceAuthenticator = (
-  user,
-  deviceFingerprint = "",
-  removeUnscopedAuthenticator = false,
-  deviceId = "",
-) => {
+const removeDeviceAuthenticator = (user, deviceFingerprint = "", removeUnscopedAuthenticator = false) => {
   const fingerprint = String(deviceFingerprint || "");
-  const targetDeviceId = String(deviceId || "");
-  if (!fingerprint && !targetDeviceId) return;
+  if (!fingerprint) return;
 
   user.authenticators = getUserAuthenticators(user).filter(
     (authenticator) => {
-      const authenticatorDeviceId = getAuthenticatorDeviceId(authenticator);
-      if (targetDeviceId && authenticatorDeviceId) {
-        return authenticatorDeviceId !== targetDeviceId;
-      }
-
       const authenticatorFingerprint =
         getAuthenticatorDeviceFingerprint(authenticator);
 
-      if (fingerprint && authenticatorFingerprint === fingerprint) return false;
+      if (authenticatorFingerprint === fingerprint) return false;
       if (removeUnscopedAuthenticator && !authenticatorFingerprint) return false;
 
       return true;
@@ -1551,12 +1488,29 @@ const removeDeviceAuthenticator = (
   user.authenticator = undefined;
 };
 
+const ensureLostDeviceRequestIndexes = async () => {
+  try {
+    const indexes = await DeviceLost.collection.indexes();
+    const deviceFingerprintIndex = indexes.find(
+      (index) =>
+        index.unique &&
+        index.key &&
+        Object.keys(index.key).length === 1 &&
+        index.key.device_fingerprint === 1
+    );
+
+    if (deviceFingerprintIndex?.name) {
+      await DeviceLost.collection.dropIndex(deviceFingerprintIndex.name);
+      console.log(`Dropped legacy unique lost-device index: ${deviceFingerprintIndex.name}`);
+    }
+  } catch (err) {
+    console.warn("Lost-device index cleanup skipped:", err.message);
+  }
+};
+
 const attachLostDeviceRequestDeviceInfo = async (requests = []) => {
   if (!requests.length) return requests;
 
-  const deviceIds = [
-    ...new Set(requests.map((request) => request.device_id?.toString?.()).filter(Boolean)),
-  ];
   const deviceFingerprints = [
     ...new Set(requests.map((request) => request.device_fingerprint).filter(Boolean)),
   ];
@@ -1564,39 +1518,28 @@ const attachLostDeviceRequestDeviceInfo = async (requests = []) => {
     ...new Set(requests.map((request) => request.user_email).filter(Boolean)),
   ];
 
-  if (!deviceIds.length && (!deviceFingerprints.length || !userEmails.length)) {
+  if (!deviceFingerprints.length || !userEmails.length) {
     return requests;
   }
 
-  const deviceConditions = [];
-  if (deviceIds.length) deviceConditions.push({ _id: { $in: deviceIds } });
-  if (deviceFingerprints.length && userEmails.length) {
-    deviceConditions.push({
-      user_email: { $in: userEmails },
-      device_fingerprint: { $in: deviceFingerprints },
-    });
-  }
-  const devices = await Devices.find({ $or: deviceConditions })
+  const devices = await Devices.find({
+    user_email: { $in: userEmails },
+    device_fingerprint: { $in: deviceFingerprints },
+  })
     .select("device_name device_os device_browser device_primary device_lost device_fingerprint user_email")
     .lean();
 
-  const deviceById = new Map(devices.map((device) => [device._id.toString(), device]));
-  const deviceByOwnerAndFingerprint = new Map();
-  for (const device of devices) {
-    const key = `${device.user_email}|${device.device_fingerprint}`;
-    if (!deviceByOwnerAndFingerprint.has(key)) {
-      deviceByOwnerAndFingerprint.set(key, device);
-    } else {
-      deviceByOwnerAndFingerprint.set(key, null);
-    }
-  }
+  const deviceByOwnerAndFingerprint = new Map(
+    devices.map((device) => [
+      `${device.user_email}|${device.device_fingerprint}`,
+      device,
+    ])
+  );
 
   return requests.map((request) => {
-    const device = request.device_id
-      ? deviceById.get(request.device_id.toString()) || null
-      : deviceByOwnerAndFingerprint.get(
-        `${request.user_email}|${request.device_fingerprint}`
-      ) || null;
+    const device = deviceByOwnerAndFingerprint.get(
+      `${request.user_email}|${request.device_fingerprint}`
+    );
 
     return {
       ...request,
@@ -1657,6 +1600,8 @@ mongoose
 
     await MobileApp.createIndexes();
     await Clocking.createIndexes();
+    await ensureLostDeviceRequestIndexes();
+
     /*
     |--------------------------------------------------------------------------
     | Start Attendance Scheduler
@@ -3152,12 +3097,7 @@ app.get(`${BASE_ROUTE}/biometric/status`, async (req, res) => {
     assertAccountCanClock(user);
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
-    const installationId = String(req.query.installation_id || "");
-    if (installationId && !isValidInstallationId(installationId)) {
-      return res.status(400).json({ message: "Invalid device installation identity." });
-    }
-
-    const state = await getDeviceBiometricState(user, deviceFingerprint, installationId);
+    const state = await getDeviceBiometricState(user, deviceFingerprint);
     const maxUserDevices = await getMaxUserDevices();
 
     const syncedDoneBiometric = Boolean(state.accountRegistered);
@@ -3195,22 +3135,28 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     assertAccountCanClock(user);
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
-    const installationId = String(req.query.installation_id || "");
-    if (installationId && !isValidInstallationId(installationId)) {
-      return res.status(400).json({ message: "Invalid device installation identity." });
-    }
-
-    const state = await getDeviceBiometricState(user, deviceFingerprint, installationId);
+    const state = await getDeviceBiometricState(user, deviceFingerprint);
     const maxUserDevices = await getMaxUserDevices();
 
-    const userDevices = await getUserDevices(user);
-    const { device: identifiedDevice } = resolveDeviceIdentity(userDevices, {
-      installationId,
-      fingerprint: deviceFingerprint,
-    });
+    if (deviceFingerprint) {
+      const existingLostDevice = await Devices.findOne({
+        user_email: user.email,
+        device_fingerprint: deviceFingerprint,
+        device_lost: true,
+      });
 
-    if (identifiedDevice?.device_lost) {
-      throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
+      if (existingLostDevice) {
+        throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
+      }
+
+      const existingOtherDevice = await Devices.findOne({
+        device_fingerprint: deviceFingerprint,
+        user_email: { $ne: user.email },
+      });
+
+      if (existingOtherDevice) {
+        throw new Error("This device is already enrolled by another account.");
+      }
     }
 
     if (state.currentDeviceRegistered) {
@@ -3297,14 +3243,10 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       device_os,
       device_browser,
       device_fingerprint,
-      installation_id = "",
     } = device;
 
     if (!device_fingerprint || !device_name || !device_os || !device_browser) {
       throw new Error("Device details are required to complete enrollment.");
-    }
-    if (installation_id && !isValidInstallationId(installation_id)) {
-      throw new Error("Invalid device installation identity.");
     }
 
     const verification = await verifyRegistrationResponse({
@@ -3316,18 +3258,27 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
 
     if (!verification.verified) return res.status(400).json({ registered: false });
 
-    const { credential } = verification.registrationInfo;
-    const userDevices = await getUserDevices(user);
-    const { device: existingDevice } = resolveDeviceIdentity(userDevices, {
-      installationId: installation_id,
-      fingerprint: device_fingerprint,
+	    const { credential } = verification.registrationInfo;
+	    const activeDevices = await getActiveUserDevices(user.email);
+	    const maxUserDevices = await getMaxUserDevices();
+    const existingLostDevice = await Devices.findOne({
+      user_email: user.email,
+      device_fingerprint,
+      device_lost: true,
     });
-    const existingOwnDevice =
-      existingDevice && !existingDevice.device_lost ? existingDevice : null;
-    const activeDevices = await getActiveUserDevices(user);
-    const maxUserDevices = await getMaxUserDevices();
+    const existingOwnDevice = activeDevices.find(
+      (deviceRecord) => deviceRecord.device_fingerprint === device_fingerprint
+    );
+    const existingOtherDevice = await Devices.findOne({
+      device_fingerprint,
+      user_email: { $ne: user.email },
+    });
 
-    if (existingDevice?.device_lost) {
+    if (existingOtherDevice) {
+      throw new Error("This device is already enrolled by another account.");
+    }
+
+    if (existingLostDevice) {
       throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
     }
 
@@ -3340,15 +3291,23 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       credentialPublicKey: Buffer.from(credential.publicKey).toString("base64url"),
       counter: credential.counter,
       deviceFingerprint: device_fingerprint,
-      installationId: installation_id,
       deviceName: device_name,
       deviceOS: device_os,
       deviceBrowser: device_browser,
       registeredAt: new Date(),
     };
 
+    const authenticators = getUserAuthenticators(user).filter(
+      (authenticator) =>
+        authenticator.deviceFingerprint !== device_fingerprint
+    );
+    authenticators.push(credentialRecord);
+
+    user.authenticators = authenticators;
+    user.authenticator = undefined;
+
     await Devices.updateMany(
-      getDeviceOwnerQuery(user),
+      { user_email: user.email },
       { $set: { device_primary: false } }
     );
 
@@ -3358,71 +3317,24 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       device_os,
       device_browser,
       device_primary: activeDevices.length === 0,
+      device_lost: false,
       device_fingerprint,
-      user_id: user._id,
-      ...(installation_id ? { installation_id } : {}),
     };
 
-    let savedDevice;
     if (existingOwnDevice) {
-      savedDevice = await Devices.findOneAndUpdate(
-        { _id: existingOwnDevice._id, device_lost: { $ne: true } },
-        {
-          $set: {
-            ...devicePayload,
-            ...(existingOwnDevice.installation_id || installation_id
-              ? { installation_id: existingOwnDevice.installation_id || installation_id }
-              : {}),
-            device_primary: existingOwnDevice.device_primary || activeDevices.length === 0,
-          },
-        },
-        { new: true },
+      await Devices.updateOne(
+        { _id: existingOwnDevice._id },
+        { $set: { ...devicePayload, device_primary: existingOwnDevice.device_primary || activeDevices.length === 0 } }
       );
-      if (!savedDevice) {
-        throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
-      }
     } else {
-      const newDevicePayload = { ...devicePayload, device_lost: false };
-      if (installation_id) {
-        try {
-          savedDevice = await Devices.findOneAndUpdate(
-            { user_id: user._id, installation_id },
-            { $setOnInsert: newDevicePayload },
-            { new: true, upsert: true, setDefaultsOnInsert: true },
-          );
-        } catch (error) {
-          if (error?.code !== 11000) throw error;
-          savedDevice = await Devices.findOne({
-            user_id: user._id,
-            installation_id,
-            device_lost: { $ne: true },
-          });
-          if (!savedDevice) throw error;
-        }
-      } else {
-        savedDevice = await Devices.create(newDevicePayload);
-      }
+      await Devices.create(devicePayload);
     }
 
-    credentialRecord.deviceId = savedDevice._id;
-    const authenticators = getUserAuthenticators(user).filter((authenticator) => {
-      const authenticatorDeviceId = getAuthenticatorDeviceId(authenticator);
-      if (authenticatorDeviceId) {
-        return authenticatorDeviceId !== savedDevice._id.toString();
-      }
-
-      return !existingOwnDevice ||
-        getAuthenticatorDeviceFingerprint(authenticator) !== device_fingerprint;
-    });
-    authenticators.push(credentialRecord);
-    user.authenticators = authenticators;
-    user.authenticator = undefined;
-
-    await ensureSinglePrimaryDevice(user);
+    await ensureSinglePrimaryDevice(user.email);
 
     // update user to mark biometric registration complete
     user.doneBiometric = true;
-    user.hasDevices = (await getActiveUserDevices(user)).length > 1;
+    user.hasDevices = (await getActiveUserDevices(user.email)).length > 1;
     user.deviceLost = false;
 
     await user.save();
@@ -3466,21 +3378,14 @@ app.get(`${BASE_ROUTE}/biometric/auth/challenge`, async (req, res) => {
     user = await refreshUserAutomaticRestrictions(user);
     assertAccountCanClock(user);
     const deviceFingerprint = String(req.query.device_fingerprint || "");
-    const installationId = String(req.query.installation_id || "");
-    if (installationId && !isValidInstallationId(installationId)) {
-      return res.status(400).json({ message: "Invalid device installation identity." });
-    }
-
-    const state = await getDeviceBiometricState(user, deviceFingerprint, installationId);
-    const preferredAuthenticators = state.currentDevice
-      ? state.currentDeviceAuthenticators
-      : deviceFingerprint
-        ? state.authenticators.filter(
-          (authenticator) =>
-            getAuthenticatorDeviceFingerprint(authenticator) === deviceFingerprint ||
-            !getAuthenticatorDeviceFingerprint(authenticator)
-        )
-        : [];
+    const state = await getDeviceBiometricState(user, deviceFingerprint);
+    const preferredAuthenticators = deviceFingerprint
+      ? state.authenticators.filter(
+        (authenticator) =>
+          getAuthenticatorDeviceFingerprint(authenticator) === deviceFingerprint ||
+          !getAuthenticatorDeviceFingerprint(authenticator)
+      )
+      : [];
     const authenticators = preferredAuthenticators.length
       ? preferredAuthenticators
       : state.authenticators;
@@ -4789,19 +4694,11 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       selectedStation,
       userCoords,
       device_fingerprint,
-      installation_id = "",
       outsideLocation,
       isWithinGeofence,
       expectedAction,
       ...authResponse
     } = req.body;
-
-    if (installation_id && !isValidInstallationId(installation_id)) {
-      return res.status(400).json({
-        verified: false,
-        message: "Invalid device installation identity.",
-      });
-    }
 
     const normalizedExpectedAction = String(expectedAction || "")
       .trim()
@@ -4865,35 +4762,17 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
     // 6. VERIFY DEVICE APPROVAL
     // ───────────────────────────────────────────────────────────────────────
 
-    const authenticatorDeviceId = getAuthenticatorDeviceId(matchedAuthenticator);
-    let matchedDevice = authenticatorDeviceId
-      ? await Devices.findOne({
-        _id: authenticatorDeviceId,
-        ...getDeviceOwnerQuery(user),
-        device_lost: { $ne: true },
-      })
-      : null;
+    let matchedDevice = await Devices.findOne({
+      user_email: user.email,
 
-    if (!matchedDevice) {
-      const legacyFingerprint =
-        getAuthenticatorDeviceFingerprint(matchedAuthenticator) || device_fingerprint;
-      const legacyMatches = legacyFingerprint
-        ? await Devices.find({
-          ...getDeviceOwnerQuery(user),
-          device_fingerprint: legacyFingerprint,
-          device_lost: { $ne: true },
-        })
-        : [];
+      device_fingerprint:
+        getAuthenticatorDeviceFingerprint(matchedAuthenticator) ||
+        device_fingerprint,
 
-      if (legacyMatches.length === 1) {
-        matchedDevice = legacyMatches[0];
-      } else if (legacyMatches.length > 1) {
-        return res.status(409).json({
-          verified: false,
-          message: "This device needs account recovery before it can be used for clocking.",
-        });
-      }
-    }
+      device_lost: {
+        $ne: true,
+      },
+    });
 
     if (!matchedDevice) {
       return res.status(403).json({
@@ -4949,35 +4828,48 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       });
     }
 
-    if (!getAuthenticatorDeviceId(matchedAuthenticator)) {
-      matchedAuthenticator.deviceId = matchedDevice._id;
-    }
+    const verifiedDeviceFingerprint = String(device_fingerprint || "");
+    const matchedAuthenticatorDeviceFingerprint = getAuthenticatorDeviceFingerprint(matchedAuthenticator);
+    let nextDeviceFingerprint = matchedAuthenticatorDeviceFingerprint || verifiedDeviceFingerprint;
 
     if (
-      installation_id &&
-      !matchedDevice.installation_id
+      verifiedDeviceFingerprint &&
+      matchedAuthenticatorDeviceFingerprint &&
+      verifiedDeviceFingerprint !== matchedAuthenticatorDeviceFingerprint
     ) {
-      const installationAlreadyAssigned = await Devices.exists({
-        ...getDeviceOwnerQuery(user),
-        installation_id,
-        _id: { $ne: matchedDevice._id },
+      const conflictingDevice = await Devices.findOne({
+        device_fingerprint: verifiedDeviceFingerprint,
+        user_email: { $ne: user.email },
       });
 
-      if (!installationAlreadyAssigned) {
-        matchedDevice.installation_id = installation_id;
-        try {
-          await matchedDevice.save();
-        } catch (error) {
-          if (error?.code !== 11000) throw error;
-          console.warn(
-            "Device installation binding already exists; keeping verified legacy device association.",
-            { userId: user._id.toString() },
-          );
-          matchedDevice = await Devices.findById(matchedDevice._id);
-          if (!matchedDevice) throw new Error("Device record disappeared during identity migration.");
-        }
+      if (conflictingDevice) {
+        return res.status(403).json({
+          verified: false,
+          message: "This device is already enrolled by another account.",
+        });
       }
+
+      const currentDevice = await Devices.findOne({
+        user_email: user.email,
+        device_fingerprint: verifiedDeviceFingerprint,
+        device_lost: { $ne: true },
+      });
+
+      if (currentDevice) {
+        matchedDevice = currentDevice;
+        nextDeviceFingerprint = verifiedDeviceFingerprint;
+      } else if (matchedDevice) {
+        await Devices.updateOne(
+          { _id: matchedDevice._id },
+          { $set: { device_fingerprint: verifiedDeviceFingerprint } }
+        );
+        matchedDevice.device_fingerprint = verifiedDeviceFingerprint;
+        nextDeviceFingerprint = verifiedDeviceFingerprint;
+      }
+    } else if (verifiedDeviceFingerprint && !matchedAuthenticatorDeviceFingerprint) {
+      nextDeviceFingerprint = verifiedDeviceFingerprint;
     }
+
 
     // ───────────────────────────────────────────────────────────────────────
     // 9. UPDATE AUTHENTICATOR COUNTER
@@ -5008,16 +4900,7 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
                 .newCounter,
 
             deviceFingerprint:
-              getAuthenticatorDeviceFingerprint(matchedAuthenticator) ||
-              String(device_fingerprint || ""),
-
-            deviceId:
-              matchedDevice._id,
-
-            installationId:
-              getAuthenticatorInstallationId(authenticator) ||
-              matchedDevice.installation_id ||
-              "",
+              nextDeviceFingerprint,
 
             lastUsedAt:
               new Date(),
@@ -8633,15 +8516,9 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    const {
-      description,
-      startDate,
-      endDate,
-      device_fingerprint,
-      device_id,
-    } = req.body;
+    const { description, startDate, endDate, device_fingerprint } = req.body;
 
-    if (!description || !startDate || !endDate || (!device_id && !device_fingerprint))
+    if (!description || !startDate || !endDate || !device_fingerprint)
       throw new Error("All fields are required");
 
 
@@ -8668,37 +8545,23 @@ app.post(`${BASE_ROUTE}/device/lost/request`, async (req, res) => {
     const message = `Hello Admin Team, ${formattedRole} ${name} (Phone: ${phone} and Email: ${email}) from ${stationName} - ${department} department has reported a lost device.
 Please navigate to the lost device section to review this case. Approval will mark the reported device as lost, block it from clocking, and free one active device slot for replacement enrollment.`;
 
-    const userDevices = await getUserDevices(user);
-    let reportedDevice = null;
-    if (device_id) {
-      reportedDevice = userDevices.find((device) => device._id.toString() === String(device_id));
-    } else {
-      const { device, ambiguous } = resolveDeviceIdentity(userDevices, {
-        fingerprint: String(device_fingerprint || ""),
-      });
-      if (ambiguous) {
-        throw new Error("This device is ambiguous. Refresh your device list and select the specific device.");
-      }
-      reportedDevice = device;
-    }
-
-    if (!reportedDevice) {
-      throw new Error("Selected device is not enrolled on your profile.");
-    }
+    const userDevices = await Devices.find({ user_email: user.email })
 
     const existingPending = await DeviceLost.findOne({
-      ...getDeviceOwnerQuery(user),
+      user_email: user.email,
       status: "pending",
-      device_id: reportedDevice._id,
-    }) || await DeviceLost.findOne({
-      ...getDeviceOwnerQuery(user),
-      status: "pending",
-      device_id: null,
-      device_fingerprint: reportedDevice.device_fingerprint,
+      device_fingerprint
     });
 
     if (existingPending)
       throw new Error("You already have a pending request");
+
+    const reportedDevice = userDevices.find(
+      (device) => device.device_fingerprint === device_fingerprint
+    );
+    if (!reportedDevice) {
+      throw new Error("Selected device is not enrolled on your profile.");
+    }
 
     if (reportedDevice.device_lost) {
       throw new Error("This device is already marked as lost.");
@@ -8707,11 +8570,9 @@ Please navigate to the lost device section to review this case. Approval will ma
     const lostRequest = await DeviceLost.create({
       description,
       user_email: user.email,
-      user_id: user._id,
       startDate,
       endDate,
-      device_fingerprint: reportedDevice.device_fingerprint,
-      device_id: reportedDevice._id,
+      device_fingerprint
     });
 
 
@@ -8722,9 +8583,7 @@ Please navigate to the lost device section to review this case. Approval will ma
       label: "urgent",
       status: 'pending',
       user_email: email,
-      user_id: user._id,
-      device_fingerprint: reportedDevice.device_fingerprint,
-      lost_request_id: lostRequest._id,
+      device_fingerprint
     })
 
 
@@ -8741,8 +8600,7 @@ Please navigate to the lost device section to review this case. Approval will ma
       metadata: {
         startDate,
         endDate,
-        deviceFingerprint: reportedDevice.device_fingerprint,
-        deviceId: reportedDevice._id.toString(),
+        deviceFingerprint: device_fingerprint,
         latestStation: stationName || "",
       },
     });
@@ -8813,29 +8671,14 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     request.status = normalizedAction;
     request.responded = responder.rank;
 
-    const affectedUser = request.user_id
-      ? await User.findById(request.user_id)
-      : await User.findOne({ email: request.user_email });
+    const affectedUser = await User.findOne({ email: request.user_email });
     if (!affectedUser) throw new Error("User not found");
 
     if (normalizedAction === "granted") {
-      let reportedDevice = request.device_id
-        ? await Devices.findOne({
-          _id: request.device_id,
-          ...getDeviceOwnerQuery(affectedUser),
-        })
-        : null;
-
-      if (!reportedDevice) {
-        const legacyMatches = await Devices.find({
-          ...getDeviceOwnerQuery(affectedUser),
-          device_fingerprint: request.device_fingerprint,
-        });
-        if (legacyMatches.length === 1) reportedDevice = legacyMatches[0];
-        if (legacyMatches.length > 1) {
-          throw new Error("This legacy lost-device request is ambiguous and requires administrator recovery.");
-        }
-      }
+      const reportedDevice = await Devices.findOne({
+        user_email: affectedUser.email,
+        device_fingerprint: request.device_fingerprint,
+      });
 
       if (!reportedDevice) {
         throw new Error("Reported device is no longer enrolled on this user profile.");
@@ -8847,19 +8690,14 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
       reportedDevice.device_primary = false;
       await reportedDevice.save();
 
-      const sameFingerprintDeviceCount = await Devices.countDocuments({
-        ...getDeviceOwnerQuery(affectedUser),
-        device_fingerprint: request.device_fingerprint,
-      });
       removeDeviceAuthenticator(
         affectedUser,
-        sameFingerprintDeviceCount === 1 ? request.device_fingerprint : "",
-        reportedDeviceWasPrimary,
-        reportedDevice._id.toString(),
+        request.device_fingerprint,
+        reportedDeviceWasPrimary
       );
       affectedUser.deviceLost = false;
 
-      await ensureSinglePrimaryDevice(affectedUser);
+      await ensureSinglePrimaryDevice(affectedUser.email);
       await syncUserDeviceFlags(affectedUser);
     } else {
       affectedUser.deviceLost = false;
@@ -8869,12 +8707,7 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     await request.save();
 
     // update the admin message
-    const messageAdmin = await MessageAdmin.findOne({ lost_request_id: request._id }) ||
-      await MessageAdmin.findOne({
-        ...getDeviceOwnerQuery(affectedUser),
-        device_fingerprint: request.device_fingerprint,
-        status: "pending",
-      }).sort({ createdAt: -1 });
+    const messageAdmin = await MessageAdmin.findOne({ device_fingerprint: request.device_fingerprint })
     if (messageAdmin) {
       messageAdmin.status = normalizedAction
       messageAdmin.responded = responder.rank
@@ -9844,75 +9677,45 @@ app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
     user = await refreshUserAutomaticRestrictions(user);
     assertAccountCanClock(user);
 
-    const {
-      device_name,
-      device_os,
-      device_browser,
-      device_fingerprint,
-      installation_id = "",
-    } = req.body;
+    const { device_name, device_os, device_browser, device_fingerprint } = req.body;
 
 
     if (!device_fingerprint || !device_os || !device_browser || !device_name) {
       throw new Error('Something went wrong!')
     }
-    if (installation_id && !isValidInstallationId(installation_id)) {
-      throw new Error("Invalid device installation identity.");
-    }
 
-    const userDevices = await getUserDevices(user);
-    const { device: existingDevice } = resolveDeviceIdentity(userDevices, {
-      installationId: installation_id,
-      fingerprint: device_fingerprint,
-    });
 
-    if (existingDevice?.device_lost) {
-      throw new Error("This device is marked as lost and cannot be added again. Please use your replacement device.");
-    }
-    if (existingDevice) {
-      throw new Error("Device already registered on your account.");
-    }
+	    const existingDevice = await Devices.findOne({
+	      device_fingerprint
+	    });
 
-	    const activeDevices = await getActiveUserDevices(user);
+
+	    if (existingDevice) {
+	      if (existingDevice.user_email === user.email && existingDevice.device_lost) {
+	        throw new Error("This device is marked as lost and cannot be added again. Please use your replacement device.");
+	      }
+
+	      throw new Error("Device already registered in the system.");
+	    }
+
+	    const activeDevices = await getActiveUserDevices(user.email);
 	    const maxUserDevices = await getMaxUserDevices();
 
 	    if (activeDevices.length >= maxUserDevices) {
 	      throw new Error(`You can only enroll up to ${maxUserDevices} devices. Report a lost device or contact admin to clear one.`);
 	    }
 
-    const newDevicePayload = {
+	    const newDevice = await Devices.create({
 	      device_name,
 	      user_email: user.email,
 	      device_os,
 	      device_browser,
 	      device_primary: activeDevices.length === 0,
 	      device_lost: false,
-	      device_fingerprint,
-	      user_id: user._id,
-	      ...(installation_id ? { installation_id } : {}),
-    };
-    let newDevice;
-    if (installation_id) {
-      try {
-        newDevice = await Devices.findOneAndUpdate(
-          { user_id: user._id, installation_id },
-          { $setOnInsert: newDevicePayload },
-          { new: true, upsert: true, setDefaultsOnInsert: true },
-        );
-      } catch (error) {
-        if (error?.code !== 11000) throw error;
-        newDevice = await Devices.findOne({
-          user_id: user._id,
-          installation_id,
-          device_lost: { $ne: true },
-        });
-        if (!newDevice) throw error;
-      }
-    } else {
-      newDevice = await Devices.create(newDevicePayload);
-    }
+	      device_fingerprint
+	    });
 
-	    await ensureSinglePrimaryDevice(user);
+	    await ensureSinglePrimaryDevice(user.email);
 	    await syncUserDeviceFlags(user);
 
     res.json({
@@ -9936,7 +9739,9 @@ app.get(`${BASE_ROUTE}/device/my-devices`, async (req, res) => {
     const user = await User.findById(req.session.userID);
     if (!user) throw new Error("User not found");
 
-    const devices = await getUserDevices(user).sort({ createdAt: -1 });
+    const devices = await Devices.find({
+      user_email: user.email
+    }).sort({ createdAt: -1 });
 
     res.json(devices);
 
@@ -9958,7 +9763,7 @@ app.get(`${BASE_ROUTE}/device/lost/my-requests`, async (req, res) => {
     if (!user) throw new Error("User not found");
 
     const requests = await DeviceLost.find({
-      ...getDeviceOwnerQuery(user)
+      user_email: user.email
     }).sort({ createdAt: -1 }).lean();
 
     res.json(await attachLostDeviceRequestDeviceInfo(requests));
@@ -9985,11 +9790,7 @@ app.delete(`${BASE_ROUTE}/device/remove/:deviceId`, async (req, res) => {
     if (!device)
       return res.status(404).json({ message: "Device not found" });
 
-    if (
-      device.user_id
-        ? device.user_id.toString() !== user._id.toString()
-        : device.user_email !== user.email
-    )
+    if (device.user_email !== user.email)
       return res.status(403).json({ message: "You can only remove your own devices" });
 
     // Prevent removal of primary device
@@ -9999,27 +9800,14 @@ app.delete(`${BASE_ROUTE}/device/remove/:deviceId`, async (req, res) => {
     // Store device info for audit log
     const deviceInfo = `${device.device_name} (${device.device_os} - ${device.device_browser})`;
 
-    const sameFingerprintDevices = device.device_fingerprint
-      ? await Devices.countDocuments({
-        ...getDeviceOwnerQuery(user),
-        device_fingerprint: device.device_fingerprint,
-      })
-      : 0;
-
     // Delete the device
     await Devices.findByIdAndDelete(deviceId);
 
     // Remove associated biometric authenticator from user
     if (device.device_fingerprint && user.authenticators) {
-      user.authenticators = getUserAuthenticators(user).filter((authenticator) => {
-        const authenticatorDeviceId = getAuthenticatorDeviceId(authenticator);
-        if (authenticatorDeviceId) {
-          return authenticatorDeviceId !== device._id.toString();
-        }
-
-        return sameFingerprintDevices > 1 ||
-          getAuthenticatorDeviceFingerprint(authenticator) !== device.device_fingerprint;
-      });
+      user.authenticators = user.authenticators.filter(
+        auth => auth.deviceFingerprint !== device.device_fingerprint
+      );
       await user.save();
     }
 
@@ -10707,7 +10495,7 @@ app.put(`${BASE_ROUTE}/admin/user/:id/reset-biometrics`, async (req, res) => {
     // delete any devices that have been saved in the model of the target user email
     // this makes the user by default to be like they have not added any devices
 
-    await Devices.deleteMany(getDeviceOwnerQuery(targetUser))
+    await Devices.deleteMany({ user_email: targetUser.email })
 
     await createAuditLog({
       req,
@@ -11606,27 +11394,10 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
       await Clocking.deleteMany({ user_id: req.params.id });
       await Leave.deleteMany({ requestedBy: req.params.id });
       await Feedback.deleteMany({ $or: [{ submittedBy: req.params.id }, { ratedUser: req.params.id }] });
-      await Devices.deleteMany({
-        $or: [
-          { user_id: targetUser._id },
-          { user_email: targetUser.email },
-        ],
-      });
-      await DeviceLost.deleteMany({
-        $or: [
-          { user_id: targetUser._id },
-          { user_email: targetUser.email },
-        ],
-      });
+      await Devices.deleteMany({ user: req.params.id });
+      await deviceLost.deleteMany({ user_id: req.params.id });
       await MessageUser.deleteMany({ $or: [{ userId: req.params.id }, { sender: req.params.id }] });
-      await MessageAdmin.deleteMany({
-        $or: [
-          { user_id: targetUser._id },
-          { user_email: targetUser.email },
-          { userId: req.params.id },
-          { sender: req.params.id },
-        ],
-      });
+      await MessageAdmin.deleteMany({ $or: [{ userId: req.params.id }, { sender: req.params.id }] });
       await PasswordReset.deleteMany({ userId: req.params.id });
       await VerifyReport.deleteMany({ $or: [{ userId: req.params.id }, { verifier: req.params.id }] });
     } catch (err) {
