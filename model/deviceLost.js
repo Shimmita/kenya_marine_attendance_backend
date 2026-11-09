@@ -9,6 +9,11 @@ const deviceLost = new mongoose.Schema(
             lowercase: true,
             trim: true,
         },
+        user_id: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            default: null,
+        },
 
         startDate: { type: String, required: true },
         endDate: { type: String, required: true },
@@ -22,7 +27,13 @@ const deviceLost = new mongoose.Schema(
             enum: ["", "admin", "hr", "supervisor", "superadmin"],
             default: "",
         },
+
         device_fingerprint: { type: String, required: true },
+        device_id: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "devices",
+            default: null,
+        },
 
     },
     { timestamps: true }

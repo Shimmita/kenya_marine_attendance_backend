@@ -6,6 +6,8 @@ const authenticatorSchema = new mongoose.Schema({
   credentialPublicKey: { type: String, required: true },
   counter: { type: Number, required: true, default: 0 },
   deviceFingerprint: { type: String, default: "" },
+  deviceId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  installationId: { type: String, default: "" },
   deviceName: { type: String, default: "" },
   deviceOS: { type: String, default: "" },
   deviceBrowser: { type: String, default: "" },
