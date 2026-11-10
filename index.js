@@ -639,6 +639,41 @@ const buildAnalyticsUserFilter = (context, query = {}) => {
 const getWorkingDateKeysInRange = async (start, end) =>
   getConfiguredWorkingDateKeysInRange(start, end);
 
+// Longest single day a person can realistically be on duty. Sessions or days
+// beyond this are treated as data anomalies (e.g. forgotten clock-outs).
+const MAX_REALISTIC_DAILY_HOURS = 16;
+
+// Realistic average hours worked per attended day, grouped by an arbitrary key.
+// - Uses only sessions with a genuine clock-out (system auto clock-outs are
+//   assumed times, not worked hours).
+// - Sums multiple sessions on the same day per person, then averages across
+//   person-days, so the result reads as "hours per working day".
+const computeAverageDailyHoursByGroup = (records, getGroup, workingDateSet = null) => {
+  const personDayHours = {};
+
+  records.forEach((record) => {
+    if (!record?.clock_in || !record?.clock_out || record.missedClockOut) return;
+    const dateKey = getNairobiDateKey(record.clock_in);
+    if (workingDateSet && !workingDateSet.has(dateKey)) return;
+
+    const hours = (new Date(record.clock_out) - new Date(record.clock_in)) / (1000 * 60 * 60);
+    if (!Number.isFinite(hours) || hours <= 0 || hours > MAX_REALISTIC_DAILY_HOURS) return;
+
+    const group = getGroup(record);
+    if (group == null) return;
+    const email = String(record.email || "").toLowerCase();
+    if (!personDayHours[group]) personDayHours[group] = {};
+    const key = `${email}:${dateKey}`;
+    personDayHours[group][key] = (personDayHours[group][key] || 0) + hours;
+  });
+
+  return Object.entries(personDayHours).reduce((acc, [group, days]) => {
+    const values = Object.values(days).map((value) => Math.min(value, MAX_REALISTIC_DAILY_HOURS));
+    acc[group] = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+    return acc;
+  }, {});
+};
+
 const countApprovedLeaveDaysByGroup = (leaveRecords, emailGroupMap, workingDateKeys) => {
   const groupedLeaveDays = {};
 
@@ -6528,13 +6563,28 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/kpis`, async (req, res) => {
       role: user?.role || "",
       ...extra,
     });
+    // One entry per person: a staff member may clock in several times a day.
+    // Keep their first clock-in (drives lateness) and latest clock-out.
+    const todaySessionsByEmail = new Map();
+    todayRecords.forEach((record) => {
+      const email = String(record.email || "").toLowerCase();
+      if (!email) return;
+      const existing = todaySessionsByEmail.get(email);
+      if (!existing) {
+        todaySessionsByEmail.set(email, { clockIn: record.clock_in, clockOut: record.clock_out || null, hasOpenSession: !record.clock_out });
+        return;
+      }
+      if (new Date(record.clock_in) < new Date(existing.clockIn)) existing.clockIn = record.clock_in;
+      if (!record.clock_out) existing.hasOpenSession = true;
+      else if (!existing.clockOut || new Date(record.clock_out) > new Date(existing.clockOut)) existing.clockOut = record.clock_out;
+    });
     const todayDetails = {
-      present: todayRecords.map((record) => {
-        const user = userByEmail.get(String(record.email || "").toLowerCase()) || {};
+      present: Array.from(todaySessionsByEmail.entries()).map(([email, session]) => {
+        const user = userByEmail.get(email) || {};
         return formatTodayUser(user, {
-          clockIn: record.clock_in,
-          clockOut: record.clock_out,
-          isLate: !isClockInOnTimeByPolicy(record.clock_in, attendancePolicy),
+          clockIn: session.clockIn,
+          clockOut: session.hasOpenSession ? null : session.clockOut,
+          isLate: !isClockInOnTimeByPolicy(session.clockIn, attendancePolicy),
         });
       }),
       absent: users
@@ -7282,6 +7332,11 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
     });
 
     const leaveDaysByDept = countApprovedLeaveDaysByGroup(leaveRecords, deptMap, workingDateKeys);
+    const averageHoursByDept = computeAverageDailyHoursByGroup(
+      records,
+      (record) => deptMap[String(record.email || "").toLowerCase()] || "Unassigned",
+      workingDateSet
+    );
 
     // Compute rates
     const result = Object.keys(deptStats).map(dept => {
@@ -7304,7 +7359,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/departments`, async (req, re
         attendanceRate: parseFloat(attendanceRate.toFixed(1)),
         punctualityRate: parseFloat(punctualityRate.toFixed(1)),
         latenessRate: parseFloat(latenessRate.toFixed(1)),
-        absenteeismRate: parseFloat(absenteeismRate.toFixed(1))
+        absenteeismRate: parseFloat(absenteeismRate.toFixed(1)),
+        averageWorkingHours: parseFloat(Number(averageHoursByDept[dept] || 0).toFixed(1)),
       };
     });
 
@@ -7436,6 +7492,10 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
     });
 
     const leaveDaysByStation = countApprovedLeaveDaysByGroup(leaveRecords, emailStationMap, workingDateKeys);
+    const averageHoursByStation = computeAverageDailyHoursByGroup(
+      workingRecords,
+      (record) => emailStationMap[String(record.email || "").toLowerCase()] || "Unassigned"
+    );
 
     // Compute station-level rates
     const result = stationsList.map(st => {
@@ -7447,8 +7507,8 @@ app.get(`${BASE_ROUTE}/overall/attendance/analytics/stations`, async (req, res) 
       const absentDays = Math.max(maxPossibleDays - totalPresentDays - onLeaveDays, 0);
       const attendanceRate = maxPossibleDays > 0 ? (totalPresentDays / maxPossibleDays) * 100 : 0;
 
-      // Average hours per employee
-      const avgHours = staffCount > 0 ? stats.totalHours / staffCount : 0;
+      // Average hours worked per attended day (not period total per head)
+      const avgHours = Number(averageHoursByStation[st] || 0);
 
       // Overtime per employee
       const avgOvertime = staffCount > 0 ? stats.totalOvertime / staffCount : 0;
@@ -8139,6 +8199,7 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
       name
       department
       station
+      canClockOutside
       `
     ).lean();
 
@@ -8183,6 +8244,12 @@ app.get(`${BASE_ROUTE}/overall/attendance/records`, async (req, res) => {
         isLate: !isClockInOnTimeByPolicy(record.clock_in, attendancePolicy),
 
         role: user.role || "",
+
+        canClockOutside: Boolean(user.canClockOutside),
+
+        clockedOutSide: Boolean(record.clockedOutSide),
+
+        outSideReason: String(record.outSideReason || "").trim(),
 
         name: user.name || record.name,
 

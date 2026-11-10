@@ -23,10 +23,11 @@ const clockingPointChallengeSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    // Indexed by the TTL index declared below (schema.index); do not also set
+    // `index: true` here, or Mongoose declares a duplicate {expiresAt: 1} index.
     expiresAt: {
       type: Date,
       required: true,
-      index: true,
     },
     attempts: {
       type: Number,
