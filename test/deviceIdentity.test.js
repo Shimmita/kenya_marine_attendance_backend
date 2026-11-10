@@ -1,136 +1,77 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  isValidInstallationId,
-  resolveDeviceIdentity,
+  evaluateFingerprintConflict,
+  normalizeDeviceInstallId,
 } from "../util/deviceIdentity.js";
-import Devices from "../model/Devices.js";
 
-const oldDevice = {
-  _id: "old",
-  device_fingerprint: "shared-fingerprint",
-  installation_id: "",
-};
+const INSTALL_A = "3f2b8c1e-7d4a-4c9b-9e21-5a6f0d8b7c41";
+const INSTALL_B = "a91c4e07-2b5d-4f3e-8c6a-1d9e7b3f5a20";
 
-test("resolves an exact installation before fingerprint matches", () => {
-  const installedDevice = {
-    _id: "installed",
-    device_fingerprint: "shared-fingerprint",
-    installation_id: "browser-installation-1234",
-  };
-
-  assert.deepEqual(
-    resolveDeviceIdentity([oldDevice, installedDevice], {
-      installationId: installedDevice.installation_id,
-      fingerprint: installedDevice.device_fingerprint,
-    }),
-    { device: installedDevice, ambiguous: false },
-  );
+test("normalizeDeviceInstallId accepts UUIDs and rejects junk", () => {
+  assert.equal(normalizeDeviceInstallId(INSTALL_A), INSTALL_A);
+  assert.equal(normalizeDeviceInstallId(`  ${INSTALL_A}  `), INSTALL_A);
+  assert.equal(normalizeDeviceInstallId(undefined), "");
+  assert.equal(normalizeDeviceInstallId(""), "");
+  assert.equal(normalizeDeviceInstallId("short"), "");
+  assert.equal(normalizeDeviceInstallId("has spaces in the middle of it"), "");
+  assert.equal(normalizeDeviceInstallId({ $ne: null }), "");
+  assert.equal(normalizeDeviceInstallId("x".repeat(129)), "");
 });
 
-test("distinguishes multiple installations with the same account fingerprint", () => {
-  const firstInstallation = {
-    _id: "first",
-    device_fingerprint: "shared-fingerprint",
-    installation_id: "browser-installation-1111",
-  };
-  const secondInstallation = {
-    _id: "second",
-    device_fingerprint: "shared-fingerprint",
-    installation_id: "browser-installation-2222",
-  };
-
-  assert.equal(
-    resolveDeviceIdentity([firstInstallation, secondInstallation], {
-      installationId: secondInstallation.installation_id,
-      fingerprint: secondInstallation.device_fingerprint,
-    }).device,
-    secondInstallation,
-  );
-});
-
-test("uses a unique legacy fingerprint match during migration", () => {
-  assert.deepEqual(
-    resolveDeviceIdentity([oldDevice], {
-      installationId: "browser-installation-1234",
-      fingerprint: "shared-fingerprint",
-    }),
-    { device: oldDevice, ambiguous: false },
-  );
-});
-
-test("keeps the legacy fingerprint-only client path when it is unambiguous", () => {
-  assert.deepEqual(
-    resolveDeviceIdentity([oldDevice], {
-      fingerprint: "shared-fingerprint",
-    }),
-    { device: oldDevice, ambiguous: false },
-  );
-});
-
-test("does not guess between colliding legacy devices", () => {
-  const secondOldDevice = { ...oldDevice, _id: "second" };
-
-  assert.deepEqual(
-    resolveDeviceIdentity([oldDevice, secondOldDevice], {
-      installationId: "browser-installation-1234",
-      fingerprint: "shared-fingerprint",
-    }),
-    { device: null, ambiguous: true },
-  );
-});
-
-test("does not claim a legacy record when another colliding device is already bound", () => {
-  const boundDevice = {
-    _id: "bound",
-    device_fingerprint: "shared-fingerprint",
-    installation_id: "another-installation-5678",
-  };
-
-  assert.deepEqual(
-    resolveDeviceIdentity([oldDevice, boundDevice], {
-      installationId: "browser-installation-1234",
-      fingerprint: "shared-fingerprint",
-    }),
-    { device: null, ambiguous: true },
-  );
-});
-
-test("does not treat a fingerprint bound to another installation as an identity match", () => {
-  const boundDevice = {
-    ...oldDevice,
-    installation_id: "other-installation-5678",
-  };
-
-  assert.deepEqual(
-    resolveDeviceIdentity([boundDevice], {
-      installationId: "browser-installation-1234",
-      fingerprint: "shared-fingerprint",
-    }),
-    { device: null, ambiguous: false },
-  );
-});
-
-test("validates installation IDs without accepting short or malformed values", () => {
-  assert.equal(isValidInstallationId("browser_installation-1234"), true);
-  assert.equal(isValidInstallationId("short"), false);
-  assert.equal(isValidInstallationId("invalid installation id"), false);
-});
-
-test("declares account-scoped installation uniqueness and non-unique fingerprints", () => {
-  const indexes = Devices.schema.indexes();
-  const installationIndex = indexes.find(
-    ([keys]) => keys.user_id === 1 && keys.installation_id === 1,
-  );
-  const fingerprintIndex = indexes.find(
-    ([keys]) => Object.keys(keys).length === 1 && keys.device_fingerprint === 1,
-  );
-
-  assert.equal(installationIndex?.[1].unique, true);
-  assert.deepEqual(installationIndex?.[1].partialFilterExpression, {
-    user_id: { $type: "objectId" },
-    installation_id: { $type: "string", $gt: "" },
+test("no other-account devices: allowed, no collision", () => {
+  assert.deepEqual(evaluateFingerprintConflict([], INSTALL_A), {
+    blocked: false,
+    collision: false,
+    reason: "none",
   });
-  assert.equal(fingerprintIndex?.[1].unique, undefined);
-  assert.equal(Devices.schema.options.autoIndex, false);
+  assert.equal(evaluateFingerprintConflict(undefined, "").blocked, false);
+});
+
+test("old frontend without install id keeps the legacy block", () => {
+  const result = evaluateFingerprintConflict([{ device_install_id: INSTALL_B }], "");
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "legacy_client");
+});
+
+test("same browser install on another account is blocked", () => {
+  const result = evaluateFingerprintConflict(
+    [{ device_install_id: INSTALL_A, device_lost: false }],
+    INSTALL_A
+  );
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "same_install");
+});
+
+test("look-alike device with a different install id is allowed and flagged", () => {
+  const result = evaluateFingerprintConflict(
+    [{ device_install_id: INSTALL_B, device_lost: false }],
+    INSTALL_A
+  );
+  assert.equal(result.blocked, false);
+  assert.equal(result.collision, true);
+  assert.equal(result.reason, "fingerprint_collision");
+});
+
+test("legacy record (not yet backfilled) is allowed and flagged", () => {
+  const result = evaluateFingerprintConflict([{ device_lost: false }], INSTALL_A);
+  assert.equal(result.blocked, false);
+  assert.equal(result.collision, true);
+});
+
+test("another account's lost device stays blocked", () => {
+  const result = evaluateFingerprintConflict(
+    [{ device_install_id: INSTALL_B, device_lost: true }],
+    INSTALL_A
+  );
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lost_device");
+});
+
+test("same install wins over other records", () => {
+  const result = evaluateFingerprintConflict(
+    [{ device_install_id: INSTALL_B }, { device_install_id: INSTALL_A }],
+    INSTALL_A
+  );
+  assert.equal(result.reason, "same_install");
 });

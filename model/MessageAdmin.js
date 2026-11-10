@@ -8,11 +8,6 @@ const messageAdmin = new mongoose.Schema(
             lowercase: true,
             trim: true,
         },
-        user_id: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "User",
-            default: null,
-        },
 
         message: { type: String, required: true },
         title: { type: String, required: true },
@@ -40,12 +35,9 @@ const messageAdmin = new mongoose.Schema(
             default: "",
         },
 
+        // Not unique: a device can be reported more than once (e.g. after a
+        // rejected report) and look-alike devices can share a fingerprint.
         device_fingerprint: { type: String, required: true },
-        lost_request_id: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "lostDevice",
-            default: null,
-        },
 
     },
     { timestamps: true }
