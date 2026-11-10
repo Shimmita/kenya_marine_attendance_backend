@@ -43,6 +43,10 @@ import {
   getWorkingDateKeysInRange as getConfiguredWorkingDateKeysInRange
 } from "./services/holiday.js";
 import { parseMobileEventAt } from "./util/mobileEventTime.js";
+import {
+  evaluateFingerprintConflict,
+  normalizeDeviceInstallId,
+} from "./util/deviceIdentity.js";
 import { SendMessageNow } from "./util/SendSMS.js";
 
 const PORT = process.env.PORT || 5000;
@@ -1508,6 +1512,84 @@ const ensureLostDeviceRequestIndexes = async () => {
   }
 };
 
+// Drops a legacy single-field UNIQUE index on device_fingerprint, if present.
+const dropLegacyUniqueFingerprintIndex = async (Model, label) => {
+  try {
+    const indexes = await Model.collection.indexes();
+    const legacyIndex = indexes.find(
+      (index) =>
+        index.unique &&
+        index.key &&
+        Object.keys(index.key).length === 1 &&
+        index.key.device_fingerprint === 1
+    );
+
+    if (legacyIndex?.name) {
+      await Model.collection.dropIndex(legacyIndex.name);
+      console.log(`Dropped legacy unique ${label} fingerprint index: ${legacyIndex.name}`);
+    }
+  } catch (err) {
+    console.warn(`${label} fingerprint index cleanup skipped:`, err.message);
+  }
+};
+
+/**
+ * Device fingerprints are not globally unique (look-alike devices can share one),
+ * so replace the global unique index with a per-account one. Idempotent; safe on
+ * every start. If anything fails, enrollment keeps today's stricter behaviour.
+ */
+const ensureDeviceIdentityIndexes = async () => {
+  await dropLegacyUniqueFingerprintIndex(Devices, "device");
+  await dropLegacyUniqueFingerprintIndex(MessageAdmin, "admin-message");
+
+  try {
+    await Devices.createIndexes();
+  } catch (err) {
+    console.warn("Device identity index creation skipped:", err.message);
+  }
+};
+
+/**
+ * Looks for device records on OTHER accounts sharing this fingerprint and decides
+ * (via evaluateFingerprintConflict) whether they block the current device.
+ */
+const findCrossAccountFingerprintConflict = async (user, deviceFingerprint, deviceInstallId) => {
+  const otherAccountDevices = await Devices.find({
+    device_fingerprint: String(deviceFingerprint || ""),
+    user_email: { $ne: user.email },
+  })
+    .select("user_email device_lost device_install_id")
+    .lean();
+
+  return {
+    ...evaluateFingerprintConflict(otherAccountDevices, deviceInstallId),
+    otherAccountDevices,
+  };
+};
+
+const auditFingerprintCollision = (req, user, {
+  stage,
+  deviceFingerprint,
+  deviceInstallId,
+  otherAccountDevices = [],
+}) =>
+  createAuditLog({
+    req,
+    category: "device",
+    action: "device.fingerprint_collision",
+    description:
+      "Device fingerprint is shared with another account but the browser install differs (look-alike device). Allowed; review if unexpected.",
+    actor: user,
+    metadata: {
+      stage,
+      deviceFingerprint,
+      deviceInstallId,
+      otherAccountEmails: [
+        ...new Set(otherAccountDevices.map((device) => device.user_email).filter(Boolean)),
+      ],
+    },
+  });
+
 const attachLostDeviceRequestDeviceInfo = async (requests = []) => {
   if (!requests.length) return requests;
 
@@ -1601,6 +1683,7 @@ mongoose
     await MobileApp.createIndexes();
     await Clocking.createIndexes();
     await ensureLostDeviceRequestIndexes();
+    await ensureDeviceIdentityIndexes();
 
     /*
     |--------------------------------------------------------------------------
@@ -3135,6 +3218,7 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
     assertAccountCanClock(user);
 
     const deviceFingerprint = String(req.query.device_fingerprint || "");
+    const deviceInstallId = normalizeDeviceInstallId(req.query.device_install_id);
     const state = await getDeviceBiometricState(user, deviceFingerprint);
     const maxUserDevices = await getMaxUserDevices();
 
@@ -3149,12 +3233,15 @@ app.get(`${BASE_ROUTE}/biometric/register/challenge`, async (req, res) => {
         throw new Error("This device is marked as lost and cannot be enrolled again. Please use your replacement device.");
       }
 
-      const existingOtherDevice = await Devices.findOne({
-        device_fingerprint: deviceFingerprint,
-        user_email: { $ne: user.email },
-      });
+      // Look-alike devices can share a fingerprint; only block when it is really
+      // the same browser install (or the client is too old to tell).
+      const fingerprintConflict = await findCrossAccountFingerprintConflict(
+        user,
+        deviceFingerprint,
+        deviceInstallId
+      );
 
-      if (existingOtherDevice) {
+      if (fingerprintConflict.blocked) {
         throw new Error("This device is already enrolled by another account.");
       }
     }
@@ -3243,11 +3330,20 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       device_os,
       device_browser,
       device_fingerprint,
+      device_install_id,
     } = device;
 
-    if (!device_fingerprint || !device_name || !device_os || !device_browser) {
+    if (
+      !device_fingerprint ||
+      typeof device_fingerprint !== "string" ||
+      !device_name ||
+      !device_os ||
+      !device_browser
+    ) {
       throw new Error("Device details are required to complete enrollment.");
     }
+
+    const deviceInstallId = normalizeDeviceInstallId(device_install_id);
 
     const verification = await verifyRegistrationResponse({
       response,
@@ -3269,12 +3365,16 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
     const existingOwnDevice = activeDevices.find(
       (deviceRecord) => deviceRecord.device_fingerprint === device_fingerprint
     );
-    const existingOtherDevice = await Devices.findOne({
+    // FingerprintJS visitorIds collide on look-alike devices (same model/OS/browser).
+    // Only block when another account has the SAME browser install (or a lost
+    // device), or when an old client cannot send an install ID.
+    const fingerprintConflict = await findCrossAccountFingerprintConflict(
+      user,
       device_fingerprint,
-      user_email: { $ne: user.email },
-    });
+      deviceInstallId
+    );
 
-    if (existingOtherDevice) {
+    if (fingerprintConflict.blocked) {
       throw new Error("This device is already enrolled by another account.");
     }
 
@@ -3319,6 +3419,8 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
       device_primary: activeDevices.length === 0,
       device_lost: false,
       device_fingerprint,
+      // only set when the client sent one, so an old client never wipes a stored ID
+      ...(deviceInstallId ? { device_install_id: deviceInstallId } : {}),
     };
 
     if (existingOwnDevice) {
@@ -3352,9 +3454,19 @@ app.post(`${BASE_ROUTE}/biometric/register/verify`, async (req, res) => {
         deviceOS: device_os,
         deviceBrowser: device_browser,
         deviceFingerprint: device_fingerprint,
+        deviceInstallId,
         credentialID: credential.id,
       },
     });
+
+    if (fingerprintConflict.collision) {
+      await auditFingerprintCollision(req, user, {
+        stage: "enrollment",
+        deviceFingerprint: device_fingerprint,
+        deviceInstallId,
+        otherAccountDevices: fingerprintConflict.otherAccountDevices,
+      });
+    }
 
     res.json({ registered: true });
   } catch (err) {
@@ -4694,11 +4806,14 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       selectedStation,
       userCoords,
       device_fingerprint,
+      device_install_id,
       outsideLocation,
       isWithinGeofence,
       expectedAction,
       ...authResponse
     } = req.body;
+
+    const deviceInstallId = normalizeDeviceInstallId(device_install_id);
 
     const normalizedExpectedAction = String(expectedAction || "")
       .trim()
@@ -4837,17 +4952,16 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
       matchedAuthenticatorDeviceFingerprint &&
       verifiedDeviceFingerprint !== matchedAuthenticatorDeviceFingerprint
     ) {
-      const conflictingDevice = await Devices.findOne({
+      // The fingerprint drifted (e.g. browser/OS update). The WebAuthn signature
+      // verified above already proves this is the user's own enrolled authenticator,
+      // so a drifted value that happens to equal another account's fingerprint is a
+      // look-alike collision, not a shared device: record it, but don't block clocking.
+      const conflictingDevices = await Devices.find({
         device_fingerprint: verifiedDeviceFingerprint,
         user_email: { $ne: user.email },
-      });
-
-      if (conflictingDevice) {
-        return res.status(403).json({
-          verified: false,
-          message: "This device is already enrolled by another account.",
-        });
-      }
+      })
+        .select("user_email device_lost device_install_id")
+        .lean();
 
       const currentDevice = await Devices.findOne({
         user_email: user.email,
@@ -4859,15 +4973,44 @@ app.post(`${BASE_ROUTE}/biometric/auth/verify`, async (req, res) => {
         matchedDevice = currentDevice;
         nextDeviceFingerprint = verifiedDeviceFingerprint;
       } else if (matchedDevice) {
-        await Devices.updateOne(
-          { _id: matchedDevice._id },
-          { $set: { device_fingerprint: verifiedDeviceFingerprint } }
-        );
-        matchedDevice.device_fingerprint = verifiedDeviceFingerprint;
-        nextDeviceFingerprint = verifiedDeviceFingerprint;
+        // Keep the stored fingerprint if one of the user's own LOST records already
+        // holds the new value (per-account unique index would reject the rewrite).
+        const ownLostDeviceHoldsFingerprint = await Devices.exists({
+          user_email: user.email,
+          device_fingerprint: verifiedDeviceFingerprint,
+          device_lost: true,
+        });
+
+        if (!ownLostDeviceHoldsFingerprint) {
+          await Devices.updateOne(
+            { _id: matchedDevice._id },
+            { $set: { device_fingerprint: verifiedDeviceFingerprint } }
+          );
+          matchedDevice.device_fingerprint = verifiedDeviceFingerprint;
+          nextDeviceFingerprint = verifiedDeviceFingerprint;
+        }
+      }
+
+      if (conflictingDevices.length && nextDeviceFingerprint === verifiedDeviceFingerprint) {
+        await auditFingerprintCollision(req, user, {
+          stage: "clocking_fingerprint_drift",
+          deviceFingerprint: verifiedDeviceFingerprint,
+          deviceInstallId,
+          otherAccountDevices: conflictingDevices,
+        });
       }
     } else if (verifiedDeviceFingerprint && !matchedAuthenticatorDeviceFingerprint) {
       nextDeviceFingerprint = verifiedDeviceFingerprint;
+    }
+
+    // Backfill / refresh the browser install ID on the device the user just proved
+    // possession of. This is how already-enrolled devices migrate, with no re-enrollment.
+    if (deviceInstallId && matchedDevice && matchedDevice.device_install_id !== deviceInstallId) {
+      await Devices.updateOne(
+        { _id: matchedDevice._id },
+        { $set: { device_install_id: deviceInstallId } }
+      );
+      matchedDevice.device_install_id = deviceInstallId;
     }
 
 
@@ -8707,7 +8850,11 @@ app.post(`${BASE_ROUTE}/device/lost/respond`, async (req, res) => {
     await request.save();
 
     // update the admin message
-    const messageAdmin = await MessageAdmin.findOne({ device_fingerprint: request.device_fingerprint })
+    // Scope to the reporting user (fingerprints are not globally unique) and take the latest notice.
+    const messageAdmin = await MessageAdmin.findOne({
+      device_fingerprint: request.device_fingerprint,
+      user_email: request.user_email,
+    }).sort({ createdAt: -1 })
     if (messageAdmin) {
       messageAdmin.status = normalizedAction
       messageAdmin.responded = responder.rank
@@ -9677,24 +9824,37 @@ app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
     user = await refreshUserAutomaticRestrictions(user);
     assertAccountCanClock(user);
 
-    const { device_name, device_os, device_browser, device_fingerprint } = req.body;
+    const { device_name, device_os, device_browser, device_fingerprint, device_install_id } = req.body;
 
 
-    if (!device_fingerprint || !device_os || !device_browser || !device_name) {
+    if (!device_fingerprint || typeof device_fingerprint !== "string" || !device_os || !device_browser || !device_name) {
       throw new Error('Something went wrong!')
     }
 
+    const deviceInstallId = normalizeDeviceInstallId(device_install_id);
 
 	    const existingDevice = await Devices.findOne({
-	      device_fingerprint
+	      device_fingerprint,
+	      user_email: user.email,
 	    });
 
 
 	    if (existingDevice) {
-	      if (existingDevice.user_email === user.email && existingDevice.device_lost) {
+	      if (existingDevice.device_lost) {
 	        throw new Error("This device is marked as lost and cannot be added again. Please use your replacement device.");
 	      }
 
+	      throw new Error("Device already registered in the system.");
+	    }
+
+	    // Look-alike devices may share a fingerprint with another account.
+	    const fingerprintConflict = await findCrossAccountFingerprintConflict(
+	      user,
+	      device_fingerprint,
+	      deviceInstallId
+	    );
+
+	    if (fingerprintConflict.blocked) {
 	      throw new Error("Device already registered in the system.");
 	    }
 
@@ -9712,11 +9872,21 @@ app.post(`${BASE_ROUTE}/device/add`, async (req, res) => {
 	      device_browser,
 	      device_primary: activeDevices.length === 0,
 	      device_lost: false,
-	      device_fingerprint
+	      device_fingerprint,
+	      ...(deviceInstallId ? { device_install_id: deviceInstallId } : {}),
 	    });
 
 	    await ensureSinglePrimaryDevice(user.email);
 	    await syncUserDeviceFlags(user);
+
+	    if (fingerprintConflict.collision) {
+	      await auditFingerprintCollision(req, user, {
+	        stage: "device_add",
+	        deviceFingerprint: device_fingerprint,
+	        deviceInstallId,
+	        otherAccountDevices: fingerprintConflict.otherAccountDevices,
+	      });
+	    }
 
     res.json({
       message: "New device added successfully",
@@ -11389,13 +11559,22 @@ app.delete(`${BASE_ROUTE}/admin/user/:id`, async (req, res) => {
     };
 
     // Delete user from all related collections
+    // Release the user's enrolled devices. Devices/DeviceLost are keyed by user_email;
+    // the previous `{ user: id }` filter matched nothing (and `deviceLost` was an
+    // undefined identifier), leaving orphaned fingerprints that blocked other staff
+    // with "This device is already enrolled by another account."
+    try {
+      await Devices.deleteMany({ user_email: targetUser.email });
+      await DeviceLost.deleteMany({ user_email: targetUser.email });
+    } catch (err) {
+      console.error("Error deleting user devices:", err);
+    }
+
     try {
       // Delete from related models
       await Clocking.deleteMany({ user_id: req.params.id });
       await Leave.deleteMany({ requestedBy: req.params.id });
       await Feedback.deleteMany({ $or: [{ submittedBy: req.params.id }, { ratedUser: req.params.id }] });
-      await Devices.deleteMany({ user: req.params.id });
-      await deviceLost.deleteMany({ user_id: req.params.id });
       await MessageUser.deleteMany({ $or: [{ userId: req.params.id }, { sender: req.params.id }] });
       await MessageAdmin.deleteMany({ $or: [{ userId: req.params.id }, { sender: req.params.id }] });
       await PasswordReset.deleteMany({ userId: req.params.id });

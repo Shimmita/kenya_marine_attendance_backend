@@ -35,7 +35,9 @@ const messageAdmin = new mongoose.Schema(
             default: "",
         },
 
-        device_fingerprint: { type: String, required: true, unique: true },
+        // Not unique: a device can be reported more than once (e.g. after a
+        // rejected report) and look-alike devices can share a fingerprint.
+        device_fingerprint: { type: String, required: true },
 
     },
     { timestamps: true }
